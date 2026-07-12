@@ -10,7 +10,9 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 
-[dependencies.netcode]
+# the package is netcode-official but its library target is named netcode, so the
+# fuzz targets still say `use netcode::...`
+[dependencies.netcode-official]
 path = ".."
 
 [[bin]]

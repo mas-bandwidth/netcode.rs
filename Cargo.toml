@@ -1,19 +1,23 @@
 [package]
-name = "netcode"
+name = "netcode-official"
 version = "1.0.0"
 edition = "2024"
 rust-version = "1.85"
 authors = ["Más Bandwidth LLC"]
-description = "A Rust implementation of the netcode network protocol"
+description = "The official Rust implementation of the netcode network protocol"
 license = "BSD-3-Clause"
 repository = "https://github.com/mas-bandwidth/netcode.rs"
+documentation = "https://docs.rs/netcode-official"
 readme = "README.md"
 keywords = ["gamedev", "networking", "udp", "protocol", "netcode"]
 categories = ["game-development", "network-programming"]
-# the crate name on crates.io is unresolved (netcode and netcode-rs are taken by
-# other projects), so publishing is disabled until a name is chosen
-publish = false
 exclude = [".github/", "fuzz/"]
+
+[lib]
+# the library target keeps the name `netcode` (code says `use netcode::...`), so if
+# the package later moves to the `netcode` name on crates.io, dependent code will not
+# change -- only the dependency line in Cargo.toml
+name = "netcode"
 
 [dependencies]
 chacha20poly1305 = "0.11"

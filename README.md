@@ -1,6 +1,8 @@
 # netcode.rs
 
 [![CI](https://github.com/mas-bandwidth/netcode.rs/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/mas-bandwidth/netcode.rs/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/netcode-official.svg)](https://crates.io/crates/netcode-official)
+[![docs.rs](https://docs.rs/netcode-official/badge.svg)](https://docs.rs/netcode-official)
 
 **netcode** is a secure client/server protocol for multiplayer games built on top of UDP.
 
@@ -32,6 +34,14 @@ This implementation is binary compatible with the reference C implementation, an
 If either layer fails, the change breaks interoperability with other netcode implementations and must not merge.
 
 # Usage
+
+Add the crate to your project:
+
+```console
+cargo add netcode-official
+```
+
+The package is published as `netcode-official`; the library target is named `netcode`, so code says `use netcode::...` and will not need to change if the package later moves to the `netcode` name on crates.io.
 
 Start by generating a random 32 byte private key. Do not share your private key with _anybody_.
 

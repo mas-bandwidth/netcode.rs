@@ -6,7 +6,7 @@
 //! In both cases the buffer layout is the message followed by a 16-byte authentication
 //! tag, matching the libsodium combined mode used by the reference implementation.
 
-use chacha20poly1305::aead::AeadInPlace;
+use chacha20poly1305::aead::AeadInOut;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Tag, XChaCha20Poly1305};
 
 use crate::{Error, Key, MAC_BYTES};
@@ -30,9 +30,9 @@ pub(crate) fn encrypt_aead(
     nonce: &[u8; NONCE_BYTES],
     key: &Key,
 ) -> Result<(), Error> {
-    let (message, mac) = buffer.split_at_mut(buffer.len() - MAC_BYTES);
+    let (message, mac) = buffer.split_last_chunk_mut::<MAC_BYTES>().ok_or(Error::EncryptFailed)?;
     let tag = ChaCha20Poly1305::new(key.into())
-        .encrypt_in_place_detached(nonce.into(), additional_data, message)
+        .encrypt_inout_detached(nonce.into(), additional_data, message.into())
         .map_err(|_| Error::EncryptFailed)?;
     mac.copy_from_slice(&tag);
     Ok(())
@@ -46,9 +46,9 @@ pub(crate) fn decrypt_aead(
     nonce: &[u8; NONCE_BYTES],
     key: &Key,
 ) -> Result<(), Error> {
-    let (message, mac) = buffer.split_at_mut(buffer.len() - MAC_BYTES);
+    let (message, mac) = buffer.split_last_chunk_mut::<MAC_BYTES>().ok_or(Error::DecryptFailed)?;
     ChaCha20Poly1305::new(key.into())
-        .decrypt_in_place_detached(nonce.into(), additional_data, message, Tag::from_slice(mac))
+        .decrypt_inout_detached(nonce.into(), additional_data, message.into(), &Tag::from(*mac))
         .map_err(|_| Error::DecryptFailed)
 }
 
@@ -59,9 +59,9 @@ pub(crate) fn encrypt_aead_big_nonce(
     nonce: &[u8; XNONCE_BYTES],
     key: &Key,
 ) -> Result<(), Error> {
-    let (message, mac) = buffer.split_at_mut(buffer.len() - MAC_BYTES);
+    let (message, mac) = buffer.split_last_chunk_mut::<MAC_BYTES>().ok_or(Error::EncryptFailed)?;
     let tag = XChaCha20Poly1305::new(key.into())
-        .encrypt_in_place_detached(nonce.into(), additional_data, message)
+        .encrypt_inout_detached(nonce.into(), additional_data, message.into())
         .map_err(|_| Error::EncryptFailed)?;
     mac.copy_from_slice(&tag);
     Ok(())
@@ -74,9 +74,9 @@ pub(crate) fn decrypt_aead_big_nonce(
     nonce: &[u8; XNONCE_BYTES],
     key: &Key,
 ) -> Result<(), Error> {
-    let (message, mac) = buffer.split_at_mut(buffer.len() - MAC_BYTES);
+    let (message, mac) = buffer.split_last_chunk_mut::<MAC_BYTES>().ok_or(Error::DecryptFailed)?;
     XChaCha20Poly1305::new(key.into())
-        .decrypt_in_place_detached(nonce.into(), additional_data, message, Tag::from_slice(mac))
+        .decrypt_inout_detached(nonce.into(), additional_data, message.into(), &Tag::from(*mac))
         .map_err(|_| Error::DecryptFailed)
 }
 

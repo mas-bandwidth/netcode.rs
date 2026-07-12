@@ -84,6 +84,8 @@
 //! }
 //! ```
 
+#![forbid(unsafe_code)]
+
 mod bytes;
 mod client;
 mod crypto;

@@ -16,10 +16,11 @@ use crate::{
 
 /// The state of a [`Client`].
 ///
-/// The initial state is [`Disconnected`](ClientState::Disconnected). States before it
-/// in declaration order are error states; the goal state is
-/// [`Connected`](ClientState::Connected).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// The initial state is [`Disconnected`](ClientState::Disconnected); the goal state is
+/// [`Connected`](ClientState::Connected). The [`is_error`](ClientState::is_error),
+/// [`is_connecting`](ClientState::is_connecting) and
+/// [`is_disconnected`](ClientState::is_disconnected) predicates classify the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientState {
     /// The connect token expired before the client finished connecting.
     ConnectTokenExpired,
@@ -46,7 +47,30 @@ pub enum ClientState {
 impl ClientState {
     /// Whether this is one of the error states.
     pub fn is_error(self) -> bool {
-        self < ClientState::Disconnected
+        matches!(
+            self,
+            ClientState::ConnectTokenExpired
+                | ClientState::InvalidConnectToken
+                | ClientState::ConnectionTimedOut
+                | ClientState::ConnectionResponseTimedOut
+                | ClientState::ConnectionRequestTimedOut
+                | ClientState::ConnectionDenied
+        )
+    }
+
+    /// Whether the client is partway through connecting: sending connection requests
+    /// or connection responses.
+    pub fn is_connecting(self) -> bool {
+        matches!(
+            self,
+            ClientState::SendingConnectionRequest | ClientState::SendingConnectionResponse
+        )
+    }
+
+    /// Whether the client is disconnected, either cleanly
+    /// ([`Disconnected`](ClientState::Disconnected)) or in an error state.
+    pub fn is_disconnected(self) -> bool {
+        self == ClientState::Disconnected || self.is_error()
     }
 }
 
@@ -213,7 +237,7 @@ impl Client {
         self.receive_packets();
         self.send_packets();
 
-        if self.state > ClientState::Disconnected && self.state < ClientState::Connected {
+        if self.state.is_connecting() {
             let connect_token = self.connect_token.as_ref().unwrap();
             let expire_seconds = connect_token.expire_timestamp - connect_token.create_timestamp;
             if self.time - self.connect_start_time >= expire_seconds as f64 {
@@ -361,9 +385,9 @@ impl Client {
         destination_state: ClientState,
         send_disconnect_packets: bool,
     ) {
-        debug_assert!(destination_state <= ClientState::Disconnected);
+        debug_assert!(destination_state.is_disconnected());
 
-        if self.state <= ClientState::Disconnected || self.state == destination_state {
+        if self.state.is_disconnected() || self.state == destination_state {
             return;
         }
 
@@ -479,28 +503,24 @@ impl Client {
     }
 
     fn receive_packets(&mut self) {
-        let Some(server_address) = self.server_address else {
-            return;
-        };
-
-        // the client only talks to one server, so receive on the socket matching the
-        // current server address family
-        let socket = match server_address {
-            SocketAddr::V4(_) => self.socket_ipv4.take(),
-            SocketAddr::V6(_) => self.socket_ipv6.take(),
-        };
-        let Some(socket) = socket else {
-            return;
-        };
-
         let mut packet_data = [0u8; MAX_PACKET_BYTES];
-        while let Some((packet_bytes, from)) = socket::receive_packet(&socket, &mut packet_data) {
+        loop {
+            // the client only talks to one server, so receive on the socket matching
+            // the current server address family. the socket borrow is scoped to the
+            // receive call so packet processing can borrow self mutably.
+            let socket = match self.server_address {
+                Some(SocketAddr::V4(_)) => self.socket_ipv4.as_ref(),
+                Some(SocketAddr::V6(_)) => self.socket_ipv6.as_ref(),
+                None => None,
+            };
+            let Some(socket) = socket else {
+                return;
+            };
+            let Some((packet_bytes, from)) = socket::receive_packet(socket, &mut packet_data)
+            else {
+                return;
+            };
             self.process_packet(from, &mut packet_data[..packet_bytes]);
-        }
-
-        match server_address {
-            SocketAddr::V4(_) => self.socket_ipv4 = Some(socket),
-            SocketAddr::V6(_) => self.socket_ipv6 = Some(socket),
         }
     }
 
@@ -595,16 +615,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn state_ordering_matches_the_standard() {
-        // the state machine relies on error states < disconnected < connecting < connected
-        assert!(ClientState::ConnectTokenExpired < ClientState::Disconnected);
-        assert!(ClientState::ConnectionDenied < ClientState::Disconnected);
-        assert!(ClientState::Disconnected < ClientState::SendingConnectionRequest);
-        assert!(ClientState::SendingConnectionRequest < ClientState::SendingConnectionResponse);
-        assert!(ClientState::SendingConnectionResponse < ClientState::Connected);
-        assert!(ClientState::ConnectTokenExpired.is_error());
+    fn state_predicates() {
+        let error_states = [
+            ClientState::ConnectTokenExpired,
+            ClientState::InvalidConnectToken,
+            ClientState::ConnectionTimedOut,
+            ClientState::ConnectionResponseTimedOut,
+            ClientState::ConnectionRequestTimedOut,
+            ClientState::ConnectionDenied,
+        ];
+        for state in error_states {
+            assert!(state.is_error());
+            assert!(state.is_disconnected());
+            assert!(!state.is_connecting());
+        }
+
         assert!(!ClientState::Disconnected.is_error());
+        assert!(ClientState::Disconnected.is_disconnected());
+        assert!(!ClientState::Disconnected.is_connecting());
+
+        for state in [ClientState::SendingConnectionRequest, ClientState::SendingConnectionResponse]
+        {
+            assert!(state.is_connecting());
+            assert!(!state.is_error());
+            assert!(!state.is_disconnected());
+        }
+
         assert!(!ClientState::Connected.is_error());
+        assert!(!ClientState::Connected.is_disconnected());
+        assert!(!ClientState::Connected.is_connecting());
     }
 
     #[test]

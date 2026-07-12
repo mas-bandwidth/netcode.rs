@@ -312,8 +312,8 @@ pub(crate) fn read_packet(
                 debug!("ignored connection challenge/response packet. decrypted packet data is wrong size");
                 return None;
             }
-            let challenge_token_sequence = reader.read_u64().unwrap();
-            let challenge_token_data = reader.read_bytes::<CHALLENGE_TOKEN_BYTES>().unwrap();
+            let challenge_token_sequence = reader.read_u64()?;
+            let challenge_token_data = reader.read_bytes::<CHALLENGE_TOKEN_BYTES>()?;
             if packet_type == CONNECTION_CHALLENGE_PACKET {
                 Packet::Challenge { challenge_token_sequence, challenge_token_data }
             } else {
@@ -326,10 +326,7 @@ pub(crate) fn read_packet(
                 debug!("ignored connection keep alive packet. decrypted packet data is wrong size");
                 return None;
             }
-            Packet::KeepAlive {
-                client_index: reader.read_u32().unwrap(),
-                max_clients: reader.read_u32().unwrap(),
-            }
+            Packet::KeepAlive { client_index: reader.read_u32()?, max_clients: reader.read_u32()? }
         }
 
         CONNECTION_PAYLOAD_PACKET => {
@@ -382,12 +379,12 @@ fn read_connection_request_packet(
 
     let mut reader = Reader::new(&buffer[1..]);
 
-    if reader.read_bytes::<13>().unwrap() != VERSION_INFO {
+    if reader.read_bytes::<13>()? != VERSION_INFO {
         debug!("ignored connection request packet. bad version info");
         return None;
     }
 
-    let packet_protocol_id = reader.read_u64().unwrap();
+    let packet_protocol_id = reader.read_u64()?;
     if packet_protocol_id != protocol_id {
         debug!(
             "ignored connection request packet. wrong protocol id. expected {protocol_id:016x}, got {packet_protocol_id:016x}"
@@ -395,13 +392,13 @@ fn read_connection_request_packet(
         return None;
     }
 
-    let expire_timestamp = reader.read_u64().unwrap();
+    let expire_timestamp = reader.read_u64()?;
     if expire_timestamp <= current_timestamp {
         debug!("ignored connection request packet. connect token expired");
         return None;
     }
 
-    let nonce = reader.read_bytes::<CONNECT_TOKEN_NONCE_BYTES>().unwrap();
+    let nonce = reader.read_bytes::<CONNECT_TOKEN_NONCE_BYTES>()?;
 
     let private_data_start = buffer.len() - CONNECT_TOKEN_PRIVATE_BYTES;
     let mut private_data = Box::new([0u8; CONNECT_TOKEN_PRIVATE_BYTES]);

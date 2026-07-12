@@ -87,7 +87,7 @@ fn main() {
             server.disconnect_client(0);
         }
 
-        if client.state() <= ClientState::Disconnected {
+        if client.state().is_disconnected() {
             break;
         }
 

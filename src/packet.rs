@@ -264,7 +264,7 @@ pub(crate) fn read_packet(
     let replay_protected = packet_type >= CONNECTION_KEEP_ALIVE_PACKET;
 
     if replay_protected {
-        if let Some(&mut ref replay_protection) = replay_protection {
+        if let Some(replay_protection) = replay_protection.as_deref() {
             if replay_protection.already_received(sequence) {
                 debug!(
                     "ignored packet. sequence {sequence:016x} already received (replay protection)"

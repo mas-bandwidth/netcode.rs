@@ -99,6 +99,9 @@ jobs:
           workspaces: fuzz
       - name: smoke fuzz each target
         run: |
+          # the prebuilt cargo-fuzz defaults to its own (musl) build target, which is
+          # incompatible with the address sanitizer: always fuzz the host triple
+          host=$(rustc -vV | sed -n 's/host: //p')
           for target in $(cargo fuzz list); do
-            cargo fuzz run "$target" -- -max_total_time=30
+            cargo fuzz run "$target" --target "$host" -- -max_total_time=30
           done

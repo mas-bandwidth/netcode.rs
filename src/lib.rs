@@ -96,6 +96,12 @@ mod server;
 mod socket;
 mod token;
 
+#[cfg(fuzzing)]
+pub mod fuzzing;
+
+#[cfg(test)]
+mod wire_compat;
+
 pub use client::{Client, ClientState};
 pub use crypto::generate_key;
 pub use error::Error;

@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::bytes::{Reader, Writer};
 use crate::crypto::{self, XNONCE_BYTES};
 use crate::{
-    Error, Key, UserData, CONNECT_TOKEN_BYTES, KEY_BYTES, MAX_SERVERS_PER_CONNECT, USER_DATA_BYTES,
+    CONNECT_TOKEN_BYTES, Error, KEY_BYTES, Key, MAX_SERVERS_PER_CONNECT, USER_DATA_BYTES, UserData,
     VERSION_INFO,
 };
 
@@ -35,6 +35,7 @@ fn connect_token_additional_data(protocol_id: u64, expire_timestamp: u64) -> [u8
 
 /// The private portion of a connect token. Readable only by the web backend and the
 /// dedicated servers that share the private key.
+#[cfg_attr(fuzzing, derive(Debug, PartialEq))]
 pub(crate) struct PrivateConnectToken {
     pub client_id: u64,
     pub timeout_seconds: i32,
@@ -182,6 +183,7 @@ pub(crate) fn decrypt_challenge_token(
 
 /// A parsed connect token: the public fields the client needs to connect, wrapped
 /// around the encrypted private data it forwards to the server.
+#[cfg_attr(fuzzing, derive(Debug, PartialEq))]
 pub(crate) struct ConnectToken {
     pub protocol_id: u64,
     pub create_timestamp: u64,
@@ -411,22 +413,26 @@ mod tests {
         .unwrap();
 
         // a different protocol id or expire timestamp must fail the signature check
-        assert!(decrypt_connect_token_private(
-            &mut buffer.clone(),
-            TEST_PROTOCOL_ID + 1,
-            expire_timestamp,
-            &nonce,
-            &key
-        )
-        .is_err());
-        assert!(decrypt_connect_token_private(
-            &mut buffer.clone(),
-            TEST_PROTOCOL_ID,
-            expire_timestamp + 1,
-            &nonce,
-            &key
-        )
-        .is_err());
+        assert!(
+            decrypt_connect_token_private(
+                &mut buffer.clone(),
+                TEST_PROTOCOL_ID + 1,
+                expire_timestamp,
+                &nonce,
+                &key
+            )
+            .is_err()
+        );
+        assert!(
+            decrypt_connect_token_private(
+                &mut buffer.clone(),
+                TEST_PROTOCOL_ID,
+                expire_timestamp + 1,
+                &nonce,
+                &key
+            )
+            .is_err()
+        );
     }
 
     #[test]

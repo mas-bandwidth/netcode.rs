@@ -8,12 +8,12 @@ use log::{debug, error, info};
 use crate::packet::{AllowedPackets, Packet};
 use crate::replay::ReplayProtection;
 use crate::token::{
-    self, ChallengeToken, PrivateConnectToken, CHALLENGE_TOKEN_BYTES, CONNECT_TOKEN_PRIVATE_BYTES,
+    self, CHALLENGE_TOKEN_BYTES, CONNECT_TOKEN_PRIVATE_BYTES, ChallengeToken, PrivateConnectToken,
 };
 use crate::{
-    crypto, socket, Error, Key, UserData, KEY_BYTES, MAC_BYTES, MAX_CLIENTS, MAX_PACKET_BYTES,
-    MAX_PAYLOAD_BYTES, NUM_DISCONNECT_PACKETS, PACKET_QUEUE_SIZE, PACKET_SEND_RATE,
-    USER_DATA_BYTES,
+    Error, KEY_BYTES, Key, MAC_BYTES, MAX_CLIENTS, MAX_PACKET_BYTES, MAX_PAYLOAD_BYTES,
+    NUM_DISCONNECT_PACKETS, PACKET_QUEUE_SIZE, PACKET_SEND_RATE, USER_DATA_BYTES, UserData, crypto,
+    socket,
 };
 
 /// Why a client was disconnected from the server.
@@ -30,10 +30,19 @@ pub enum DisconnectReason {
 /// A connection event on the server, drained with [`Server::next_event`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerEvent {
-    /// A client connected and was assigned the slot `client_index`.
-    ClientConnected { client_index: usize },
-    /// The client in slot `client_index` disconnected.
-    ClientDisconnected { client_index: usize, reason: DisconnectReason },
+    /// A client connected.
+    ClientConnected {
+        /// The slot the client was assigned.
+        client_index: usize,
+    },
+    /// A client disconnected.
+    ClientDisconnected {
+        /// The slot the client occupied. It is free again by the time this event is
+        /// observed.
+        client_index: usize,
+        /// Why the client was disconnected.
+        reason: DisconnectReason,
+    },
 }
 
 // ----------------------------------------------------------------
@@ -727,7 +736,9 @@ impl Server {
         }
 
         if self.find_client_index_by_address(from).is_some() {
-            debug!("server ignored connection request. a client with this address is already connected");
+            debug!(
+                "server ignored connection request. a client with this address is already connected"
+            );
             return;
         }
 
@@ -821,7 +832,9 @@ impl Server {
         };
 
         if self.find_client_index_by_address(from).is_some() {
-            debug!("server ignored connection response. a client with this address is already connected");
+            debug!(
+                "server ignored connection response. a client with this address is already connected"
+            );
             return;
         }
 

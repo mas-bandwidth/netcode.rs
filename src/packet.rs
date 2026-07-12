@@ -26,6 +26,7 @@ const CONNECTION_NUM_PACKETS: u8 = 7;
 const CONNECTION_REQUEST_PACKET_BYTES: usize =
     1 + 13 + 8 + 8 + CONNECT_TOKEN_NONCE_BYTES + CONNECT_TOKEN_PRIVATE_BYTES;
 
+#[cfg_attr(fuzzing, derive(Debug, PartialEq))]
 pub(crate) enum Packet {
     Request {
         protocol_id: u64,
@@ -309,7 +310,9 @@ pub(crate) fn read_packet(
 
         CONNECTION_CHALLENGE_PACKET | CONNECTION_RESPONSE_PACKET => {
             if decrypted.len() != 8 + CHALLENGE_TOKEN_BYTES {
-                debug!("ignored connection challenge/response packet. decrypted packet data is wrong size");
+                debug!(
+                    "ignored connection challenge/response packet. decrypted packet data is wrong size"
+                );
                 return None;
             }
             let challenge_token_sequence = reader.read_u64()?;
@@ -423,8 +426,8 @@ fn read_connection_request_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::generate_key;
     use crate::MAX_PACKET_BYTES;
+    use crate::generate_key;
 
     const TEST_PROTOCOL_ID: u64 = 0x1122334455667788;
     const TEST_SEQUENCE: u64 = 1000;
@@ -604,16 +607,18 @@ mod tests {
 
         let mut buffer = [0u8; MAX_PACKET_BYTES];
         let written = write_packet(&input, &mut buffer, 1, &key, TEST_PROTOCOL_ID).unwrap();
-        assert!(read_packet(
-            &mut buffer[..written],
-            Some(&key),
-            TEST_PROTOCOL_ID,
-            0,
-            None,
-            AllowedPackets::CLIENT,
-            None,
-        )
-        .is_none());
+        assert!(
+            read_packet(
+                &mut buffer[..written],
+                Some(&key),
+                TEST_PROTOCOL_ID,
+                0,
+                None,
+                AllowedPackets::CLIENT,
+                None,
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -626,16 +631,18 @@ mod tests {
 
         // flipping the packet type in the prefix byte changes the associated data
         buffer[0] = (buffer[0] & 0xF0) | CONNECTION_KEEP_ALIVE_PACKET;
-        assert!(read_packet(
-            &mut buffer[..written],
-            Some(&key),
-            TEST_PROTOCOL_ID,
-            0,
-            None,
-            AllowedPackets::CLIENT,
-            None,
-        )
-        .is_none());
+        assert!(
+            read_packet(
+                &mut buffer[..written],
+                Some(&key),
+                TEST_PROTOCOL_ID,
+                0,
+                None,
+                AllowedPackets::CLIENT,
+                None,
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -649,28 +656,32 @@ mod tests {
                 .unwrap();
 
         let mut first = buffer;
-        assert!(read_packet(
-            &mut first[..written],
-            Some(&key),
-            TEST_PROTOCOL_ID,
-            0,
-            None,
-            AllowedPackets::CLIENT,
-            Some(&mut replay_protection),
-        )
-        .is_some());
+        assert!(
+            read_packet(
+                &mut first[..written],
+                Some(&key),
+                TEST_PROTOCOL_ID,
+                0,
+                None,
+                AllowedPackets::CLIENT,
+                Some(&mut replay_protection),
+            )
+            .is_some()
+        );
 
         // the identical packet is rejected the second time
         let mut second = buffer;
-        assert!(read_packet(
-            &mut second[..written],
-            Some(&key),
-            TEST_PROTOCOL_ID,
-            0,
-            None,
-            AllowedPackets::CLIENT,
-            Some(&mut replay_protection),
-        )
-        .is_none());
+        assert!(
+            read_packet(
+                &mut second[..written],
+                Some(&key),
+                TEST_PROTOCOL_ID,
+                0,
+                None,
+                AllowedPackets::CLIENT,
+                Some(&mut replay_protection),
+            )
+            .is_none()
+        );
     }
 }

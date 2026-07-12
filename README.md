@@ -22,6 +22,15 @@ Real-time multiplayer games typically use UDP instead of TCP, because head of li
 * Support for both IPv4 and IPv6 connections.
 * No unsafe code.
 
+# Wire compatibility
+
+This implementation is binary compatible with the reference C implementation, and that compatibility is enforced mechanically on every change:
+
+* **Golden test vectors.** `tests/vectors/` holds every token and packet type as written by the reference C implementation from fixed inputs. The tests in `src/wire_compat.rs` assert this implementation produces byte-identical output — including AEAD ciphertext and authentication tags — and reads the C bytes back to the same values. They run in every `cargo test`.
+* **Live interoperability.** CI builds the reference C implementation and runs `tests/c_interop.rs`: a C server accepting a connection from this client, and this server accepting a connection from the C client, each exchanging encrypted payloads in both directions for longer than the connect token timeout.
+
+If either layer fails, the change breaks interoperability with other netcode implementations and must not merge.
+
 # Usage
 
 Start by generating a random 32 byte private key. Do not share your private key with _anybody_.
@@ -106,6 +115,25 @@ Differences from the C implementation:
 * The network simulator, loopback clients, dual-stack servers and packet tagging are not (yet) ported.
 
 If you'd like to create your own implementation of netcode, please read the [netcode 1.02 standard](https://github.com/mas-bandwidth/netcode/blob/main/STANDARD.md), and see [IMPLEMENTERS.md](https://github.com/mas-bandwidth/netcode/blob/main/IMPLEMENTERS.md) for findings other implementations should check themselves against. This implementation includes those fixes: the replay protection already-received test is written in the overflow-free subtraction form, and there is a regression test locking down the nonce construction.
+
+# Development
+
+```console
+cargo test                                   # unit, wire-compatibility and integration tests
+cargo fmt --check                            # formatting
+cargo clippy --all-targets -- -D warnings    # lints
+cargo +nightly fuzz run fuzz_read_packet     # coverage-guided fuzzing (cargo install cargo-fuzz)
+```
+
+CI runs the test suite on Linux, macOS and Windows (stable and beta Rust), checks formatting, clippy, rustdoc, the minimum supported Rust version (1.85), dependency licenses and security advisories with cargo-deny, live interoperability against the reference C implementation, and smoke-fuzzes the untrusted input surface with the harnesses in `fuzz/`.
+
+To run the interoperability tests locally, build the [reference C implementation](https://github.com/mas-bandwidth/netcode) and point the tests at its example binaries:
+
+```console
+NETCODE_C_SERVER=path/to/netcode/build/bin/server \
+NETCODE_C_CLIENT=path/to/netcode/build/bin/client \
+cargo test --test c_interop -- --ignored --test-threads=1
+```
 
 # Author
 

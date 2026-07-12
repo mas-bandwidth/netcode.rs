@@ -1,0 +1,44 @@
+[package]
+name = "netcode-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.netcode]
+path = ".."
+
+[[bin]]
+name = "fuzz_read_packet"
+path = "fuzz_targets/fuzz_read_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_packet_round_trip"
+path = "fuzz_targets/fuzz_packet_round_trip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_connect_token"
+path = "fuzz_targets/fuzz_connect_token.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_private_connect_token"
+path = "fuzz_targets/fuzz_private_connect_token.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

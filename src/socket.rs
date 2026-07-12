@@ -42,12 +42,13 @@ pub(crate) fn receive_packet(socket: &UdpSocket, buffer: &mut [u8]) -> Option<(u
     }
 }
 
-/// Zeroes the IPv6 flow label so received addresses compare equal to parsed ones.
+/// Zeroes the IPv6 flow label and scope id so received addresses compare equal to
+/// parsed ones. The reference implementation cannot represent either field, so
+/// carrying them here would make otherwise-identical addresses compare unequal and
+/// silently drop packets (e.g. from link-local sources, where the OS sets a scope id).
 fn normalize_address(address: SocketAddr) -> SocketAddr {
     match address {
-        SocketAddr::V6(v6) => {
-            SocketAddr::V6(SocketAddrV6::new(*v6.ip(), v6.port(), 0, v6.scope_id()))
-        }
+        SocketAddr::V6(v6) => SocketAddr::V6(SocketAddrV6::new(*v6.ip(), v6.port(), 0, 0)),
         SocketAddr::V4(_) => address,
     }
 }

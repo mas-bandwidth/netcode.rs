@@ -8,10 +8,10 @@ use log::{debug, info};
 
 use crate::packet::{AllowedPackets, Packet};
 use crate::replay::ReplayProtection;
-use crate::token::{self, ConnectToken, CHALLENGE_TOKEN_BYTES};
+use crate::token::{self, CHALLENGE_TOKEN_BYTES, ConnectToken};
 use crate::{
-    socket, Error, Key, CONNECT_TOKEN_BYTES, KEY_BYTES, MAX_PACKET_BYTES, MAX_PAYLOAD_BYTES,
-    NUM_DISCONNECT_PACKETS, PACKET_QUEUE_SIZE, PACKET_SEND_RATE,
+    CONNECT_TOKEN_BYTES, Error, KEY_BYTES, Key, MAX_PACKET_BYTES, MAX_PAYLOAD_BYTES,
+    NUM_DISCONNECT_PACKETS, PACKET_QUEUE_SIZE, PACKET_SEND_RATE, socket,
 };
 
 /// The state of a [`Client`].

@@ -12,7 +12,7 @@ keywords = ["gamedev", "networking", "udp", "protocol", "netcode"]
 categories = ["game-development", "network-programming"]
 
 [dependencies]
-chacha20poly1305 = "0.10"
+chacha20poly1305 = "0.11"
 getrandom = "0.3"
 log = "0.4"
 socket2 = "0.6"

@@ -1,6 +1,6 @@
 [package]
 name = "netcode"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.85"
 authors = ["Más Bandwidth LLC"]
@@ -10,6 +10,10 @@ repository = "https://github.com/mas-bandwidth/netcode.rs"
 readme = "README.md"
 keywords = ["gamedev", "networking", "udp", "protocol", "netcode"]
 categories = ["game-development", "network-programming"]
+# the crate name on crates.io is unresolved (netcode and netcode-rs are taken by
+# other projects), so publishing is disabled until a name is chosen
+publish = false
+exclude = [".github/", "fuzz/"]
 
 [dependencies]
 chacha20poly1305 = "0.11"

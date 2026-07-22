@@ -21,7 +21,7 @@ jobs:
             rust: beta
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup update ${{ matrix.rust }} && rustup default ${{ matrix.rust }}
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --all-targets
@@ -30,7 +30,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup update stable && rustup default stable && rustup component add rustfmt clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
@@ -41,7 +41,7 @@ jobs:
     env:
       RUSTDOCFLAGS: -D warnings
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup update stable && rustup default stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo doc --no-deps
@@ -50,7 +50,7 @@ jobs:
   msrv:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup toolchain install 1.85 --profile minimal && rustup default 1.85
       - uses: Swatinem/rust-cache@v2
       - run: cargo check
@@ -59,7 +59,7 @@ jobs:
   deny:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
 
   # binary compatibility: live interoperability against the reference C implementation.
@@ -68,8 +68,8 @@ jobs:
   interop:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
         with:
           repository: mas-bandwidth/netcode
           path: netcode-c
@@ -89,7 +89,7 @@ jobs:
   fuzz:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup toolchain install nightly --profile minimal && rustup default nightly
       - uses: taiki-e/install-action@v2
         with:
@@ -110,7 +110,7 @@ jobs:
     name: STANDARD.md matches upstream
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # STANDARD.md here is a VERBATIM VENDORED COPY of the wire-format
       # specification that lives in mas-bandwidth/netcode. This job fails if the

@@ -1036,6 +1036,8 @@ impl Drop for Server {
 mod tests {
     use super::*;
 
+    const TEST_PROTOCOL_ID: u64 = 0x1122334455667788;
+
     fn test_address(port: u16) -> SocketAddr {
         format!("127.0.0.1:{port}").parse().unwrap()
     }
@@ -1106,5 +1108,34 @@ mod tests {
         assert!(find_or_add_connect_token_entry(&mut entries, test_address(40000), &mac, 1.0));
         // same token from a different address is rejected
         assert!(!find_or_add_connect_token_entry(&mut entries, test_address(40001), &mac, 2.0));
+    }
+
+    /// Guards the AEAD nonce-reuse fix ported from the C library (netcode commit
+    /// dc21b70). Global packets (challenge, denied) encrypt under the same per-token
+    /// server-to-client key as per-client packets, whose sequences start at zero, so the
+    /// server's global sequence must stay in the top half of the sequence space. Both
+    /// `stop` and `start` re-seed it: a stopped-and-restarted server that let the
+    /// sequence fall back to zero would reuse nonces under the shared key.
+    #[test]
+    fn restart_reseeds_global_sequence() {
+        // public port 0 binds an ephemeral port so parallel tests don't collide
+        let private_key = crypto::generate_key();
+        let mut server = Server::new(test_address(0), TEST_PROTOCOL_ID, &private_key, 0.0).unwrap();
+        assert_eq!(server.global_sequence, 1 << 63);
+
+        server.start(1).unwrap();
+        assert_eq!(server.global_sequence, 1 << 63);
+
+        // advance the global sequence as if global packets had been sent, then restart
+        server.global_sequence += 10;
+
+        // stopping re-seeds on its own: the invariant holds in every server state, not
+        // just while running, so nothing depends on start being the one to restore it
+        server.stop();
+        assert_eq!(server.global_sequence, 1 << 63);
+
+        // after a restart the global sequence is back in the top half, not near zero
+        server.start(1).unwrap();
+        assert_eq!(server.global_sequence, 1 << 63);
     }
 }

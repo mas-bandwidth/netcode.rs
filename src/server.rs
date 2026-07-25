@@ -1034,7 +1034,26 @@ impl Drop for Server {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+    use crate::packet::{read_packet, write_packet};
+    use crate::token::ConnectToken;
+    use crate::{CONNECT_TOKEN_BYTES, generate_connect_token};
+
+    const TEST_PROTOCOL_ID: u64 = 0x1122334455667788;
+    const TEST_TOKEN_EXPIRY: i32 = 30;
+    const TEST_TOKEN_TIMEOUT: i32 = 5;
+
+    /// The server stamps its global packets (challenge and denied) with sequence
+    /// numbers from the top half of the sequence space. Those packets are encrypted
+    /// with the same per-connect-token server-to-client key as the packets sent to a
+    /// connected client, whose sequence numbers start at zero, so a global sequence
+    /// down in the bottom half repeats an AEAD nonce under a key that is already in
+    /// use for the other half of the conversation. The reference C implementation
+    /// seeded the global sequence when the server was created but zeroed it on stop,
+    /// so a restarted server did exactly that (netcode commit dc21b70).
+    const GLOBAL_SEQUENCE_FLOOR: u64 = u64::MAX / 2;
 
     fn test_address(port: u16) -> SocketAddr {
         format!("127.0.0.1:{port}").parse().unwrap()
@@ -1106,5 +1125,134 @@ mod tests {
         assert!(find_or_add_connect_token_entry(&mut entries, test_address(40000), &mac, 1.0));
         // same token from a different address is rejected
         assert!(!find_or_add_connect_token_entry(&mut entries, test_address(40001), &mac, 2.0));
+    }
+
+    /// Sends `connect_token` to the server as a connection request from `socket` and
+    /// returns the sequence number the server stamped on the challenge packet it sent
+    /// back — that is, the AEAD nonce it used under this token's server-to-client key.
+    fn challenge_sequence_on_the_wire(
+        server: &mut Server,
+        socket: &UdpSocket,
+        connect_token: &[u8; CONNECT_TOKEN_BYTES],
+        time: &mut f64,
+    ) -> u64 {
+        let token = ConnectToken::read(connect_token).unwrap();
+        let request = Packet::Request {
+            protocol_id: token.protocol_id,
+            expire_timestamp: token.expire_timestamp,
+            nonce: token.nonce,
+            private_data: token.private_data.clone(),
+        };
+
+        // connection request packets travel in the clear, so the write key is unused
+        let mut request_data = [0u8; MAX_PACKET_BYTES];
+        let request_bytes =
+            write_packet(&request, &mut request_data, 0, &[0; KEY_BYTES], token.protocol_id)
+                .unwrap();
+        socket.send_to(&request_data[..request_bytes], server.address()).unwrap();
+
+        let mut reply = [0u8; MAX_PACKET_BYTES];
+        for _ in 0..100 {
+            *time += 0.01;
+            server.update(*time);
+
+            let Ok((reply_bytes, _)) = socket.recv_from(&mut reply) else {
+                continue;
+            };
+            let (packet, sequence) = read_packet(
+                &mut reply[..reply_bytes],
+                Some(&token.server_to_client_key),
+                token.protocol_id,
+                token::unix_timestamp(),
+                None,
+                AllowedPackets::CLIENT,
+                None,
+            )
+            .expect("the server reply did not decrypt under the connect token key");
+            assert!(matches!(packet, Packet::Challenge { .. }));
+            return sequence;
+        }
+
+        panic!("the server never replied to the connection request");
+    }
+
+    /// A server that is stopped and started again must not go back to stamping its
+    /// global packets with sequence numbers a connected client's packets also use.
+    /// This drives a real connection request over UDP before and after a restart with
+    /// the same connect token, and reads the nonce off the challenge packets the
+    /// server actually sends.
+    #[test]
+    fn restarted_server_keeps_global_packets_out_of_the_client_sequence_range() {
+        let private_key = crypto::generate_key();
+        let mut server = Server::new(test_address(0), TEST_PROTOCOL_ID, &private_key, 0.0).unwrap();
+        server.start(1).unwrap();
+
+        let connect_token = generate_connect_token(
+            &[server.address()],
+            &[server.address()],
+            TEST_TOKEN_EXPIRY,
+            TEST_TOKEN_TIMEOUT,
+            0x1234,
+            TEST_PROTOCOL_ID,
+            &private_key,
+            &[0; USER_DATA_BYTES],
+        )
+        .unwrap();
+
+        let socket = UdpSocket::bind(test_address(0)).unwrap();
+        socket.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
+
+        let mut time = 0.0;
+        let before_restart =
+            challenge_sequence_on_the_wire(&mut server, &socket, &connect_token, &mut time);
+        assert!(before_restart > GLOBAL_SEQUENCE_FLOOR, "global sequence {before_restart}");
+
+        server.stop();
+        server.start(1).unwrap();
+
+        // the same client, the same connect token, and therefore the same
+        // server-to-client key as before the restart
+        let after_restart =
+            challenge_sequence_on_the_wire(&mut server, &socket, &connect_token, &mut time);
+        assert!(
+            after_restart > GLOBAL_SEQUENCE_FLOOR,
+            "a restarted server sent a global packet with sequence {after_restart}, which is in \
+             the range used by packets to connected clients (client slot sequences restart at \
+             {}), so the two share an AEAD nonce under the connect token key",
+            server.clients[0].sequence,
+        );
+        assert_eq!(server.clients[0].sequence, 0, "client sequences start at zero after a start");
+    }
+
+    /// Every entry point that can leave the server ready to send global packets has to
+    /// establish the floor itself, rather than inheriting it from another one — which
+    /// is the whole of the upstream fix, since creation alone used to seed it.
+    #[test]
+    fn create_start_and_stop_each_reseed_the_global_sequence() {
+        let private_key = crypto::generate_key();
+        let mut server = Server::new(test_address(0), TEST_PROTOCOL_ID, &private_key, 0.0).unwrap();
+        assert!(
+            server.global_sequence > GLOBAL_SEQUENCE_FLOOR,
+            "a new server starts below the global sequence floor: {}",
+            server.global_sequence
+        );
+
+        // starting a stopped server whose sequence was left down in the client range
+        server.global_sequence = 0;
+        server.start(1).unwrap();
+        assert!(
+            server.global_sequence > GLOBAL_SEQUENCE_FLOOR,
+            "start did not reseed the global sequence: {}",
+            server.global_sequence
+        );
+
+        // and stopping one, so that a later start cannot inherit a low sequence
+        server.global_sequence = 0;
+        server.stop();
+        assert!(
+            server.global_sequence > GLOBAL_SEQUENCE_FLOOR,
+            "stop did not reseed the global sequence: {}",
+            server.global_sequence
+        );
     }
 }

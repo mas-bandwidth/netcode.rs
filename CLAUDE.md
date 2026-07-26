@@ -40,6 +40,17 @@ mint a new one — it is the wrong machine account. Either Glenn publishes from 
 account, or he moves the token into the mas keychain with the prompting form
 (`security add-generic-password -U -a rowan -s crates-io-token -w`, no value after -w).
 Verified 2026-07-26: crates.io has netcode-official 1.0.0 while this repo is at 1.1.0.
+
+CARGO.LOCK IS GITIGNORED HERE ON PURPOSE
+`.gitignore` lists `Cargo.lock` and `fuzz/Cargo.lock` deliberately, hand-written beside
+the fuzz artifacts. This is a library crate: dependents do not use its lock, and this is
+the only one of the three Rust ports with real dependencies (57 packages via
+chacha20poly1305). serialize.rs and reliable.rs DO commit a lock, but by omission rather
+than decision -- neither .gitignore mentions it, and both locks are near-empty (1 and 2
+packages) because those crates have essentially no dependencies. Do not "fix" the
+inconsistency by adding a lock here; the considered choice is this one.
+Note the lock IS packaged into the published .crate, so if this is ever revisited it is
+a version site, not just a dev-convenience question.
 <!-- HOT:END -->
 
 ## Build and test

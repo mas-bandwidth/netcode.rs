@@ -31,6 +31,15 @@ TRAPS
 NEVER regenerate tests/vectors/*.bin to make a test pass: a golden failure means the
 change breaks every other netcode implementation. Only a standard change justifies new
 vectors.
+
+PUBLISHING (crates.io) — the token is NOT on this bench
+The crates.io token lives at /Users/glenn/.cargo/credentials.toml on GLENN'S personal
+macOS account: mode 0600, owned by glenn, unreadable from the mas account. `cargo publish`
+here fails with "no token found". That is NOT a missing credential and NOT a reason to
+mint a new one — it is the wrong machine account. Either Glenn publishes from his own
+account, or he moves the token into the mas keychain with the prompting form
+(`security add-generic-password -U -a rowan -s crates-io-token -w`, no value after -w).
+Verified 2026-07-26: crates.io has netcode-official 1.0.0 while this repo is at 1.1.0.
 <!-- HOT:END -->
 
 ## Build and test

@@ -55,7 +55,9 @@ pub(crate) fn create_socket(address: SocketAddr) -> io::Result<UdpSocket> {
         socket.set_only_v6(true)?;
     }
     set_buffer_with_backoff(SOCKET_SNDBUF_SIZE, "send", |size| socket.set_send_buffer_size(size))?;
-    set_buffer_with_backoff(SOCKET_RCVBUF_SIZE, "receive", |size| socket.set_recv_buffer_size(size))?;
+    set_buffer_with_backoff(SOCKET_RCVBUF_SIZE, "receive", |size| {
+        socket.set_recv_buffer_size(size)
+    })?;
     socket.set_nonblocking(true)?;
     socket.bind(&address.into())?;
     Ok(socket.into())
@@ -124,11 +126,7 @@ mod tests {
         let attempts = RefCell::new(Vec::new());
         let got = set_buffer_with_backoff(SOCKET_SNDBUF_SIZE, "send", |size| {
             attempts.borrow_mut().push(size);
-            if size > limit {
-                Err(enobufs())
-            } else {
-                Ok(())
-            }
+            if size > limit { Err(enobufs()) } else { Ok(()) }
         })
         .unwrap();
         assert_eq!(got, limit);

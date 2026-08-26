@@ -4,6 +4,8 @@
 [![crates.io](https://img.shields.io/crates/v/netcode-official.svg)](https://crates.io/crates/netcode-official)
 [![docs.rs](https://docs.rs/netcode-official/badge.svg)](https://docs.rs/netcode-official)
 
+If this library helps you, please support it: **[Become a supporter](https://www.patreon.com/MasBandwidth/membership)**
+
 **netcode** is a secure client/server protocol for multiplayer games built on top of UDP.
 
 This is a Rust implementation of the [netcode 1.02 standard](https://github.com/mas-bandwidth/netcode/blob/main/STANDARD.md). It is a from-scratch port of the [reference C implementation](https://github.com/mas-bandwidth/netcode), written in idiomatic Rust, and interoperates on the wire with other conforming implementations.
@@ -151,7 +153,7 @@ The author of this library is [Glenn Fiedler](https://www.linkedin.com/in/glenn-
 
 Other open source libraries by the same author include: [netcode](https://github.com/mas-bandwidth/netcode) (C reference implementation), [reliable](https://github.com/mas-bandwidth/reliable), [serialize](https://github.com/mas-bandwidth/serialize), and [yojimbo](https://github.com/mas-bandwidth/yojimbo).
 
-If you find this software useful, [please consider sponsoring it](https://github.com/sponsors/mas-bandwidth). Thanks!
+If you find this software useful, please consider [becoming a supporter](https://www.patreon.com/MasBandwidth/membership). Thanks!
 
 # License
 

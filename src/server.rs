@@ -49,6 +49,22 @@ pub enum ServerEvent {
 
 const MAX_ENCRYPTION_MAPPINGS: usize = MAX_CLIENTS * 4;
 
+/// Configuration for a [`Server`].
+#[derive(Debug, Clone, Copy)]
+pub struct ServerConfig {
+    /// The longest lifetime, in seconds, of connect tokens issued by the backend.
+    /// A token whose expiry is earlier than the server start time plus this lifetime
+    /// is rejected. Values at or below zero use
+    /// [`crate::DEFAULT_MAX_CONNECT_TOKEN_LIFETIME`].
+    pub max_connect_token_lifetime: i32,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self { max_connect_token_lifetime: crate::DEFAULT_MAX_CONNECT_TOKEN_LIFETIME }
+    }
+}
+
 /// Maps packet source addresses to the encryption keys from their connect token.
 /// An entry is added when a connection request is accepted and expires after
 /// `timeout` seconds without packets, or at `expire_time` if the client never
@@ -59,6 +75,7 @@ struct EncryptionEntry {
     expire_time: f64,
     last_access_time: f64,
     client_index: Option<usize>,
+    connect_token_entry_index: Option<usize>,
     send_key: Key,
     receive_key: Key,
 }
@@ -71,6 +88,7 @@ impl EncryptionEntry {
             expire_time: -1.0,
             last_access_time: -1000.0,
             client_index: None,
+            connect_token_entry_index: None,
             send_key: [0; KEY_BYTES],
             receive_key: [0; KEY_BYTES],
         }
@@ -110,6 +128,7 @@ impl EncryptionManager {
         time: f64,
         expire_time: f64,
         timeout_seconds: i32,
+        connect_token_entry_index: usize,
     ) -> bool {
         for index in 0..self.num_entries {
             let entry = &mut self.entries[index];
@@ -119,6 +138,7 @@ impl EncryptionManager {
                 entry.last_access_time = time;
                 entry.send_key = *send_key;
                 entry.receive_key = *receive_key;
+                entry.connect_token_entry_index = Some(connect_token_entry_index);
                 return true;
             }
         }
@@ -132,6 +152,7 @@ impl EncryptionManager {
                     expire_time,
                     last_access_time: time,
                     client_index: None,
+                    connect_token_entry_index: Some(connect_token_entry_index),
                     send_key: *send_key,
                     receive_key: *receive_key,
                 };
@@ -200,6 +221,10 @@ impl EncryptionManager {
         self.entries[index].client_index = client_index;
     }
 
+    fn connect_token_entry_index(&self, index: usize) -> Option<usize> {
+        self.entries[index].connect_token_entry_index
+    }
+
     fn send_key(&self, index: usize) -> Key {
         self.entries[index].send_key
     }
@@ -217,10 +242,27 @@ impl EncryptionManager {
 
 const MAX_CONNECT_TOKEN_ENTRIES: usize = MAX_CLIENTS * 8;
 
-/// A history of connect tokens already used, keyed by token HMAC, so a token stolen
-/// off the wire cannot be replayed from a different address.
+/// A history of connect tokens seen by the server, keyed by token HMAC, so a token
+/// stolen off the wire cannot be replayed from a different address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectTokenEntryState {
+    Free,
+    Pending,
+    Consumed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectTokenEntryResult {
+    Accepted(usize),
+    Refused,
+    HistoryFull,
+}
+
 struct ConnectTokenEntry {
+    state: ConnectTokenEntryState,
+    #[allow(dead_code)]
     time: f64,
+    expire_timestamp: u64,
     mac: [u8; MAC_BYTES],
     address: Option<SocketAddr>,
 }
@@ -228,45 +270,70 @@ struct ConnectTokenEntry {
 fn reset_connect_token_entries(entries: &mut Vec<ConnectTokenEntry>) {
     entries.clear();
     entries.extend((0..MAX_CONNECT_TOKEN_ENTRIES).map(|_| ConnectTokenEntry {
+        state: ConnectTokenEntryState::Free,
         time: -1000.0,
+        expire_timestamp: 0,
         mac: [0; MAC_BYTES],
         address: None,
     }));
 }
 
-/// Returns whether the connect token may be used from this address: true for a token
-/// never seen before (recording it) or one seen only from the same address.
+/// Returns the history entry that admits this connection request.
 fn find_or_add_connect_token_entry(
     entries: &mut [ConnectTokenEntry],
     address: SocketAddr,
     mac: &[u8; MAC_BYTES],
+    expire_timestamp: u64,
+    current_timestamp: u64,
     time: f64,
-) -> bool {
-    // find the matching entry for the token mac and the oldest token entry.
-    // constant time worst case. This is intentional!
+) -> ConnectTokenEntryResult {
+    // Find the matching entry for the token MAC and the first slot that is free
+    // or whose token has expired. The scan is constant time in the worst case.
+    // This is intentional so token history timing does not reveal whether a token
+    // was seen before.
     let mut matching_index = None;
-    let mut oldest_index = 0;
-    let mut oldest_time = f64::MAX;
+    let mut free_index = None;
 
     for (index, entry) in entries.iter().enumerate() {
-        if &entry.mac == mac {
+        if entry.state != ConnectTokenEntryState::Free && &entry.mac == mac {
             matching_index = Some(index);
         }
-        if entry.time < oldest_time {
-            oldest_time = entry.time;
-            oldest_index = index;
+        if free_index.is_none()
+            && (entry.state == ConnectTokenEntryState::Free
+                || entry.expire_timestamp <= current_timestamp)
+        {
+            free_index = Some(index);
         }
     }
 
     match matching_index {
-        // this is a new connect token: replace the oldest entry
         None => {
-            entries[oldest_index] = ConnectTokenEntry { time, mac: *mac, address: Some(address) };
-            true
+            let Some(index) = free_index else {
+                return ConnectTokenEntryResult::HistoryFull;
+            };
+            entries[index] = ConnectTokenEntry {
+                state: ConnectTokenEntryState::Pending,
+                time,
+                expire_timestamp,
+                mac: *mac,
+                address: Some(address),
+            };
+            ConnectTokenEntryResult::Accepted(index)
         }
-        // allow connect tokens we have already seen from the same address
-        Some(index) => entries[index].address == Some(address),
+        Some(index) => {
+            if entries[index].state == ConnectTokenEntryState::Pending
+                && entries[index].address == Some(address)
+            {
+                ConnectTokenEntryResult::Accepted(index)
+            } else {
+                ConnectTokenEntryResult::Refused
+            }
+        }
     }
+}
+
+fn consume_connect_token_entry(entries: &mut [ConnectTokenEntry], index: usize) {
+    entries[index].state = ConnectTokenEntryState::Consumed;
 }
 
 // ----------------------------------------------------------------
@@ -314,6 +381,7 @@ impl ClientSlot {
 pub struct Server {
     protocol_id: u64,
     private_key: Key,
+    max_connect_token_lifetime: u64,
     socket: UdpSocket,
     public_address: SocketAddr,
     time: f64,
@@ -322,6 +390,7 @@ pub struct Server {
     num_connected_clients: usize,
     global_sequence: u64,
     challenge_sequence: u64,
+    min_connect_token_expire_timestamp: u64,
     challenge_key: Key,
     clients: Vec<ClientSlot>,
     connect_token_entries: Vec<ConnectTokenEntry>,
@@ -344,6 +413,23 @@ impl Server {
         private_key: &Key,
         time: f64,
     ) -> Result<Self, Error> {
+        Self::new_with_config(
+            public_address,
+            protocol_id,
+            private_key,
+            ServerConfig::default(),
+            time,
+        )
+    }
+
+    /// Creates a server with explicit configuration.
+    pub fn new_with_config(
+        public_address: SocketAddr,
+        protocol_id: u64,
+        private_key: &Key,
+        config: ServerConfig,
+        time: f64,
+    ) -> Result<Self, Error> {
         let bind_address: SocketAddr = match public_address {
             SocketAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, public_address.port()).into(),
             SocketAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, public_address.port()).into(),
@@ -363,6 +449,11 @@ impl Server {
         Ok(Self {
             protocol_id,
             private_key: *private_key,
+            max_connect_token_lifetime: if config.max_connect_token_lifetime > 0 {
+                config.max_connect_token_lifetime as u64
+            } else {
+                crate::DEFAULT_MAX_CONNECT_TOKEN_LIFETIME as u64
+            },
             socket,
             public_address,
             time,
@@ -371,6 +462,7 @@ impl Server {
             num_connected_clients: 0,
             global_sequence: 1 << 63,
             challenge_sequence: 0,
+            min_connect_token_expire_timestamp: 0,
             challenge_key: [0; KEY_BYTES],
             clients: Vec::new(),
             connect_token_entries,
@@ -397,6 +489,8 @@ impl Server {
         self.num_connected_clients = 0;
         self.challenge_sequence = 0;
         self.challenge_key = crypto::generate_key();
+        self.min_connect_token_expire_timestamp =
+            token::unix_timestamp().saturating_add(self.max_connect_token_lifetime);
         // global packets (challenge, denied) encrypt with the same per-token
         // server-to-client keys as per-client packets, whose sequences start at zero,
         // so the global sequence takes the top half of the space to keep AEAD nonces
@@ -421,6 +515,7 @@ impl Server {
         self.global_sequence = 1 << 63;
         self.challenge_sequence = 0;
         self.challenge_key = [0; KEY_BYTES];
+        self.min_connect_token_expire_timestamp = 0;
         self.clients.clear();
 
         reset_connect_token_entries(&mut self.connect_token_entries);
@@ -631,19 +726,29 @@ impl Server {
         let replay_protection =
             client_index.map(|client_index| &mut self.clients[client_index].replay_protection);
 
-        let Some((packet, sequence)) = crate::packet::read_packet(
-            packet_data,
-            read_packet_key.as_ref(),
-            protocol_id,
-            current_timestamp,
-            Some(&private_key),
-            AllowedPackets::SERVER,
-            replay_protection,
-        ) else {
+        let Some((packet, sequence)) =
+            crate::packet::read_packet_with_min_connect_token_expire_timestamp(
+                packet_data,
+                read_packet_key.as_ref(),
+                protocol_id,
+                current_timestamp,
+                Some(&private_key),
+                AllowedPackets::SERVER,
+                replay_protection,
+                self.min_connect_token_expire_timestamp,
+            )
+        else {
             return;
         };
 
-        self.process_packet(from, packet, sequence, encryption_index, client_index);
+        self.process_packet(
+            from,
+            packet,
+            sequence,
+            encryption_index,
+            client_index,
+            current_timestamp,
+        );
     }
 
     fn process_packet(
@@ -653,11 +758,17 @@ impl Server {
         sequence: u64,
         encryption_index: Option<usize>,
         client_index: Option<usize>,
+        current_timestamp: u64,
     ) {
         match packet {
-            Packet::Request { private_data, .. } => {
+            Packet::Request { expire_timestamp, private_data, .. } => {
                 debug!("server received connection request from {from}");
-                self.process_connection_request(from, &private_data);
+                self.process_connection_request(
+                    from,
+                    &private_data,
+                    expire_timestamp,
+                    current_timestamp,
+                );
             }
 
             Packet::Response { challenge_token_sequence, challenge_token_data } => {
@@ -722,6 +833,8 @@ impl Server {
         &mut self,
         from: SocketAddr,
         private_data: &[u8; CONNECT_TOKEN_PRIVATE_BYTES],
+        expire_timestamp: u64,
+        current_timestamp: u64,
     ) {
         let Ok(private_token) = PrivateConnectToken::read(&private_data[..]) else {
             debug!("server ignored connection request. failed to read connect token");
@@ -749,11 +862,24 @@ impl Server {
 
         let mac: [u8; MAC_BYTES] =
             private_data[CONNECT_TOKEN_PRIVATE_BYTES - MAC_BYTES..].try_into().unwrap();
-        if !find_or_add_connect_token_entry(&mut self.connect_token_entries, from, &mac, self.time)
-        {
-            debug!("server ignored connection request. connect token has already been used");
-            return;
-        }
+        let connect_token_entry_index = match find_or_add_connect_token_entry(
+            &mut self.connect_token_entries,
+            from,
+            &mac,
+            expire_timestamp,
+            current_timestamp,
+            self.time,
+        ) {
+            ConnectTokenEntryResult::Accepted(index) => index,
+            ConnectTokenEntryResult::Refused => {
+                debug!("server ignored connection request. connect token has already been used");
+                return;
+            }
+            ConnectTokenEntryResult::HistoryFull => {
+                debug!("server ignored connection request. connect token history is full");
+                return;
+            }
+        };
 
         if self.num_connected_clients == self.max_clients {
             debug!("server denied connection request. server is full");
@@ -774,6 +900,7 @@ impl Server {
             self.time,
             expire_time,
             private_token.timeout_seconds,
+            connect_token_entry_index,
         ) {
             debug!("server ignored connection request. failed to add encryption mapping");
             return;
@@ -881,6 +1008,11 @@ impl Server {
         // expires on its own, only when the client disconnects
         self.encryption_manager.set_expire_time(encryption_index, -1.0);
         self.encryption_manager.set_client_index(encryption_index, Some(client_index));
+        if let Some(connect_token_entry_index) =
+            self.encryption_manager.connect_token_entry_index(encryption_index)
+        {
+            consume_connect_token_entry(&mut self.connect_token_entries, connect_token_entry_index);
+        }
 
         let client = &mut self.clients[client_index];
         debug_assert!(!client.connected);
@@ -1075,6 +1207,7 @@ mod tests {
                 time,
                 time + 5.0,
                 5,
+                0,
             ));
         }
 
@@ -1107,24 +1240,115 @@ mod tests {
             100.0,
             105.0,
             -1,
+            0,
         ));
         assert!(manager.find_encryption_mapping(test_address(40000), 104.0).is_some());
         assert!(manager.find_encryption_mapping(test_address(40000), 106.0).is_none());
     }
 
     #[test]
-    fn connect_token_entries_reject_reuse_from_different_address() {
+    fn server_start_sets_configured_connect_token_restart_guard() {
+        let private_key = crypto::generate_key();
+        let mut server = Server::new_with_config(
+            test_address(0),
+            TEST_PROTOCOL_ID,
+            &private_key,
+            ServerConfig { max_connect_token_lifetime: 60 },
+            0.0,
+        )
+        .unwrap();
+
+        assert_eq!(server.min_connect_token_expire_timestamp, 0);
+        server.start(1).unwrap();
+
+        let current_timestamp = token::unix_timestamp();
+        assert!(server.min_connect_token_expire_timestamp >= current_timestamp + 59);
+        assert!(server.min_connect_token_expire_timestamp <= current_timestamp + 60);
+    }
+
+    #[test]
+    fn connect_token_entries_enforce_single_use_and_bounded_history() {
         let mut entries = Vec::new();
         reset_connect_token_entries(&mut entries);
 
         let mac = [0x42u8; MAC_BYTES];
 
         // first use records the token
-        assert!(find_or_add_connect_token_entry(&mut entries, test_address(40000), &mac, 0.0));
-        // same token from the same address is fine
-        assert!(find_or_add_connect_token_entry(&mut entries, test_address(40000), &mac, 1.0));
-        // same token from a different address is rejected
-        assert!(!find_or_add_connect_token_entry(&mut entries, test_address(40001), &mac, 2.0));
+        let index = match find_or_add_connect_token_entry(
+            &mut entries,
+            test_address(40000),
+            &mac,
+            30,
+            0,
+            0.0,
+        ) {
+            ConnectTokenEntryResult::Accepted(index) => index,
+            result => panic!("unexpected result: {result:?}"),
+        };
+        // a pending token can be retransmitted from the address that created it,
+        // and the entry time is not refreshed
+        assert_eq!(
+            find_or_add_connect_token_entry(&mut entries, test_address(40000), &mac, 30, 1, 1.0,),
+            ConnectTokenEntryResult::Accepted(index)
+        );
+        assert_eq!(entries[index].time, 0.0);
+        // a pending token refuses every other address
+        assert_eq!(
+            find_or_add_connect_token_entry(&mut entries, test_address(40001), &mac, 30, 2, 2.0,),
+            ConnectTokenEntryResult::Refused
+        );
+
+        // once the client is installed, the token is consumed and cannot be
+        // presented again, including from the address that used it
+        consume_connect_token_entry(&mut entries, index);
+        assert_eq!(
+            find_or_add_connect_token_entry(&mut entries, test_address(40000), &mac, 30, 3, 3.0,),
+            ConnectTokenEntryResult::Refused
+        );
+
+        // a history whose entries all hold unexpired tokens refuses a new token
+        // instead of evicting a consumed entry
+        for i in 1..MAX_CONNECT_TOKEN_ENTRIES {
+            let mut mac = [0u8; MAC_BYTES];
+            mac[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            assert!(matches!(
+                find_or_add_connect_token_entry(
+                    &mut entries,
+                    test_address(40000),
+                    &mac,
+                    30,
+                    0,
+                    4.0,
+                ),
+                ConnectTokenEntryResult::Accepted(_)
+            ));
+        }
+
+        let new_mac = [0xFFu8; MAC_BYTES];
+        assert_eq!(
+            find_or_add_connect_token_entry(
+                &mut entries,
+                test_address(40000),
+                &new_mac,
+                30,
+                0,
+                5.0,
+            ),
+            ConnectTokenEntryResult::HistoryFull
+        );
+
+        // entries become reusable only after the token expires
+        assert!(matches!(
+            find_or_add_connect_token_entry(
+                &mut entries,
+                test_address(40000),
+                &new_mac,
+                30,
+                30,
+                6.0,
+            ),
+            ConnectTokenEntryResult::Accepted(_)
+        ));
     }
 
     /// Sends `connect_token` to the server as a connection request from `socket` and

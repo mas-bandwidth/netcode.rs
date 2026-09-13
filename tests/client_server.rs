@@ -188,6 +188,29 @@ fn connect_token_cannot_be_reused_from_another_address() {
 }
 
 #[test]
+fn connect_token_cannot_be_reused_after_disconnect() {
+    let mut harness = Harness::new(1);
+    let connect_token = harness.generate_connect_token(1);
+
+    let mut client = Client::new("127.0.0.1:0".parse().unwrap(), 0.0).unwrap();
+    client.connect(&connect_token).unwrap();
+    harness.clients.push(client);
+    harness.run_until(1000, |h| h.clients[0].state() == ClientState::Connected);
+
+    harness.server.disconnect_client(0);
+    harness.run_until(1000, |h| h.clients[0].state() == ClientState::Disconnected);
+
+    // Reuse the same client socket and token after the session has ended. The
+    // token was consumed when the first client was installed.
+    harness.clients[0].connect(&connect_token).unwrap();
+    for _ in 0..300 {
+        harness.update();
+        assert_ne!(harness.clients[0].state(), ClientState::Connected);
+    }
+    assert_eq!(harness.server.num_connected_clients(), 0);
+}
+
+#[test]
 fn wrong_protocol_id_cannot_connect() {
     let mut harness = Harness::new(1);
 

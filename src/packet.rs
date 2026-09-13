@@ -199,6 +199,32 @@ pub(crate) fn read_packet(
     allowed_packets: AllowedPackets,
     replay_protection: Option<&mut ReplayProtection>,
 ) -> Option<(Packet, u64)> {
+    read_packet_with_min_connect_token_expire_timestamp(
+        buffer,
+        read_packet_key,
+        protocol_id,
+        current_timestamp,
+        private_key,
+        allowed_packets,
+        replay_protection,
+        0,
+    )
+}
+
+/// Reads a packet while also rejecting connect tokens that could have been issued before
+/// the server started. The minimum expiry timestamp is zero for clients and servers that do
+/// not enable the restart mitigation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn read_packet_with_min_connect_token_expire_timestamp(
+    buffer: &mut [u8],
+    read_packet_key: Option<&Key>,
+    protocol_id: u64,
+    current_timestamp: u64,
+    private_key: Option<&Key>,
+    allowed_packets: AllowedPackets,
+    replay_protection: Option<&mut ReplayProtection>,
+    min_connect_token_expire_timestamp: u64,
+) -> Option<(Packet, u64)> {
     if buffer.is_empty() {
         debug!("ignored packet. buffer length is less than 1");
         return None;
@@ -211,6 +237,7 @@ pub(crate) fn read_packet(
             buffer,
             protocol_id,
             current_timestamp,
+            min_connect_token_expire_timestamp,
             private_key,
             allowed_packets,
         )
@@ -358,6 +385,7 @@ fn read_connection_request_packet(
     buffer: &mut [u8],
     protocol_id: u64,
     current_timestamp: u64,
+    min_connect_token_expire_timestamp: u64,
     private_key: Option<&Key>,
     allowed_packets: AllowedPackets,
 ) -> Option<Packet> {
@@ -398,6 +426,11 @@ fn read_connection_request_packet(
     let expire_timestamp = reader.read_u64()?;
     if expire_timestamp <= current_timestamp {
         debug!("ignored connection request packet. connect token expired");
+        return None;
+    }
+
+    if expire_timestamp < min_connect_token_expire_timestamp {
+        debug!("ignored connection request packet. connect token predates the server start");
         return None;
     }
 
@@ -596,6 +629,56 @@ mod tests {
             }
             _ => panic!("wrong packet type"),
         }
+    }
+
+    #[test]
+    fn connection_request_rejects_token_before_server_start() {
+        let private_key = generate_key();
+        let expire_timestamp = crate::token::unix_timestamp() + 30;
+
+        let mut nonce = [0u8; CONNECT_TOKEN_NONCE_BYTES];
+        crypto::random_bytes(&mut nonce);
+
+        let private_token = crate::token::PrivateConnectToken::generate(
+            0x1234,
+            10,
+            &["127.0.0.1:40000".parse().unwrap()],
+            &[0u8; crate::USER_DATA_BYTES],
+        );
+        let mut private_data = Box::new([0u8; CONNECT_TOKEN_PRIVATE_BYTES]);
+        private_token.write(&mut private_data);
+        crate::token::encrypt_connect_token_private(
+            &mut private_data,
+            TEST_PROTOCOL_ID,
+            expire_timestamp,
+            &nonce,
+            &private_key,
+        )
+        .unwrap();
+
+        let input = Packet::Request {
+            protocol_id: TEST_PROTOCOL_ID,
+            expire_timestamp,
+            nonce,
+            private_data,
+        };
+        let key = generate_key();
+        let mut buffer = [0u8; MAX_PACKET_BYTES];
+        let written = write_packet(&input, &mut buffer, 0, &key, TEST_PROTOCOL_ID).unwrap();
+
+        assert!(
+            read_packet_with_min_connect_token_expire_timestamp(
+                &mut buffer[..written],
+                None,
+                TEST_PROTOCOL_ID,
+                crate::token::unix_timestamp(),
+                Some(&private_key),
+                AllowedPackets::SERVER,
+                None,
+                expire_timestamp + 1,
+            )
+            .is_none()
+        );
     }
 
     #[test]

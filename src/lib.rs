@@ -105,7 +105,7 @@ mod wire_compat;
 pub use client::{Client, ClientState};
 pub use crypto::generate_key;
 pub use error::Error;
-pub use server::{DisconnectReason, Server, ServerEvent};
+pub use server::{DisconnectReason, Server, ServerConfig, ServerEvent};
 pub use token::generate_connect_token;
 
 /// The size of a connect token in bytes.
@@ -125,6 +125,9 @@ pub const MAX_SERVERS_PER_CONNECT: usize = 32;
 
 /// The maximum number of client slots on a server.
 pub const MAX_CLIENTS: usize = 256;
+
+/// The default maximum lifetime, in seconds, for connect tokens issued by the backend.
+pub const DEFAULT_MAX_CONNECT_TOKEN_LIFETIME: i32 = 30;
 
 /// The maximum size of a payload packet in bytes.
 pub const MAX_PAYLOAD_BYTES: usize = 1200;

@@ -62,6 +62,28 @@ let mut server = netcode::Server::new(server_address, protocol_id, &private_key,
     .expect("failed to create server");
 ```
 
+`Server::new` uses the default maximum connect-token lifetime of 30 seconds for
+the server-restart replay guard. If your backend issues tokens with a different
+maximum lifetime, configure it when creating the server:
+
+```rust
+let config = netcode::ServerConfig { max_connect_token_lifetime: 60 };
+let mut server = netcode::Server::new_with_config(
+    server_address,
+    protocol_id,
+    &private_key,
+    config,
+    time,
+)
+.expect("failed to create server");
+```
+
+The server records each connect token it sees. Retransmitted requests remain
+pending only from their original address; a token is consumed when its client
+is installed and cannot be used again. While the server runs, entries remain
+until their tokens expire, so the finite history refuses new tokens rather than
+evicting unexpired entries.
+
 Then start the server with the number of client slots you want:
 
 ```rust

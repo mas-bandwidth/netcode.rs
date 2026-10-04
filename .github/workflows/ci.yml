@@ -1,10 +1,24 @@
+# Per-change CI stays within a two-minute critical path: docs-only changes skip every
+# job and each fuzz smoke target runs for ten seconds.
 name: CI
 
 on:
   push:
     branches: [main]
+    paths-ignore: &docs-ignore
+      - '**/*.md'
+      - 'LICENSE'
+      - '**/*.png'
+      - '**/*.jpg'
+      - '**/*.jpeg'
+      - '**/*.gif'
+      - '**/*.svg'
+      - '**/*.ico'
+      - '**/*.webp'
+      - '.github/ISSUE_TEMPLATE/**'
   pull_request:
     branches: [main]
+    paths-ignore: *docs-ignore
 
 env:
   CARGO_TERM_COLOR: always
@@ -103,7 +117,7 @@ jobs:
           # incompatible with the address sanitizer: always fuzz the host triple
           host=$(rustc -vV | sed -n 's/host: //p')
           for target in $(cargo fuzz list); do
-            cargo fuzz run "$target" --target "$host" -- -max_total_time=30
+            cargo fuzz run "$target" --target "$host" -- -max_total_time=10
           done
 
   spec-sync:

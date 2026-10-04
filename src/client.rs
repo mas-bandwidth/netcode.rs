@@ -741,4 +741,69 @@ mod tests {
             false
         }
     }
+
+    /// test_client_create from netcode.c (lines 7656-7725). Creates a client bound
+    /// to port 0 (the C test binds 40000/50000) and checks which sockets were opened
+    /// and that the bound address matches the requested address family and IP.
+    #[test]
+    fn client_create() {
+        // IPv4-only bind: ipv4 socket open, ipv6 socket closed
+        {
+            let client = Client::new("127.0.0.1:0".parse().unwrap(), 0.0).unwrap();
+            let test_address: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+            assert!(client.socket_ipv4.is_some());
+            assert!(client.socket_ipv6.is_none());
+            let bound = bound_local_addr(&client, true);
+            assert_eq!(bound.ip(), test_address.ip());
+            assert_eq!(bound.is_ipv4(), test_address.is_ipv4());
+        }
+
+        // IPv6-only bind: ipv4 socket closed, ipv6 socket open
+        {
+            let client = Client::new("[::]:0".parse().unwrap(), 0.0).unwrap();
+            let test_address: SocketAddr = "[::]:50000".parse().unwrap();
+            assert!(client.socket_ipv4.is_none());
+            assert!(client.socket_ipv6.is_some());
+            let bound = bound_local_addr(&client, false);
+            assert_eq!(bound.ip(), test_address.ip());
+            assert_eq!(bound.is_ipv6(), test_address.is_ipv6());
+        }
+
+        // dual bind with an IPv4 primary address: both sockets open
+        {
+            let client =
+                Client::new_dual("127.0.0.1:0".parse().unwrap(), "[::]:0".parse().unwrap(), 0.0)
+                    .unwrap();
+            let test_address: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+            assert!(client.socket_ipv4.is_some());
+            assert!(client.socket_ipv6.is_some());
+            let bound = bound_local_addr(&client, true);
+            assert_eq!(bound.ip(), test_address.ip());
+            assert_eq!(bound.is_ipv4(), test_address.is_ipv4());
+        }
+
+        // dual bind with an IPv6 primary address: both sockets open
+        {
+            let client =
+                Client::new_dual("127.0.0.1:0".parse().unwrap(), "[::]:0".parse().unwrap(), 0.0)
+                    .unwrap();
+            let test_address: SocketAddr = "[::]:50000".parse().unwrap();
+            assert!(client.socket_ipv4.is_some());
+            assert!(client.socket_ipv6.is_some());
+            let bound = bound_local_addr(&client, false);
+            assert_eq!(bound.ip(), test_address.ip());
+            assert_eq!(bound.is_ipv6(), test_address.is_ipv6());
+        }
+    }
+
+    /// The local address the client bound, selecting the socket whose family matches
+    /// the C test's address. Port is omitted from the comparison because the port is
+    /// 0 here (OS-assigned) rather than the C test's fixed 40000/50000.
+    fn bound_local_addr(client: &Client, ipv4: bool) -> SocketAddr {
+        let socket = if ipv4 { client.socket_ipv4.as_ref() } else { client.socket_ipv6.as_ref() };
+        socket
+            .expect("client should have a bound socket for this family")
+            .local_addr()
+            .expect("local_addr")
+    }
 }

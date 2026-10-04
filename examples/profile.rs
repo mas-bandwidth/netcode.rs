@@ -90,8 +90,7 @@ fn main() {
         }
     }
 
-    #[allow(clippy::print_with_newline)]
-    print!("shutdown\n");
+    let _ = std::io::stdout().write_all(b"shutdown\n");
 
     for entry in server.iter_mut() {
         *entry = None;

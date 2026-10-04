@@ -50,6 +50,8 @@ fn main() {
         num_iterations = args[1].parse().unwrap_or(0);
     }
 
+    println!("initializing");
+
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let mut rng =
@@ -88,7 +90,7 @@ fn main() {
         }
     }
 
-    println!("\nshutdown");
+    print!("shutdown\n");
 
     for entry in server.iter_mut() {
         *entry = None;

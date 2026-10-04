@@ -61,6 +61,8 @@ fn main() {
 
     println!("[soak]\nnum_iterations = {num_iterations}");
 
+    println!("initializing");
+
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let mut rng =
@@ -71,6 +73,8 @@ fn main() {
 
     let mut server: [Option<Server>; MAX_SERVERS] = std::array::from_fn(|_| None);
     let mut client: [Option<Client>; MAX_CLIENTS] = std::array::from_fn(|_| None);
+
+    println!("starting");
 
     let mut time = 0.0;
     let delta_time = 0.1;

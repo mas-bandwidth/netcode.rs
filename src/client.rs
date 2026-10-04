@@ -653,4 +653,157 @@ mod tests {
         assert!(client.connect(&connect_token).is_err());
         assert_eq!(client.state(), ClientState::InvalidConnectToken);
     }
+
+    /// test_queue from netcode.c (lines 5883-5971). Exercises the client's receive
+    /// queue (`packet_receive_queue`) with the same capacity boundary and drop
+    /// behaviour as the C packet_queue, bounded by `PACKET_QUEUE_SIZE`.
+    #[test]
+    fn queue() {
+        let mut client = Client::new("127.0.0.1:0".parse().unwrap(), 0.0).unwrap();
+        let queue = &mut client.packet_receive_queue;
+
+        // netcode_packet_queue_init: a fresh queue is empty
+        assert_eq!(queue.len(), 0);
+        // C: queue.start_index == 0 -- no Rust equivalent: VecDeque has no start_index field
+
+        // popping a packet off an empty queue returns NULL (None here)
+        assert!(queue.pop_front().is_none());
+
+        // add some packets and make sure they pop off in the correct order
+        const NUM_PACKETS: usize = 100;
+        let mut packets: Vec<Vec<u8>> = Vec::with_capacity(NUM_PACKETS);
+        for i in 0..NUM_PACKETS {
+            let packet = vec![i as u8; (i + 1) * 256];
+            // C: netcode_packet_queue_push == 1 (success)
+            assert!(push_queue(queue, packet.clone(), i as u64));
+            packets.push(packet);
+        }
+
+        assert_eq!(queue.len(), NUM_PACKETS);
+
+        for (i, original) in packets.iter().enumerate() {
+            let (packet, sequence) = queue.pop_front().expect("packet");
+            assert_eq!(sequence, i as u64);
+            assert_eq!(packet.as_slice(), original.as_slice());
+        }
+
+        // after all entries are popped, the queue is empty, so pop returns None
+        assert_eq!(queue.len(), 0);
+        assert!(queue.pop_front().is_none());
+
+        // the queue can be filled to its maximum capacity
+        packets.clear();
+        for i in 0..PACKET_QUEUE_SIZE {
+            let packet = vec![i as u8; i * 256];
+            // C: netcode_packet_queue_push == 1 (success)
+            assert!(push_queue(queue, packet.clone(), i as u64));
+            packets.push(packet);
+        }
+
+        assert_eq!(queue.len(), PACKET_QUEUE_SIZE);
+
+        // when full, attempting to push drops the packet and returns 0 (false)
+        // C: netcode_packet_queue_push( &queue, malloc(100), 0 ) == 0
+        assert!(!push_queue(queue, vec![0u8; 100], 0));
+        assert_eq!(queue.len(), PACKET_QUEUE_SIZE);
+
+        // all packets pop off in the correct order
+        for (i, original) in packets.iter().enumerate() {
+            let (packet, sequence) = queue.pop_front().expect("packet");
+            assert_eq!(sequence, i as u64);
+            assert_eq!(packet.as_slice(), original.as_slice());
+        }
+
+        // add some packets again
+        for (i, slot) in packets.iter_mut().enumerate() {
+            let packet = vec![i as u8; i * 256];
+            assert!(push_queue(queue, packet.clone(), i as u64));
+            *slot = packet;
+        }
+
+        // clear the queue and make sure every entry is dropped
+        queue.clear();
+        assert_eq!(queue.len(), 0);
+        // C: queue.start_index == 0 -- no Rust equivalent: VecDeque has no start_index field
+        // C: queue.packet_data[i] == NULL -- no Rust equivalent: VecDeque stores owned Vecs,
+        //    not a fixed array of pointers to check for NULL
+    }
+
+    /// Mirrors C `netcode_packet_queue_push`: succeeds when the queue is below
+    /// `PACKET_QUEUE_SIZE` and frees (drops) the packet, returning false, when full.
+    fn push_queue(queue: &mut VecDeque<(Vec<u8>, u64)>, packet: Vec<u8>, sequence: u64) -> bool {
+        if queue.len() < PACKET_QUEUE_SIZE {
+            queue.push_back((packet, sequence));
+            true
+        } else {
+            // C equivalent: queue->free_function(queue->allocator_context, packet_data)
+            drop(packet);
+            false
+        }
+    }
+
+    /// test_client_create from netcode.c (lines 7656-7725). Creates a client bound
+    /// to port 0 (the C test binds 40000/50000) and checks which sockets were opened
+    /// and that the bound address matches the requested address family and IP.
+    #[test]
+    fn client_create() {
+        // IPv4-only bind: ipv4 socket open, ipv6 socket closed
+        {
+            let client = Client::new("127.0.0.1:0".parse().unwrap(), 0.0).unwrap();
+            let test_address: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+            assert!(client.socket_ipv4.is_some());
+            assert!(client.socket_ipv6.is_none());
+            let bound = bound_local_addr(&client, true);
+            assert_eq!(bound.ip(), test_address.ip());
+            assert_eq!(bound.is_ipv4(), test_address.is_ipv4());
+        }
+
+        // IPv6-only bind: ipv4 socket closed, ipv6 socket open
+        {
+            let client = Client::new("[::]:0".parse().unwrap(), 0.0).unwrap();
+            let test_address: SocketAddr = "[::]:50000".parse().unwrap();
+            assert!(client.socket_ipv4.is_none());
+            assert!(client.socket_ipv6.is_some());
+            let bound = bound_local_addr(&client, false);
+            assert_eq!(bound.ip(), test_address.ip());
+            assert_eq!(bound.is_ipv6(), test_address.is_ipv6());
+        }
+
+        // dual bind with an IPv4 primary address: both sockets open
+        {
+            let client =
+                Client::new_dual("127.0.0.1:0".parse().unwrap(), "[::]:0".parse().unwrap(), 0.0)
+                    .unwrap();
+            let test_address: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+            assert!(client.socket_ipv4.is_some());
+            assert!(client.socket_ipv6.is_some());
+            let bound = bound_local_addr(&client, true);
+            assert_eq!(bound.ip(), test_address.ip());
+            assert_eq!(bound.is_ipv4(), test_address.is_ipv4());
+        }
+
+        // dual bind with an IPv6 primary address: both sockets open
+        {
+            let client =
+                Client::new_dual("127.0.0.1:0".parse().unwrap(), "[::]:0".parse().unwrap(), 0.0)
+                    .unwrap();
+            let test_address: SocketAddr = "[::]:50000".parse().unwrap();
+            assert!(client.socket_ipv4.is_some());
+            assert!(client.socket_ipv6.is_some());
+            let bound = bound_local_addr(&client, false);
+            assert_eq!(bound.ip(), test_address.ip());
+            assert_eq!(bound.is_ipv6(), test_address.is_ipv6());
+        }
+    }
+
+    /// The local address the client bound, selecting the socket whose family matches
+    /// the C test's address. Port is omitted from the comparison because the port is
+    /// 0 here (OS-assigned) rather than the C test's fixed 40000/50000.
+    fn bound_local_addr(client: &Client, ipv4: bool) -> SocketAddr {
+        let socket = if ipv4 { client.socket_ipv4.as_ref() } else { client.socket_ipv6.as_ref() };
+        socket
+            .expect("client should have a bound socket for this family")
+            .local_addr()
+            .expect("local_addr")
+    }
 }

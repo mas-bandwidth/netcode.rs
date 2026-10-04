@@ -90,6 +90,7 @@ fn main() {
         }
     }
 
+    #[allow(clippy::print_with_newline)]
     print!("shutdown\n");
 
     for entry in server.iter_mut() {

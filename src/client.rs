@@ -504,24 +504,25 @@ impl Client {
 
     fn receive_packets(&mut self) {
         let mut packet_data = [0u8; MAX_PACKET_BYTES];
-        loop {
+        socket::drain_with_cap(crate::CLIENT_MAX_RECEIVE_PACKETS, || {
             // the client only talks to one server, so receive on the socket matching
-            // the current server address family. the socket borrow is scoped to the
-            // receive call so packet processing can borrow self mutably.
+            // the current server address family. the socket borrow ends when the
+            // receive call returns, so packet processing can borrow self mutably.
             let socket = match self.server_address {
                 Some(SocketAddr::V4(_)) => self.socket_ipv4.as_ref(),
                 Some(SocketAddr::V6(_)) => self.socket_ipv6.as_ref(),
                 None => None,
             };
             let Some(socket) = socket else {
-                return;
+                return socket::ReceiveStatus::Drained;
             };
-            let Some((packet_bytes, from)) = socket::receive_packet(socket, &mut packet_data)
-            else {
-                return;
-            };
-            self.process_packet(from, &mut packet_data[..packet_bytes]);
-        }
+            let (status, from) = socket::receive_datagram(socket, &mut packet_data);
+            if let socket::ReceiveStatus::Datagram(packet_bytes) = status {
+                let from = from.expect("a datagram carries a source address");
+                self.process_packet(from, &mut packet_data[..packet_bytes]);
+            }
+            status
+        });
     }
 
     fn process_packet(&mut self, from: SocketAddr, packet_data: &mut [u8]) {

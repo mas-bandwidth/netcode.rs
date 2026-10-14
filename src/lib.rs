@@ -108,6 +108,9 @@ pub use error::Error;
 pub use server::{DisconnectReason, Server, ServerConfig, ServerEvent};
 pub use token::generate_connect_token;
 
+#[doc(hidden)]
+pub use socket::differential_transcript;
+
 /// The size of a connect token in bytes.
 pub const CONNECT_TOKEN_BYTES: usize = 2048;
 
@@ -125,6 +128,14 @@ pub const MAX_SERVERS_PER_CONNECT: usize = 32;
 
 /// The maximum number of client slots on a server.
 pub const MAX_CLIENTS: usize = 256;
+
+/// The maximum number of datagrams the server drains from its socket per update.
+/// Every receive attempt counts, so an unauthenticated sender cannot hold the
+/// update open; matches the reference's `64 * MAX_CLIENTS`.
+pub(crate) const SERVER_MAX_RECEIVE_PACKETS: usize = 64 * MAX_CLIENTS;
+
+/// The maximum number of datagrams the client drains from its socket per update.
+pub(crate) const CLIENT_MAX_RECEIVE_PACKETS: usize = 64;
 
 /// The default maximum lifetime, in seconds, for connect tokens issued by the backend.
 pub const DEFAULT_MAX_CONNECT_TOKEN_LIFETIME: i32 = 30;

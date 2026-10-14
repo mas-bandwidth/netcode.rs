@@ -49,13 +49,13 @@
 
     Override transports and a passed-in time only. No socket is opened.
 
-    Verified against mas-bandwidth/netcode branch sprint/netcode-audit-fixes at
-    1c58478 (the land of netfix-global-packet-nonces-differ-between-servers-sharing-a-token):
-    this scenario compiles and runs there unchanged, and its transcript matches
-    the port's byte for byte. The netcode_generate_connect_token call here uses
-    the signature netcode.h declares (num_server_addresses, public addresses,
-    internal addresses, expire_seconds, timeout_seconds, client_id, protocol_id,
-    private_key, user_data, out token buffer, returning int).
+    Written against mas-bandwidth/netcode branch sprint/netcode-audit-fixes at
+    or after 1c58478 (the land of
+    netfix-global-packet-nonces-differ-between-servers-sharing-a-token). The
+    netcode_generate_connect_token call here uses the signature netcode.h
+    declares (num_server_addresses, public addresses, internal addresses,
+    expire_seconds, timeout_seconds, client_id, protocol_id, private_key,
+    user_data, out token buffer, returning int).
 */
 
 static void global_nonce_send( void * context, struct netcode_address_t * to, NETCODE_CONST uint8_t * packet_data, int packet_bytes )

@@ -9,7 +9,9 @@
 //!
 //! This is a functional test: it builds and runs a local C program on fixed
 //! inputs with no socket and no clock anywhere in the comparison. It is
-//! `#[ignore]`d and gated on `NETCODE_C_DIR` so the unit gate stays hermetic:
+//! `#[ignore = "functional"]` so the unit gate stays hermetic. The functional
+//! run fails, it does not pass, when `NETCODE_C_DIR` is unset: a skip that
+//! returns is counted as a pass by libtest.
 //!
 //! ```console
 //! NETCODE_C_DIR=<checkout> cargo test --test c_differential -- --ignored --test-threads=1
@@ -20,6 +22,21 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+
+/// Resolves `NETCODE_C_DIR` for a functional (`#[ignore = "functional"]`) test.
+///
+/// Unset is a failure. Returning early would let libtest count the functional
+/// run as a pass when no C reference was compared.
+fn require_netcode_c_dir(scenario: &str) -> String {
+    std::env::var("NETCODE_C_DIR").unwrap_or_else(|_| {
+        panic!(
+            "c_differential ({scenario}): NETCODE_C_DIR is unset under the functional tag; \
+             this test fails rather than passing. Set it to a checkout of mas-bandwidth/netcode \
+             holding the fix, then run:\n    \
+             NETCODE_C_DIR=<checkout> cargo test --test c_differential -- --ignored --test-threads=1"
+        )
+    })
+}
 
 /// Builds and runs the C oracle, returning its stdout split into lines.
 ///
@@ -69,16 +86,9 @@ fn c_transcript_cc(netcode_c_dir: &str, args: &[&str], extra_cc: &[&str]) -> Vec
 }
 
 #[test]
-#[ignore = "requires a C reference checkout; see the file docs"]
+#[ignore = "functional"]
 fn receive_drain_matches_the_c_reference() {
-    let Ok(netcode_c_dir) = std::env::var("NETCODE_C_DIR") else {
-        eprintln!(
-            "SKIP c_differential: NETCODE_C_DIR is unset; set it to a checkout of \
-             mas-bandwidth/netcode holding the fix, then run:\n    \
-             NETCODE_C_DIR=<checkout> cargo test --test c_differential -- --ignored --test-threads=1"
-        );
-        return;
-    };
+    let netcode_c_dir = require_netcode_c_dir("receive_drain");
 
     let c_lines = c_transcript(&netcode_c_dir);
     let port_lines = netcode::differential_transcript();
@@ -99,17 +109,9 @@ fn receive_drain_matches_the_c_reference() {
 }
 
 #[test]
-#[ignore = "requires a C reference checkout; see the file docs"]
+#[ignore = "functional"]
 fn challenge_token_binds_matches_the_c_reference() {
-    let Ok(netcode_c_dir) = std::env::var("NETCODE_C_DIR") else {
-        eprintln!(
-            "SKIP c_differential: NETCODE_C_DIR is unset; set it to a checkout of \
-             mas-bandwidth/netcode holding the fix (branch sprint/netcode-audit-fixes at or after \
-             5cc4798d), then run:\n    \
-             NETCODE_C_DIR=<checkout> cargo test --test c_differential -- --ignored --test-threads=1"
-        );
-        return;
-    };
+    let netcode_c_dir = require_netcode_c_dir("challenge");
 
     let c_lines = c_transcript_for(&netcode_c_dir, &["challenge"]);
     let port_lines = netcode::challenge_token_transcript();
@@ -138,16 +140,9 @@ fn challenge_token_binds_matches_the_c_reference() {
 /// `netcode::differential_disconnect_transcript` has no callback at all, so the
 /// comparison is over the observable contract both must print.
 #[test]
-#[ignore = "requires a C reference checkout; see the file docs"]
+#[ignore = "functional"]
 fn disconnect_paths_match_the_c_reference() {
-    let Ok(netcode_c_dir) = std::env::var("NETCODE_C_DIR") else {
-        eprintln!(
-            "SKIP c_differential (disconnect): NETCODE_C_DIR is unset; set it to a checkout of \
-             mas-bandwidth/netcode holding the fix, then run:\n    \
-             NETCODE_C_DIR=<checkout> cargo test --test c_differential -- --ignored --test-threads=1"
-        );
-        return;
-    };
+    let netcode_c_dir = require_netcode_c_dir("disconnect");
 
     let c_lines = c_transcript_for(&netcode_c_dir, &["disconnect"]);
     let port_lines = netcode::differential_disconnect_transcript();
@@ -175,17 +170,9 @@ fn disconnect_paths_match_the_c_reference() {
 /// `netcode::replay_transcript`. Each line is
 /// `<op> <sequence or expire> -> <0|1|accepted|refused>` in decimal.
 #[test]
-#[ignore = "requires a C reference checkout; see the file docs"]
+#[ignore = "functional"]
 fn replay_edges_match_the_c_reference() {
-    let Ok(netcode_c_dir) = std::env::var("NETCODE_C_DIR") else {
-        eprintln!(
-            "SKIP c_differential (replay): NETCODE_C_DIR is unset; set it to a checkout of \
-             mas-bandwidth/netcode holding the fix (branch sprint/netcode-audit-fixes at or after \
-             406e8d28), then run:\n    \
-             NETCODE_C_DIR=<checkout> cargo test --test c_differential -- --ignored --test-threads=1"
-        );
-        return;
-    };
+    let netcode_c_dir = require_netcode_c_dir("replay");
 
     let c_lines = c_transcript_for(&netcode_c_dir, &["replay"]);
     let port_lines = netcode::replay_transcript();
@@ -215,18 +202,9 @@ fn replay_edges_match_the_c_reference() {
 /// `preconnect-response <timeout> -> <connects|refused>`, or
 /// `request <expire> -> <accepted|refused>`.
 #[test]
-#[ignore = "requires a C reference checkout; see the file docs"]
+#[ignore = "functional"]
 fn token_lifetimes_match_the_c_reference() {
-    let Ok(netcode_c_dir) = std::env::var("NETCODE_C_DIR") else {
-        eprintln!(
-            "SKIP c_differential (lifetime): NETCODE_C_DIR is unset; set it to a checkout of \
-             mas-bandwidth/netcode holding the fix (branch sprint/netcode-audit-fixes at or after \
-             the commit that lands netfix-never-expiring-tokens-are-refused-or-documented-against-the-restart-floor), \
-             then run:\n    \
-             NETCODE_C_DIR=<checkout> cargo test --test c_differential -- --ignored --test-threads=1"
-        );
-        return;
-    };
+    let netcode_c_dir = require_netcode_c_dir("lifetime");
 
     let c_lines = c_transcript_for(&netcode_c_dir, &["lifetime"]);
     let port_lines = netcode::token_lifetime_transcript();
@@ -300,18 +278,9 @@ fn connect_family_transcript() -> Vec<String> {
 /// [`connect_family_transcript`]. The port must settle on the same server
 /// address index as C, or reach `invalid_connect_token`, on each token.
 #[test]
-#[ignore = "requires a C reference checkout; see the file docs"]
+#[ignore = "functional"]
 fn connect_family_matches_the_c_reference() {
-    let Ok(netcode_c_dir) = std::env::var("NETCODE_C_DIR") else {
-        eprintln!(
-            "SKIP c_differential (connect_family): NETCODE_C_DIR is unset; set it to a checkout of \
-             mas-bandwidth/netcode holding the fix (branch sprint/netcode-audit-fixes at or after \
-             the commit that lands netfix-client-refuses-a-server-address-it-has-no-socket-for), \
-             then run:\n    \
-             NETCODE_C_DIR=<checkout> cargo test --test c_differential -- --ignored --test-threads=1"
-        );
-        return;
-    };
+    let netcode_c_dir = require_netcode_c_dir("connect_family");
 
     let c_lines = c_transcript_for(&netcode_c_dir, &["connect_family"]);
     let port_lines = connect_family_transcript();
@@ -399,26 +368,19 @@ fn global_nonce_transcript() -> Vec<String> {
 /// transport and an explicit time. Each sequence line is `<step> <property> <0|1>`;
 /// the client line is `client reuse <state>`. Random values are not printed.
 ///
-/// Verified against mas-bandwidth/netcode branch `sprint/netcode-audit-fixes` at
-/// `1c58478` (the land of `netfix-global-packet-nonces-differ-between-servers-sharing-a-token`):
-/// the transcripts match byte for byte with this port's fix, and first differ at
-/// `pair differ` (C `1` vs port `0`) with this port's fix reverted.
+/// Written against mas-bandwidth/netcode branch `sprint/netcode-audit-fixes` at
+/// or after `1c58478` (the land of
+/// `netfix-global-packet-nonces-differ-between-servers-sharing-a-token`).
 #[test]
-#[ignore = "requires a C reference checkout; see the file docs"]
+#[ignore = "functional"]
 fn global_nonces_match_the_c_reference() {
-    let Ok(netcode_c_dir) = std::env::var("NETCODE_C_DIR") else {
-        eprintln!(
-            "SKIP c_differential (global_nonce): NETCODE_C_DIR is unset; set it to a checkout of \
-             mas-bandwidth/netcode holding the fix (branch sprint/netcode-audit-fixes at or after \
-             1c58478, the land of netfix-global-packet-nonces-differ-between-servers-sharing-a-token), \
-             then run:\n    \
-             NETCODE_C_DIR=<checkout> cargo test --test c_differential -- --ignored --test-threads=1"
-        );
-        return;
-    };
+    let netcode_c_dir = require_netcode_c_dir("global_nonce");
 
     let c_lines = c_transcript_cc(&netcode_c_dir, &[], &["-DNETCODE_ORACLE_GLOBAL_NONCE"]);
     let port_lines = global_nonce_transcript();
+    for (index, (c_line, port_line)) in c_lines.iter().zip(port_lines.iter()).enumerate() {
+        eprintln!("compare {index}: C {c_line:?} port {port_line:?}");
+    }
 
     assert_eq!(
         c_lines.len(),

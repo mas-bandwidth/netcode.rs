@@ -1768,7 +1768,14 @@ mod tests {
     #[test]
     fn restarted_server_keeps_global_packets_out_of_the_client_sequence_range() {
         let private_key = crypto::generate_key();
-        let mut server = Server::new(test_address(0), TEST_PROTOCOL_ID, &private_key, 0.0).unwrap();
+        let mut server = Server::new_with_config(
+            test_address(0),
+            TEST_PROTOCOL_ID,
+            &private_key,
+            ServerConfig { max_connect_token_lifetime: 10 },
+            0.0,
+        )
+        .unwrap();
         server.start(1).unwrap();
 
         let connect_token = generate_connect_token(

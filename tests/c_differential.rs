@@ -26,10 +26,16 @@ use std::process::Command;
 /// The oracle is `tests/c/oracle.c` beside this file. It `#include`s netcode.c,
 /// so netcode.c is not passed on the command line. `-finstrument-functions` is
 /// how the oracle counts entries into the reference's packet processor; without
-/// it those counts stay zero and the transcripts cannot match. `args` are passed
-/// to the oracle verbatim, selecting the scenario (empty for the receive-drain
-/// scenario, `["challenge"]` for the challenge-token binding scenario).
-fn c_transcript(netcode_c_dir: &str, args: &[&str]) -> Vec<String> {
+/// it those counts stay zero and the transcripts cannot match.
+fn c_transcript(netcode_c_dir: &str) -> Vec<String> {
+    c_transcript_for(netcode_c_dir, &[])
+}
+
+/// Like [`c_transcript`], but passes `args` to the oracle so one program can
+/// serve more than one differential scenario, one transcript per invocation
+/// (`["challenge"]` for the challenge-token binding scenario, `["disconnect"]`
+/// for the disconnect-callback re-entry scenario).
+fn c_transcript_for(netcode_c_dir: &str, args: &[&str]) -> Vec<String> {
     let oracle = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/c/oracle.c");
     let out_dir = std::env::temp_dir().join("netcode-c-differential");
     std::fs::create_dir_all(&out_dir).expect("create temp build dir");
@@ -66,7 +72,7 @@ fn receive_drain_matches_the_c_reference() {
         return;
     };
 
-    let c_lines = c_transcript(&netcode_c_dir, &[]);
+    let c_lines = c_transcript(&netcode_c_dir);
     let port_lines = netcode::differential_transcript();
 
     assert_eq!(
@@ -97,7 +103,7 @@ fn challenge_token_binds_matches_the_c_reference() {
         return;
     };
 
-    let c_lines = c_transcript(&netcode_c_dir, &["challenge"]);
+    let c_lines = c_transcript_for(&netcode_c_dir, &["challenge"]);
     let port_lines = netcode::challenge_token_transcript();
 
     assert_eq!(
@@ -111,6 +117,45 @@ fn challenge_token_binds_matches_the_c_reference() {
         assert_eq!(
             c_line, port_line,
             "C and port challenge transcripts first differ at line {index}: C {c_line:?} vs port {port_line:?}"
+        );
+    }
+}
+
+/// The three disconnect paths the reference C fix (netcode PR 196) makes
+/// re-entry-safe, over one server with one admitted client: the application
+/// disconnects the client while the callback disconnects it again; the
+/// application stops the server from inside the callback and a restart finds
+/// every slot empty; a timeout inside update whose callback stops the server.
+/// The C oracle re-enters the way the C test does; the port side
+/// `netcode::differential_disconnect_transcript` has no callback at all, so the
+/// comparison is over the observable contract both must print.
+#[test]
+#[ignore = "requires a C reference checkout; see the file docs"]
+fn disconnect_paths_match_the_c_reference() {
+    let Ok(netcode_c_dir) = std::env::var("NETCODE_C_DIR") else {
+        eprintln!(
+            "SKIP c_differential (disconnect): NETCODE_C_DIR is unset; set it to a checkout of \
+             mas-bandwidth/netcode holding the fix, then run:\n    \
+             NETCODE_C_DIR=<checkout> cargo test --test c_differential -- --ignored --test-threads=1"
+        );
+        return;
+    };
+
+    let c_lines = c_transcript_for(&netcode_c_dir, &["disconnect"]);
+    let port_lines = netcode::differential_disconnect_transcript();
+
+    assert_eq!(
+        c_lines.len(),
+        port_lines.len(),
+        "the C and port disconnect transcripts have different lengths: C {} vs port {}",
+        c_lines.len(),
+        port_lines.len()
+    );
+    for (index, (c_line, port_line)) in c_lines.iter().zip(port_lines.iter()).enumerate() {
+        assert_eq!(
+            c_line, port_line,
+            "C and port disconnect transcripts first differ at line {index}: \
+             C {c_line:?} vs port {port_line:?}"
         );
     }
 }

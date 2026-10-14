@@ -681,6 +681,88 @@ mod tests {
         );
     }
 
+    /// Builds a connection request packet whose private data decrypts, with the given
+    /// expiry timestamp, at the caller's constant current time.
+    fn connection_request_bytes(
+        private_key: &Key,
+        expire_timestamp: u64,
+    ) -> (Vec<u8>, [u8; CONNECT_TOKEN_NONCE_BYTES]) {
+        let mut nonce = [0u8; CONNECT_TOKEN_NONCE_BYTES];
+        crypto::random_bytes(&mut nonce);
+
+        let private_token = crate::token::PrivateConnectToken::generate(
+            0x1234,
+            10,
+            &["127.0.0.1:40000".parse().unwrap()],
+            &[0u8; crate::USER_DATA_BYTES],
+        );
+        let mut private_data = Box::new([0u8; CONNECT_TOKEN_PRIVATE_BYTES]);
+        private_token.write(&mut private_data);
+        crate::token::encrypt_connect_token_private(
+            &mut private_data,
+            TEST_PROTOCOL_ID,
+            expire_timestamp,
+            &nonce,
+            private_key,
+        )
+        .unwrap();
+
+        let input = Packet::Request {
+            protocol_id: TEST_PROTOCOL_ID,
+            expire_timestamp,
+            nonce,
+            private_data,
+        };
+        let key = generate_key();
+        let mut buffer = [0u8; MAX_PACKET_BYTES];
+        let written = write_packet(&input, &mut buffer, 0, &key, TEST_PROTOCOL_ID).unwrap();
+        (buffer[..written].to_vec(), nonce)
+    }
+
+    #[test]
+    fn connection_request_refuses_equal_expiry_floor() {
+        // the floor is whole seconds (start time + max lifetime) and a token's expiry
+        // is whole seconds, so a full-lifetime token minted in the same second as the
+        // start has expiry equal to the floor; equality must be refused, before any
+        // decrypt
+        let private_key = generate_key();
+        let current_timestamp = 1_000_000u64;
+        let floor = 1_000_030u64;
+
+        let (mut at_floor, _) =
+            connection_request_bytes(&private_key, floor);
+        assert!(
+            read_packet_with_min_connect_token_expire_timestamp(
+                &mut at_floor,
+                None,
+                TEST_PROTOCOL_ID,
+                current_timestamp,
+                Some(&private_key),
+                AllowedPackets::SERVER,
+                None,
+                floor,
+            )
+            .is_none()
+        );
+
+        // one second past the floor gets past it and then decrypts
+        let (mut past_floor, _) =
+            connection_request_bytes(&private_key, floor + 1);
+        assert!(
+            read_packet_with_min_connect_token_expire_timestamp(
+                &mut past_floor,
+                None,
+                TEST_PROTOCOL_ID,
+                current_timestamp,
+                Some(&private_key),
+                AllowedPackets::SERVER,
+                None,
+                floor,
+            )
+            .is_some()
+        );
+    }
+
     #[test]
     fn client_rejects_request_and_response_packets() {
         let key = generate_key();
@@ -763,6 +845,34 @@ mod tests {
                 None,
                 AllowedPackets::CLIENT,
                 Some(&mut replay_protection),
+            )
+            .is_none()
+        );
+
+        // a packet at the top of the sequence space is not replayable either:
+        // u64::MAX doubles as the empty-slot marker, so before the fix the slot
+        // read as empty and the packet passed the window and decrypted again
+        let mut top_replay_protection = ReplayProtection::new();
+        top_replay_protection.advance_sequence(u64::MAX);
+
+        let mut top_buffer = [0u8; MAX_PACKET_BYTES];
+        let top_written = write_packet(
+            &Packet::Payload(vec![1, 2, 3]),
+            &mut top_buffer,
+            u64::MAX,
+            &key,
+            TEST_PROTOCOL_ID,
+        )
+        .unwrap();
+        assert!(
+            read_packet(
+                &mut top_buffer[..top_written],
+                Some(&key),
+                TEST_PROTOCOL_ID,
+                0,
+                None,
+                AllowedPackets::CLIENT,
+                Some(&mut top_replay_protection),
             )
             .is_none()
         );

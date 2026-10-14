@@ -106,4 +106,17 @@ mod tests {
         assert!(!replay_protection.already_received(sequence + 1));
         assert!(replay_protection.already_received(sequence));
     }
+
+    #[test]
+    fn the_top_sequence_is_received_after_advancing_to_it() {
+        // u64::MAX doubles as the empty-slot marker, so the slot a real sequence of
+        // u64::MAX lands in reads as empty and the packet could be replayed without
+        // limit; the top of the sequence space is always treated as received
+        let mut replay_protection = ReplayProtection::new();
+
+        assert!(!replay_protection.already_received(u64::MAX));
+        replay_protection.advance_sequence(u64::MAX);
+
+        assert!(replay_protection.already_received(u64::MAX));
+    }
 }

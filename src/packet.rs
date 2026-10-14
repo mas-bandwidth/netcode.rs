@@ -208,6 +208,7 @@ pub(crate) fn read_packet(
         allowed_packets,
         replay_protection,
         0,
+        u64::MAX,
     )
 }
 
@@ -224,6 +225,7 @@ pub(crate) fn read_packet_with_min_connect_token_expire_timestamp(
     allowed_packets: AllowedPackets,
     replay_protection: Option<&mut ReplayProtection>,
     min_connect_token_expire_timestamp: u64,
+    max_connect_token_expire_timestamp: u64,
 ) -> Option<(Packet, u64)> {
     if buffer.is_empty() {
         debug!("ignored packet. buffer length is less than 1");
@@ -238,6 +240,7 @@ pub(crate) fn read_packet_with_min_connect_token_expire_timestamp(
             protocol_id,
             current_timestamp,
             min_connect_token_expire_timestamp,
+            max_connect_token_expire_timestamp,
             private_key,
             allowed_packets,
         )
@@ -386,6 +389,7 @@ fn read_connection_request_packet(
     protocol_id: u64,
     current_timestamp: u64,
     min_connect_token_expire_timestamp: u64,
+    max_connect_token_expire_timestamp: u64,
     private_key: Option<&Key>,
     allowed_packets: AllowedPackets,
 ) -> Option<Packet> {
@@ -568,6 +572,7 @@ pub fn replay_transcript() -> Vec<String> {
             AllowedPackets::SERVER,
             None,
             floor,
+            u64::MAX,
         )
         .is_some();
         lines.push(format!(
@@ -799,6 +804,7 @@ mod tests {
                 AllowedPackets::SERVER,
                 None,
                 expire_timestamp + 1,
+                u64::MAX,
             )
             .is_none()
         );
@@ -863,6 +869,7 @@ mod tests {
                 AllowedPackets::SERVER,
                 None,
                 floor,
+                u64::MAX,
             )
             .is_none()
         );
@@ -879,9 +886,61 @@ mod tests {
                 AllowedPackets::SERVER,
                 None,
                 floor,
+                u64::MAX,
             )
             .is_some()
         );
+    }
+
+    #[test]
+    fn never_expiring_token_is_refused() {
+        // a negative expire_seconds mints a token whose expiry is u64::MAX, and a
+        // token whose lifetime exceeds the maximum also clears the restart floor, so
+        // the floor guarantee cannot hold for either; both are refused by the
+        // maximum-lifetime check, before any decrypt
+        let private_key = generate_key();
+        let current_timestamp = 1_000_000u64;
+        let max_lifetime = 30u64;
+        let max_expire = current_timestamp + max_lifetime;
+
+        for expire_timestamp in [u64::MAX, current_timestamp + 2 * max_lifetime] {
+            let (mut bytes, _) = connection_request_bytes(&private_key, expire_timestamp);
+            assert!(
+                read_packet_with_min_connect_token_expire_timestamp(
+                    &mut bytes,
+                    None,
+                    TEST_PROTOCOL_ID,
+                    current_timestamp,
+                    Some(&private_key),
+                    AllowedPackets::SERVER,
+                    None,
+                    0,
+                    max_expire,
+                )
+                .is_none(),
+                "expire {expire_timestamp} must be refused by the max lifetime check"
+            );
+        }
+
+        // an expiry at the maximum lifetime and one second inside it decrypt
+        for expire_timestamp in [max_expire, current_timestamp + 1] {
+            let (mut bytes, _) = connection_request_bytes(&private_key, expire_timestamp);
+            assert!(
+                read_packet_with_min_connect_token_expire_timestamp(
+                    &mut bytes,
+                    None,
+                    TEST_PROTOCOL_ID,
+                    current_timestamp,
+                    Some(&private_key),
+                    AllowedPackets::SERVER,
+                    None,
+                    0,
+                    max_expire,
+                )
+                .is_some(),
+                "expire {expire_timestamp} must be accepted"
+            );
+        }
     }
 
     #[test]

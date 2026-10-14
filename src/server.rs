@@ -256,6 +256,19 @@ impl EncryptionManager {
     }
 }
 
+/// The fallback lifetime, in seconds, of an encryption mapping that has not yet
+/// been promoted to a connected client.
+const PRECONNECT_MAPPING_SECONDS: i32 = 10;
+
+/// The expiry time for a pre-connect mapping added when a connection request is
+/// accepted, before any response can promote it to a connected client. A
+/// non-positive token timeout would otherwise expire the mapping on the next
+/// update, or hold one of the encryption-mapping slots forever for a request that
+/// is never answered, so a pre-connect mapping gets its own bounded lifetime.
+fn preconnect_expire_time(now: f64, timeout_seconds: i32) -> f64 {
+    if timeout_seconds >= 0 { now + timeout_seconds as f64 } else { -1.0 }
+}
+
 // ----------------------------------------------------------------
 
 const MAX_CONNECT_TOKEN_ENTRIES: usize = MAX_CLIENTS * 8;
@@ -761,6 +774,7 @@ impl Server {
                 AllowedPackets::SERVER,
                 replay_protection,
                 self.min_connect_token_expire_timestamp,
+                current_timestamp.saturating_add(self.max_connect_token_lifetime),
             )
         else {
             return;
@@ -1604,6 +1618,19 @@ mod tests {
         ));
         assert!(manager.find_encryption_mapping(test_address(40000), 104.0).is_some());
         assert!(manager.find_encryption_mapping(test_address(40000), 106.0).is_none());
+    }
+
+    #[test]
+    fn preconnect_expire_time_is_bounded() {
+        // a pre-connect mapping must not expire on the next update (a zero timeout)
+        // or hold a slot forever (a negative timeout); both fall back to the fixed
+        // bounded lifetime, while a positive timeout is still honored exactly
+        let now = 1000.0;
+        assert_eq!(preconnect_expire_time(now, -1), now + 10.0);
+        assert_eq!(preconnect_expire_time(now, 0), now + 10.0);
+        assert_eq!(preconnect_expire_time(now, 1), now + 1.0);
+        assert_eq!(preconnect_expire_time(now, 5), now + 5.0);
+        assert_eq!(preconnect_expire_time(now, 30), now + 30.0);
     }
 
     #[test]

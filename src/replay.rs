@@ -25,6 +25,13 @@ impl ReplayProtection {
     }
 
     pub fn already_received(&self, sequence: u64) -> bool {
+        // sequence u64::MAX doubles as the empty-slot marker, so the slot a real
+        // packet at that sequence lands in reads as empty and the packet could be
+        // replayed without limit; treat the top of the sequence space as received
+        if sequence == u64::MAX {
+            return true;
+        }
+
         // written subtraction-side so it cannot overflow: "sequence + BUFFER_SIZE <=
         // most_recent" wraps for sequence values near u64::MAX and falsely rejects
         // them as replays (and panics in debug builds)
@@ -108,15 +115,15 @@ mod tests {
     }
 
     #[test]
-    fn the_top_sequence_is_received_after_advancing_to_it() {
+    fn the_top_sequence_is_always_treated_as_received() {
         // u64::MAX doubles as the empty-slot marker, so the slot a real sequence of
         // u64::MAX lands in reads as empty and the packet could be replayed without
-        // limit; the top of the sequence space is always treated as received
+        // limit; the top of the sequence space is always treated as received, before
+        // and after the advance
         let mut replay_protection = ReplayProtection::new();
 
-        assert!(!replay_protection.already_received(u64::MAX));
+        assert!(replay_protection.already_received(u64::MAX));
         replay_protection.advance_sequence(u64::MAX);
-
         assert!(replay_protection.already_received(u64::MAX));
     }
 }

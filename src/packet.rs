@@ -429,7 +429,10 @@ fn read_connection_request_packet(
         return None;
     }
 
-    if expire_timestamp < min_connect_token_expire_timestamp {
+    // the floor is whole seconds (start time + max lifetime) and a token's expiry
+    // is whole seconds, so a full-lifetime token issued earlier in the same second
+    // as the start has expiry equal to the floor; equality must be refused
+    if expire_timestamp <= min_connect_token_expire_timestamp {
         debug!("ignored connection request packet. connect token predates the server start");
         return None;
     }
@@ -551,12 +554,8 @@ pub fn replay_transcript() -> Vec<String> {
             &private_key,
         )
         .unwrap();
-        let input = Packet::Request {
-            protocol_id: PROTOCOL_ID,
-            expire_timestamp,
-            nonce,
-            private_data,
-        };
+        let input =
+            Packet::Request { protocol_id: PROTOCOL_ID, expire_timestamp, nonce, private_data };
         let write_key = crate::generate_key();
         let mut buffer = [0u8; crate::MAX_PACKET_BYTES];
         let written = write_packet(&input, &mut buffer, 0, &write_key, PROTOCOL_ID).unwrap();
@@ -853,8 +852,7 @@ mod tests {
         let current_timestamp = 1_000_000u64;
         let floor = 1_000_030u64;
 
-        let (mut at_floor, _) =
-            connection_request_bytes(&private_key, floor);
+        let (mut at_floor, _) = connection_request_bytes(&private_key, floor);
         assert!(
             read_packet_with_min_connect_token_expire_timestamp(
                 &mut at_floor,
@@ -870,8 +868,7 @@ mod tests {
         );
 
         // one second past the floor gets past it and then decrypts
-        let (mut past_floor, _) =
-            connection_request_bytes(&private_key, floor + 1);
+        let (mut past_floor, _) = connection_request_bytes(&private_key, floor + 1);
         assert!(
             read_packet_with_min_connect_token_expire_timestamp(
                 &mut past_floor,
@@ -893,7 +890,7 @@ mod tests {
         // when no C checkout is reachable
         let lines = replay_transcript();
 
-        assert!(lines.iter().any(|line| line == "probe 18446744073709551615 -> 0"));
+        assert!(lines.iter().any(|line| line == "probe 18446744073709551615 -> 1"));
         assert!(lines.iter().any(|line| line == "recheck 18446744073709551615 -> 1"));
         assert!(lines.iter().any(|line| line == "keepalive 18446744073709551615 -> refused"));
         assert!(lines.iter().any(|line| line == "request 1000029 -> refused"));

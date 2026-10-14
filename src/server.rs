@@ -1600,8 +1600,8 @@ pub fn token_lifetime_transcript() -> Vec<String> {
             Packet::Request { protocol_id: PROTOCOL_ID, expire_timestamp, nonce, private_data };
         let write_key = crate::generate_key();
         let mut buffer = [0u8; MAX_PACKET_BYTES];
-        let written = crate::packet::write_packet(&input, &mut buffer, 0, &write_key, PROTOCOL_ID)
-            .unwrap();
+        let written =
+            crate::packet::write_packet(&input, &mut buffer, 0, &write_key, PROTOCOL_ID).unwrap();
         let accepted = crate::packet::read_packet_with_min_connect_token_expire_timestamp(
             &mut buffer[..written],
             None,
@@ -1720,6 +1720,32 @@ mod tests {
         assert_eq!(preconnect_expire_time(now, 1), now + 1.0);
         assert_eq!(preconnect_expire_time(now, 5), now + 5.0);
         assert_eq!(preconnect_expire_time(now, 30), now + 30.0);
+    }
+
+    #[test]
+    fn token_lifetime_transcript_pins_the_port_side_edges() {
+        // the port half of the C differential test, so its shape is checked even
+        // when no C checkout is reachable; the lines are the shared format the
+        // oracle prints, so a regression in the refusals or the mapping offsets
+        // is caught here
+        let lines = token_lifetime_transcript();
+
+        assert!(lines.iter().any(|line| line == "preconnect -1 -> 11"));
+        assert!(lines.iter().any(|line| line == "preconnect-response -1 -> connects"));
+        assert!(lines.iter().any(|line| line == "preconnect 0 -> 11"));
+        assert!(lines.iter().any(|line| line == "preconnect-response 0 -> connects"));
+        assert!(lines.iter().any(|line| line == "preconnect 1 -> 2"));
+        assert!(lines.iter().any(|line| line == "preconnect-response 1 -> connects"));
+        assert!(lines.iter().any(|line| line == "preconnect 5 -> 6"));
+        assert!(lines.iter().any(|line| line == "preconnect-response 5 -> connects"));
+        assert!(lines.iter().any(|line| line == "preconnect 30 -> 31"));
+        assert!(lines.iter().any(|line| line == "preconnect-response 30 -> connects"));
+        assert!(lines.iter().any(|line| line == "request 18446744073709551615 -> refused"));
+        assert!(lines.iter().any(|line| line == "request 1000060 -> refused"));
+        assert!(lines.iter().any(|line| line == "request 1000031 -> refused"));
+        assert!(lines.iter().any(|line| line == "request 1000030 -> accepted"));
+        assert!(lines.iter().any(|line| line == "request 1000001 -> accepted"));
+        assert!(lines.iter().any(|line| line == "request 1000000 -> refused"));
     }
 
     #[test]

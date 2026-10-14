@@ -8,9 +8,9 @@ use log::{debug, info};
 
 use crate::packet::{AllowedPackets, Packet};
 use crate::replay::ReplayProtection;
-use crate::token::{self, CHALLENGE_TOKEN_BYTES, ConnectToken};
+use crate::token::{self, CHALLENGE_TOKEN_BYTES, CONNECT_TOKEN_PRIVATE_BYTES, ConnectToken};
 use crate::{
-    CONNECT_TOKEN_BYTES, Error, KEY_BYTES, Key, MAX_PACKET_BYTES, MAX_PAYLOAD_BYTES,
+    CONNECT_TOKEN_BYTES, Error, KEY_BYTES, Key, MAC_BYTES, MAX_PACKET_BYTES, MAX_PAYLOAD_BYTES,
     NUM_DISCONNECT_PACKETS, PACKET_QUEUE_SIZE, PACKET_SEND_RATE, socket,
 };
 
@@ -119,6 +119,8 @@ pub struct Client {
     packet_receive_queue: VecDeque<(Vec<u8>, u64)>,
     challenge_token_sequence: u64,
     challenge_token_data: [u8; CHALLENGE_TOKEN_BYTES],
+    previous_connect_token_mac: [u8; MAC_BYTES],
+    has_previous_connect_token_mac: bool,
 }
 
 impl Client {
@@ -182,6 +184,8 @@ impl Client {
             packet_receive_queue: VecDeque::new(),
             challenge_token_sequence: 0,
             challenge_token_data: [0; CHALLENGE_TOKEN_BYTES],
+            previous_connect_token_mac: [0; MAC_BYTES],
+            has_previous_connect_token_mac: false,
         };
 
         info!("client started on port {}", client.port());
@@ -205,6 +209,25 @@ impl Client {
                 return Err(error);
             }
         };
+
+        // a connect token's keys encrypt exactly one session. connecting, disconnecting,
+        // then connecting again with the same token would encrypt connection responses
+        // again from sequence zero under the same client-to-server key. the AEAD tag at
+        // the end of the private data is the fingerprint, so the whole token is not kept.
+        // disconnect does not clear it.
+        let connect_token_mac: [u8; MAC_BYTES] = connect_token.private_data
+            [CONNECT_TOKEN_PRIVATE_BYTES - MAC_BYTES..]
+            .try_into()
+            .unwrap();
+        if self.has_previous_connect_token_mac
+            && connect_token_mac == self.previous_connect_token_mac
+        {
+            info!("client connect refused. the connect token was already used by this client");
+            self.set_state(ClientState::InvalidConnectToken);
+            return Err(Error::InvalidConnectToken);
+        }
+        self.previous_connect_token_mac = connect_token_mac;
+        self.has_previous_connect_token_mac = true;
 
         let Some(index) = self.first_usable_server_address(&connect_token) else {
             info!("client connect failed. no server address for an open socket family");

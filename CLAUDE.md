@@ -8,9 +8,13 @@ deliberately still `netcode`, so code says `use netcode::...` and only the Cargo
 line changes if that name ever frees up. Do not "fix" the mismatch.
 
 DECISIONS (look like bugs, are not)
-- server.rs seeds `global_sequence = 1 << 63` in `new`, `start` AND `stop`. Not
-  redundant: seeding on create only is the AEAD nonce-reuse bug found here while
-  porting and fixed upstream in C netcode 1.4.0 (IMPLEMENTERS.md #3). Keep all three.
+- server.rs seeds `global_sequence = 1 << 63` in `new`. `start` draws
+  `2^63 + (random & (2^62 - 1))` so two servers that share a connect token do not
+  encrypt their first global packet under the same nonce. `stop` zeroes it, and
+  the next `start` draws again. Seeding on create only is the AEAD nonce-reuse
+  bug found here while porting and fixed upstream in C netcode 1.4.0
+  (IMPLEMENTERS.md #3). The random offset is the later fix for two servers
+  listed in one token.
 - `ReplayProtection::already_received` uses the subtraction-side test (IMPLEMENTERS.md
   #1); the addition form overflows near u64::MAX. Never restore it.
 - Received IPv6 addresses zero the scope id as well as the flow label. The C

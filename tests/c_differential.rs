@@ -370,10 +370,7 @@ fn global_nonce_transcript() -> Vec<String> {
     let first = server_a.global_sequence();
     server_a.stop();
     server_a.start(1).unwrap();
-    lines.push(format!(
-        "restart above-floor {}",
-        u8::from(server_a.global_sequence() >= floor)
-    ));
+    lines.push(format!("restart above-floor {}", u8::from(server_a.global_sequence() >= floor)));
     lines.push(format!("restart differ {}", u8::from(server_a.global_sequence() != first)));
 
     let address = "127.0.0.1:40000".parse().unwrap();

@@ -407,13 +407,17 @@ impl ClientSlot {
     }
 }
 
-/// The sequence a start assigns to global packets.
+/// A random sequence in `[2^63, 2^63 + 2^62)`.
 ///
-/// The defect this pins is a constant `1 << 63`: two servers that share a connect
-/// token then encrypt their first global packet under the same key and nonce.
-#[cfg_attr(not(test), allow(dead_code))]
+/// One connect token carries one server-to-client key for every server it lists.
+/// Two servers that both start at 2^63 encrypt their first global packet under that
+/// shared key at the same nonce. The offset is 62 bits so the sequence stays in the
+/// top half and never meets a per-client sequence, which starts at zero.
 fn global_sequence_seed() -> u64 {
-    1 << 63
+    let mut offset = [0u8; 8];
+    crypto::random_bytes(&mut offset);
+    let offset = u64::from_le_bytes(offset);
+    (1 << 63) + (offset & 0x3FFF_FFFF_FFFF_FFFF)
 }
 
 /// A netcode dedicated server.
@@ -538,8 +542,10 @@ impl Server {
         // global packets (challenge, denied) encrypt with the same per-token
         // server-to-client keys as per-client packets, whose sequences start at zero,
         // so the global sequence takes the top half of the space to keep AEAD nonces
-        // disjoint under a shared key
-        self.global_sequence = 1 << 63;
+        // disjoint under a shared key. stop zeroes it, so every start draws again.
+        // one connect token carries one server-to-client key for every server it
+        // lists, so the draw is a random offset in the top half rather than a constant.
+        self.global_sequence = global_sequence_seed();
         self.clients = (0..max_clients).map(|_| ClientSlot::new()).collect();
 
         Ok(())
@@ -556,7 +562,7 @@ impl Server {
         self.running = false;
         self.max_clients = 0;
         self.num_connected_clients = 0;
-        self.global_sequence = 1 << 63;
+        self.global_sequence = 0;
         self.challenge_sequence = 0;
         self.challenge_key = [0; KEY_BYTES];
         self.min_connect_token_expire_timestamp = 0;

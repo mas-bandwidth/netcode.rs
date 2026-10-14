@@ -1355,6 +1355,171 @@ pub fn challenge_token_transcript() -> Vec<String> {
     lines
 }
 
+/// Installs one connected client in slot 0 without a handshake, for the
+/// disconnect-path transcripts. Tests may reach the slot and encryption-manager
+/// internals directly; production code never does.
+fn install_connected_test_client(
+    server: &mut Server,
+    client_id: u64,
+    user_data_first: u8,
+) -> SocketAddr {
+    let address: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+    let send_key = crypto::generate_key();
+    let receive_key = crypto::generate_key();
+    let timeout_seconds = 5;
+    let mut user_data = [0u8; USER_DATA_BYTES];
+    user_data[0] = user_data_first;
+    server.encryption_manager.add_encryption_mapping(
+        address,
+        &send_key,
+        &receive_key,
+        0.0,
+        -1.0,
+        timeout_seconds,
+        0,
+        client_id,
+        &user_data,
+    );
+    let encryption_index = server.encryption_manager.find_encryption_mapping(address, 0.0).unwrap();
+    server.encryption_manager.set_client_index(encryption_index, Some(0));
+
+    let slot = &mut server.clients[0];
+    slot.connected = true;
+    slot.confirmed = true;
+    slot.client_id = client_id;
+    slot.timeout_seconds = timeout_seconds;
+    slot.encryption_index = Some(encryption_index);
+    slot.address = Some(address);
+    slot.last_packet_send_time = 0.0;
+    slot.last_packet_receive_time = 0.0;
+    slot.user_data = user_data;
+
+    server.num_connected_clients = 1;
+    address
+}
+
+/// The number of live encryption mappings the server still owns.
+fn encryption_mapping_count(server: &Server) -> usize {
+    (0..server.encryption_manager.num_entries)
+        .filter(|&index| server.encryption_manager.entries[index].address.is_some())
+        .count()
+}
+
+/// The lowercase token a transcript prints for a disconnect reason.
+fn reason_token(reason: DisconnectReason) -> &'static str {
+    match reason {
+        DisconnectReason::TimedOut => "timed-out",
+        DisconnectReason::ClientDisconnect => "client-disconnect",
+        DisconnectReason::ServerDisconnect => "server-disconnect",
+    }
+}
+
+/// One line in the differential transcript, in the shared format. The reason, id
+/// and user data first byte are what a semantic callback would have observed;
+/// the connected count, mapping count and slot clear-ness are read after the
+/// disconnect completed.
+fn disconnect_line(
+    case: &str,
+    callbacks: usize,
+    reason: DisconnectReason,
+    id: u64,
+    user_data_first: u8,
+    server: &Server,
+) -> String {
+    let connected = server.num_connected_clients;
+    let mappings = encryption_mapping_count(server);
+    let slot =
+        if server.clients.iter().any(|client| client.connected) { "connected" } else { "clear" };
+    format!(
+        "{case} callbacks {callbacks} saw {} {id} {user_data_first} connected {connected} \
+         mappings {mappings} slot {slot}",
+        reason_token(reason),
+    )
+}
+
+fn drain_disconnect_events(server: &mut Server) -> (usize, Option<DisconnectReason>) {
+    let mut callbacks = 0;
+    let mut reason = None;
+    while let Some(event) = server.next_event() {
+        if let ServerEvent::ClientDisconnected { reason: observed, .. } = event {
+            callbacks += 1;
+            reason = Some(observed);
+        }
+    }
+    (callbacks, reason)
+}
+
+/// Test seam for the C differential test: the port-side transcript for the three
+/// disconnect paths the reference C fix (netcode PR 196) makes re-entry-safe,
+/// one line per path in the shared format. Hidden from docs; not part of the
+/// supported API.
+///
+/// This is a functional seam, not a unit test: it constructs a real `Server`
+/// (which binds a `UdpSocket`) and `start`s it (which reads the wall clock via
+/// `token::unix_timestamp`); the disconnect and keep-alive packets it sends go
+/// to an unbound loopback port and are dropped. The unit gate pins the same
+/// transcript in `disconnect_paths_leave_a_consistent_server`.
+#[doc(hidden)]
+pub fn differential_disconnect_transcript() -> Vec<String> {
+    const PROTOCOL_ID: u64 = 0x1122334455667788;
+    const CLIENT_ID: u64 = 0x1234;
+    const USER_DATA_FIRST: u8 = 0xAB;
+
+    let private_key = crypto::generate_key();
+    let mut lines = Vec::new();
+
+    // Case A: the application disconnects the client.
+    let mut server =
+        Server::new("127.0.0.1:0".parse().unwrap(), PROTOCOL_ID, &private_key, 0.0).unwrap();
+    server.start(1).unwrap();
+    install_connected_test_client(&mut server, CLIENT_ID, USER_DATA_FIRST);
+    server.disconnect_client(0);
+    let (callbacks, reason) = drain_disconnect_events(&mut server);
+    lines.push(disconnect_line(
+        "disconnect",
+        callbacks,
+        reason.unwrap(),
+        CLIENT_ID,
+        USER_DATA_FIRST,
+        &server,
+    ));
+
+    // Case B: the application stops the server; a restart finds every slot empty.
+    let mut server =
+        Server::new("127.0.0.1:0".parse().unwrap(), PROTOCOL_ID, &private_key, 0.0).unwrap();
+    server.start(1).unwrap();
+    install_connected_test_client(&mut server, CLIENT_ID, USER_DATA_FIRST);
+    server.stop();
+    let (callbacks, reason) = drain_disconnect_events(&mut server);
+    server.start(1).unwrap();
+    lines.push(disconnect_line(
+        "stop",
+        callbacks,
+        reason.unwrap(),
+        CLIENT_ID,
+        USER_DATA_FIRST,
+        &server,
+    ));
+
+    // Case C: a timeout inside update disconnects the client.
+    let mut server =
+        Server::new("127.0.0.1:0".parse().unwrap(), PROTOCOL_ID, &private_key, 0.0).unwrap();
+    server.start(1).unwrap();
+    install_connected_test_client(&mut server, CLIENT_ID, USER_DATA_FIRST);
+    server.update(6.0);
+    let (callbacks, reason) = drain_disconnect_events(&mut server);
+    lines.push(disconnect_line(
+        "timeout",
+        callbacks,
+        reason.unwrap(),
+        CLIENT_ID,
+        USER_DATA_FIRST,
+        &server,
+    ));
+
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -1791,5 +1956,35 @@ mod tests {
         assert_eq!(server.num_connected_clients(), 1);
         assert_eq!(server.client_id(0), 0x2222);
         assert_eq!(server.client_user_data(0).unwrap()[0], 0xB2);
+    }
+
+    /// The reference C fix (netcode PR 196) makes the disconnect callback run
+    /// before a slot is cleared without letting the callback re-enter the
+    /// clearing disconnect. This port has no application callback, so re-entry
+    /// is impossible by construction: the event push, count decrement and slot
+    /// reset run in one `&mut self` call with no application code between them.
+    /// What the C test now guarantees, and this test pins, is the observable
+    /// result of the three paths C exercises — an explicit disconnect, a stop,
+    /// and a timeout inside update: exactly one `ClientDisconnected` event per
+    /// client, the connected count back to zero, the slot and encryption index
+    /// clear, no encryption mapping left, and a restart that finds every slot
+    /// empty.
+    ///
+    /// Like the scenario test above this is functional rather than pure: the
+    /// disconnect paths are `Server` methods, and without a transport trait the
+    /// client is installed through the slot and encryption-manager functions
+    /// directly. It is a pin (green at BASE by construction), not a red test.
+    #[test]
+    fn disconnect_paths_leave_a_consistent_server() {
+        let lines = differential_disconnect_transcript();
+        assert_eq!(
+            lines,
+            vec![
+                "disconnect callbacks 1 saw server-disconnect 4660 171 connected 0 mappings 0 \
+                 slot clear",
+                "stop callbacks 1 saw server-disconnect 4660 171 connected 0 mappings 0 slot clear",
+                "timeout callbacks 1 saw timed-out 4660 171 connected 0 mappings 0 slot clear",
+            ],
+        );
     }
 }

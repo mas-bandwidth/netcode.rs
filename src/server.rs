@@ -1534,6 +1534,95 @@ pub fn differential_disconnect_transcript() -> Vec<String> {
     lines
 }
 
+/// Test seam for the C differential test: the port-side transcript for the
+/// pre-connect mapping lifetime and the never-expiring token refusal the C fix
+/// bounds, one line per input in the shared format. Hidden from docs; not part of
+/// the supported API.
+///
+/// Pure: every input is a constant and every time is explicit. The pre-connect
+/// lifetime is read from `preconnect_expire_time` under the same live rule the
+/// encryption manager uses (a mapping is live while its expiry is not in the
+/// past, and a negative expiry never expires); the request refusals go through
+/// the port's pure packet read.
+#[doc(hidden)]
+pub fn token_lifetime_transcript() -> Vec<String> {
+    const PROTOCOL_ID: u64 = 0x1122334455667788;
+    const BASE: f64 = 100.0;
+
+    let mut lines = Vec::new();
+
+    for timeout in [-1, 0, 1, 5, 30] {
+        let expire = preconnect_expire_time(BASE, timeout);
+        let offset = if expire < 0.0 {
+            "never".to_string()
+        } else {
+            ((expire - BASE).floor() as i64 + 1).to_string()
+        };
+        lines.push(format!("preconnect {timeout} -> {offset}"));
+        let connects = expire < 0.0 || expire >= BASE + 0.1;
+        lines.push(format!(
+            "preconnect-response {timeout} -> {}",
+            if connects { "connects" } else { "refused" }
+        ));
+    }
+
+    let private_key = crate::generate_key();
+    let current_timestamp = 1_000_000u64;
+    let max_lifetime = 30u64;
+    let max_expire = current_timestamp + max_lifetime;
+    for expire_timestamp in [
+        u64::MAX,
+        current_timestamp + 2 * max_lifetime,
+        max_expire + 1,
+        max_expire,
+        current_timestamp + 1,
+        current_timestamp,
+    ] {
+        let mut nonce = [0u8; crate::token::CONNECT_TOKEN_NONCE_BYTES];
+        crypto::random_bytes(&mut nonce);
+        let private_token = PrivateConnectToken::generate(
+            0x1234,
+            10,
+            &["127.0.0.1:40000".parse().unwrap()],
+            &[0u8; USER_DATA_BYTES],
+        );
+        let mut private_data = Box::new([0u8; CONNECT_TOKEN_PRIVATE_BYTES]);
+        private_token.write(&mut private_data);
+        token::encrypt_connect_token_private(
+            &mut private_data,
+            PROTOCOL_ID,
+            expire_timestamp,
+            &nonce,
+            &private_key,
+        )
+        .unwrap();
+        let input =
+            Packet::Request { protocol_id: PROTOCOL_ID, expire_timestamp, nonce, private_data };
+        let write_key = crate::generate_key();
+        let mut buffer = [0u8; MAX_PACKET_BYTES];
+        let written = crate::packet::write_packet(&input, &mut buffer, 0, &write_key, PROTOCOL_ID)
+            .unwrap();
+        let accepted = crate::packet::read_packet_with_min_connect_token_expire_timestamp(
+            &mut buffer[..written],
+            None,
+            PROTOCOL_ID,
+            current_timestamp,
+            Some(&private_key),
+            AllowedPackets::SERVER,
+            None,
+            0,
+            max_expire,
+        )
+        .is_some();
+        lines.push(format!(
+            "request {expire_timestamp} -> {}",
+            if accepted { "accepted" } else { "refused" }
+        ));
+    }
+
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;

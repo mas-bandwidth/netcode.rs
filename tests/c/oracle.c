@@ -675,10 +675,165 @@ static int replay_run( void )
     return 0;
 }
 
+/* ----------------------------------------------------------------------------
+   Pre-connect mapping lifetime and bounded token lifetime scenario (mode
+   "lifetime").
+
+   Prints one line per input, of the form
+
+       preconnect <timeout> -> <offset|never>
+       preconnect-response <timeout> -> <connects|refused>
+       request <expire> -> <accepted|refused>
+
+   for the token timeouts {-1, 0, 1, 5, 30} and the expiries UINT64_MAX,
+   current + 2 * max lifetime, current + max lifetime + 1, current + max
+   lifetime, current + 1 and current. The pre-connect mapping and the packet
+   read are driven by hand with explicit timestamps; no socket is opened.
+
+   NOTE: written against the reference API names from memory and never compiled
+   against the C checkout (no C checkout is reachable from this job). Expect to
+   adjust file-local signatures and struct field names on first run against
+   mas-bandwidth/netcode (branch sprint/netcode-audit-fixes at or after the
+   commit that lands
+   netfix-never-expiring-tokens-are-refused-or-documented-against-the-restart-floor).
+---------------------------------------------------------------------------- */
+
+#define LIFETIME_BASE 100.0
+#define LIFETIME_MAX 30
+
+/* The mapping's expiry as the reference stores it: -1 means never. */
+static int lifetime_mapping_expire( struct netcode_server_t * server, struct netcode_address_t * addr, double * expire_time )
+{
+    int i;
+    for ( i = 0; i < NETCODE_MAX_ENCRYPTION_MAPPINGS; ++i )
+    {
+        struct netcode_encryption_manager_entry_t * entry = &server->encryption_manager.entry[i];
+        if ( entry->address && netcode_address_equal( &entry->address, addr ) )
+        {
+            *expire_time = entry->expire_time;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int lifetime_run( void )
+{
+    const uint64_t protocol_id = 0x1122334455667788ULL;
+    const int timeouts[5] = { -1, 0, 1, 5, 30 };
+    uint8_t private_key[NETCODE_KEY_BYTES];
+    struct netcode_address_t addr;
+    int i;
+
+    memset( private_key, 0x60, sizeof( private_key ) );
+    memset( &addr, 0, sizeof( addr ) );
+    addr.type = NETCODE_ADDRESS_IPV4;
+    addr.data.ipv4[0] = 127;
+    addr.data.ipv4[3] = 1;
+    addr.port = 41000;
+
+    /* group 1: the pre-connect mapping for each token timeout. The mapping is
+       added by the reference's process_connection_request; the offset is the
+       first whole second after the request at which it is gone. */
+    for ( i = 0; i < 5; ++i )
+    {
+        char * server_addresses[1];
+        uint8_t * token;
+        struct netcode_server_config_t server_config;
+        struct netcode_server_t * server;
+        int offset, k;
+
+        server_addresses[0] = "127.0.0.1:40000";
+        token = netcode_generate_connect_token( private_key, protocol_id, 1000000, timeouts[i],
+                                                0x1234, 10, server_addresses, 1, server_addresses, 1, NULL );
+
+        netcode_default_server_config( &server_config );
+        server_config.protocol_id = protocol_id;
+        memcpy( server_config.private_key, private_key, NETCODE_KEY_BYTES );
+        server_config.override_send_and_receive = 1;
+        server_config.send_packet_override = send_override;
+        server_config.receive_packet_override = receive_override;
+
+        server = netcode_server_create( "127.0.0.1:40000", &server_config, LIFETIME_BASE );
+        netcode_server_start( server, 2 );
+        server->min_connect_token_expire_timestamp = 0;
+        server->time = LIFETIME_BASE;
+
+        netcode_server_process_connection_request( server, &addr, token + CONNECT_TOKEN_PRIVATE_OFFSET, 1000000, 0 );
+
+        offset = -1;
+        for ( k = 1; k <= 40; ++k )
+        {
+            double e;
+            if ( !lifetime_mapping_expire( server, &addr, &e ) || e < 0.0 || e < LIFETIME_BASE + k )
+            {
+                offset = k;
+                break;
+            }
+        }
+        if ( offset < 0 )
+            printf( "preconnect %d -> never\n", timeouts[i] );
+        else
+            printf( "preconnect %d -> %d\n", timeouts[i], offset );
+
+        /* a response one update (0.1 s) after the request: the mapping must still
+           hold for the response to be accepted */
+        {
+            double e;
+            int present = lifetime_mapping_expire( server, &addr, &e ) && ( e < 0.0 || e >= LIFETIME_BASE + 0.1 );
+            printf( "preconnect-response %d -> %s\n", timeouts[i], present ? "connects" : "refused" );
+        }
+
+        netcode_server_destroy( server );
+        free( token );
+    }
+
+    /* group 2: connection request bytes whose expiry is UINT64_MAX or beyond the
+       maximum lifetime, refused by the lifetime check rather than the decrypt.
+       The bytes decrypt, so an accept here is the missing bound. */
+    {
+        uint64_t current_timestamp = 1000000ULL;
+        uint64_t max_expire = current_timestamp + LIFETIME_MAX;
+        uint64_t expiries[6];
+        expiries[0] = UINT64_MAX;
+        expiries[1] = current_timestamp + 2 * LIFETIME_MAX;
+        expiries[2] = max_expire + 1;
+        expiries[3] = max_expire;
+        expiries[4] = current_timestamp + 1;
+        expiries[5] = current_timestamp;
+
+        for ( i = 0; i < 6; ++i )
+        {
+            uint8_t packet[NETCODE_MAX_PACKET_BYTES];
+            uint8_t packet_type = 0;
+            uint64_t sequence = 0;
+            uint64_t expire_timestamp = expiries[i];
+            int length, accepted = 0;
+
+            length = replay_build_request( packet, private_key, protocol_id, expire_timestamp );
+            if ( length > 0 &&
+                 netcode_read_packet( packet, length, protocol_id, current_timestamp, 0, max_expire,
+                                      private_key, 1 << NETCODE_CONNECTION_REQUEST_PACKET,
+                                      &packet_type, &sequence ) == NETCODE_OK )
+                accepted = 1;
+            replay_print_verdict( "request", expire_timestamp, accepted );
+        }
+    }
+
+    return 0;
+}
+
 int main( int argc, char ** argv )
 {
     if ( netcode_init() != NETCODE_OK )
         return 1;
+
+    if ( argc > 1 && strcmp( argv[1], "lifetime" ) == 0 )
+    {
+        int result = lifetime_run();
+        netcode_term();
+        return result;
+    }
 
     if ( argc > 1 && strcmp( argv[1], "challenge" ) == 0 )
         return run_challenge_scenario();

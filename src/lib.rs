@@ -120,6 +120,9 @@ pub use server::differential_disconnect_transcript;
 #[doc(hidden)]
 pub use packet::replay_transcript;
 
+#[doc(hidden)]
+pub use server::token_lifetime_transcript;
+
 /// The size of a connect token in bytes.
 pub const CONNECT_TOKEN_BYTES: usize = 2048;
 

@@ -692,6 +692,15 @@ impl Server {
         Some(&self.clients[client_index].user_data)
     }
 
+    /// The sequence number of the next global packet (challenge or denied).
+    ///
+    /// Hidden from docs. The differential test reads it to print boolean properties
+    /// only; callers must not put the value on the wire themselves.
+    #[doc(hidden)]
+    pub fn global_sequence(&self) -> u64 {
+        self.global_sequence
+    }
+
     /// The sequence number of the next packet the server will send to the client in
     /// the given slot.
     pub fn next_packet_sequence(&self, client_index: usize) -> u64 {

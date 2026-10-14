@@ -36,6 +36,13 @@ fn c_transcript(netcode_c_dir: &str) -> Vec<String> {
 /// (`["challenge"]` for the challenge-token binding scenario, `["disconnect"]`
 /// for the disconnect-callback re-entry scenario).
 fn c_transcript_for(netcode_c_dir: &str, args: &[&str]) -> Vec<String> {
+    c_transcript_cc(netcode_c_dir, args, &[])
+}
+
+/// Like [`c_transcript_for`], but passes extra flags to `cc`. The global-nonce
+/// scenario is built with `-DNETCODE_ORACLE_GLOBAL_NONCE` so the oracle compiles
+/// only that scenario against the reference.
+fn c_transcript_cc(netcode_c_dir: &str, args: &[&str], extra_cc: &[&str]) -> Vec<String> {
     let oracle = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/c/oracle.c");
     let out_dir = std::env::temp_dir().join("netcode-c-differential");
     std::fs::create_dir_all(&out_dir).expect("create temp build dir");
@@ -43,6 +50,7 @@ fn c_transcript_for(netcode_c_dir: &str, args: &[&str]) -> Vec<String> {
 
     let status = Command::new("cc")
         .args(["-O2", "-ffp-contract=off", "-finstrument-functions"])
+        .args(extra_cc)
         .arg(format!("-I{netcode_c_dir}"))
         .arg(format!("-I{netcode_c_dir}/sodium"))
         .arg(&oracle)
@@ -319,6 +327,111 @@ fn connect_family_matches_the_c_reference() {
         assert_eq!(
             c_line, port_line,
             "C and port connect_family transcripts first differ at line {index}: \
+             C {c_line:?} vs port {port_line:?}"
+        );
+    }
+}
+
+fn client_state_name(state: netcode::ClientState) -> &'static str {
+    match state {
+        netcode::ClientState::ConnectTokenExpired => "connect_token_expired",
+        netcode::ClientState::InvalidConnectToken => "invalid_connect_token",
+        netcode::ClientState::ConnectionTimedOut => "connection_timed_out",
+        netcode::ClientState::ConnectionResponseTimedOut => "connection_response_timed_out",
+        netcode::ClientState::ConnectionRequestTimedOut => "connection_request_timed_out",
+        netcode::ClientState::ConnectionDenied => "connection_denied",
+        netcode::ClientState::Disconnected => "disconnected",
+        netcode::ClientState::SendingConnectionRequest => "sending_connection_request",
+        netcode::ClientState::SendingConnectionResponse => "sending_connection_response",
+        netcode::ClientState::Connected => "connected",
+    }
+}
+
+/// Boolean properties of two started servers and of one server stopped and started
+/// again, plus the state after a client connects, disconnects and connects with the
+/// same token. Random sequence values are not printed.
+fn global_nonce_transcript() -> Vec<String> {
+    let key = netcode::generate_key();
+    let mut server_a = netcode::Server::new("127.0.0.1:0".parse().unwrap(), 1, &key, 0.0).unwrap();
+    let mut server_b = netcode::Server::new("127.0.0.1:0".parse().unwrap(), 1, &key, 0.0).unwrap();
+    server_a.start(1).unwrap();
+    server_b.start(1).unwrap();
+
+    let floor = 1u64 << 63;
+    let mut lines = vec![
+        format!("start-a above-floor {}", u8::from(server_a.global_sequence() >= floor)),
+        format!("start-b above-floor {}", u8::from(server_b.global_sequence() >= floor)),
+        format!(
+            "pair differ {}",
+            u8::from(server_a.global_sequence() != server_b.global_sequence())
+        ),
+    ];
+
+    let first = server_a.global_sequence();
+    server_a.stop();
+    server_a.start(1).unwrap();
+    lines.push(format!(
+        "restart above-floor {}",
+        u8::from(server_a.global_sequence() >= floor)
+    ));
+    lines.push(format!("restart differ {}", u8::from(server_a.global_sequence() != first)));
+
+    let address = "127.0.0.1:40000".parse().unwrap();
+    let token = netcode::generate_connect_token(
+        &[address],
+        &[address],
+        30,
+        10,
+        1,
+        0x1122334455667788,
+        &key,
+        &[0u8; netcode::USER_DATA_BYTES],
+    )
+    .unwrap();
+    let mut client = netcode::Client::new("127.0.0.1:0".parse().unwrap(), 0.0).unwrap();
+    let _ = client.connect(&token);
+    client.disconnect();
+    let _ = client.connect(&token);
+    lines.push(format!("client reuse {}", client_state_name(client.state())));
+    lines
+}
+
+/// Two servers started from fresh, and one server stopped and started again, plus a
+/// client that connects, disconnects and connects with the same token. The C oracle
+/// (`["global_nonce"]`) drives the reference with an override transport and an
+/// explicit time. Each sequence line is `<step> <property> <0|1>`; the client line
+/// is `client reuse <state>`. Random values are not printed.
+#[test]
+#[ignore = "requires a C reference checkout; see the file docs"]
+fn global_nonces_match_the_c_reference() {
+    let Ok(netcode_c_dir) = std::env::var("NETCODE_C_DIR") else {
+        eprintln!(
+            "SKIP c_differential (global_nonce): NETCODE_C_DIR is unset; set it to a checkout of \
+             mas-bandwidth/netcode holding the fix (branch sprint/netcode-audit-fixes at or after \
+             the commit that lands netfix-global-packet-nonces-differ-between-servers-sharing-a-token), \
+             then run:\n    \
+             NETCODE_C_DIR=<checkout> cargo test --test c_differential -- --ignored --test-threads=1"
+        );
+        return;
+    };
+
+    let c_lines = c_transcript_cc(&netcode_c_dir, &[], &["-DNETCODE_ORACLE_GLOBAL_NONCE"]);
+    let port_lines = global_nonce_transcript();
+
+    assert_eq!(
+        c_lines.len(),
+        port_lines.len(),
+        "the C and port global_nonce transcripts have different lengths: C {} vs port {}",
+        c_lines.len(),
+        port_lines.len()
+    );
+    for (index, (c_line, port_line)) in c_lines.iter().zip(port_lines.iter()).enumerate() {
+        if c_line != port_line {
+            eprintln!("first differing line {index}: C {c_line:?} vs port {port_line:?}");
+        }
+        assert_eq!(
+            c_line, port_line,
+            "C and port global_nonce transcripts first differ at line {index}: \
              C {c_line:?} vs port {port_line:?}"
         );
     }

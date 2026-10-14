@@ -11,8 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::bytes::{Reader, Writer};
 use crate::crypto::{self, XNONCE_BYTES};
 use crate::{
-    CONNECT_TOKEN_BYTES, Error, KEY_BYTES, Key, MAX_SERVERS_PER_CONNECT, USER_DATA_BYTES, UserData,
-    VERSION_INFO,
+    CONNECT_TOKEN_BYTES, Error, KEY_BYTES, Key, MAC_BYTES, MAX_SERVERS_PER_CONNECT, USER_DATA_BYTES,
+    UserData, VERSION_INFO,
 };
 
 pub(crate) const CONNECT_TOKEN_PRIVATE_BYTES: usize = 1024;
@@ -162,11 +162,14 @@ impl ChallengeToken {
 }
 
 /// Encrypts the first 284 bytes of the buffer in place using the challenge sequence
-/// number as the nonce, storing the HMAC in the last 16 bytes.
+/// number as the nonce, storing the HMAC in the last 16 bytes. The connect token MAC
+/// that minted the challenge is passed as associated data so a challenge decrypts only
+/// under the mapping that minted it.
 pub(crate) fn encrypt_challenge_token(
     buffer: &mut [u8; CHALLENGE_TOKEN_BYTES],
     sequence: u64,
     key: &Key,
+    associated_data: &[u8],
 ) -> Result<(), Error> {
     crypto::encrypt_aead(buffer, &[], &crypto::sequence_nonce(sequence), key)
 }
@@ -175,6 +178,7 @@ pub(crate) fn decrypt_challenge_token(
     buffer: &mut [u8; CHALLENGE_TOKEN_BYTES],
     sequence: u64,
     key: &Key,
+    associated_data: &[u8],
 ) -> Result<(), Error> {
     crypto::decrypt_aead(buffer, &[], &crypto::sequence_nonce(sequence), key)
 }
@@ -444,12 +448,47 @@ mod tests {
 
         let mut buffer = [0u8; CHALLENGE_TOKEN_BYTES];
         token.write(&mut buffer);
-        encrypt_challenge_token(&mut buffer, sequence, &key).unwrap();
-        decrypt_challenge_token(&mut buffer, sequence, &key).unwrap();
+        encrypt_challenge_token(&mut buffer, sequence, &key, &[]).unwrap();
+        decrypt_challenge_token(&mut buffer, sequence, &key, &[]).unwrap();
 
         let output = ChallengeToken::read(&buffer);
         assert_eq!(output.client_id, token.client_id);
         assert_eq!(output.user_data, token.user_data);
+    }
+
+    #[test]
+    fn challenge_token_binds_to_its_connect_token() {
+        let key = generate_key();
+        let sequence = 7;
+        let mac_a: [u8; MAC_BYTES] = [0xA1; MAC_BYTES];
+        let mac_b: [u8; MAC_BYTES] = [0xB2; MAC_BYTES];
+
+        let token = ChallengeToken { client_id: 0x1111, user_data: test_user_data() };
+
+        // a challenge minted under one connect token MAC must not decrypt under another
+        let mut buffer = [0u8; CHALLENGE_TOKEN_BYTES];
+        token.write(&mut buffer);
+        encrypt_challenge_token(&mut buffer, sequence, &key, &mac_a).unwrap();
+
+        let mut wrong_mac = buffer;
+        assert!(
+            decrypt_challenge_token(&mut wrong_mac, sequence, &key, &mac_b).is_err(),
+            "a challenge token decrypted under a different connect token MAC"
+        );
+
+        // the minting MAC decrypts the challenge back to its fields
+        decrypt_challenge_token(&mut buffer, sequence, &key, &mac_a).unwrap();
+        let output = ChallengeToken::read(&buffer);
+        assert_eq!(output.client_id, token.client_id);
+        assert_eq!(output.user_data, token.user_data);
+
+        // a NULL-length associated-data round trip still works
+        let mut null = [0u8; CHALLENGE_TOKEN_BYTES];
+        token.write(&mut null);
+        encrypt_challenge_token(&mut null, sequence, &key, &[]).unwrap();
+        decrypt_challenge_token(&mut null, sequence, &key, &[]).unwrap();
+        assert_eq!(ChallengeToken::read(&null).client_id, token.client_id);
+        assert_eq!(ChallengeToken::read(&null).user_data, token.user_data);
     }
 
     #[test]

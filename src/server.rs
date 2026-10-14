@@ -923,6 +923,7 @@ impl Server {
             &mut challenge_token_data,
             self.challenge_sequence,
             &self.challenge_key,
+            &[],
         )
         .is_err()
         {
@@ -951,6 +952,7 @@ impl Server {
             &mut challenge_token_data,
             challenge_token_sequence,
             &self.challenge_key,
+            &[],
         )
         .is_err()
         {
@@ -1485,5 +1487,103 @@ mod tests {
             "stop did not reseed the global sequence: {}",
             server.global_sequence
         );
+    }
+
+    /// Builds the decrypted private connect token data a connection request carries,
+    /// with the original token HMAC left in the trailing 16 bytes, and returns it
+    /// beside that MAC (the bytes the challenge token must bind to).
+    fn mint_private_token_data(
+        client_id: u64,
+        user_data: &UserData,
+        private_key: &Key,
+        protocol_id: u64,
+        server_address: SocketAddr,
+    ) -> ([u8; CONNECT_TOKEN_PRIVATE_BYTES], [u8; MAC_BYTES]) {
+        let private_token =
+            PrivateConnectToken::generate(client_id, TEST_TOKEN_TIMEOUT, &[server_address], user_data);
+
+        let expire_timestamp = 1_000_000u64;
+        let mut nonce = [0u8; crate::token::CONNECT_TOKEN_NONCE_BYTES];
+        crypto::random_bytes(&mut nonce);
+
+        let mut private_data = Box::new([0u8; CONNECT_TOKEN_PRIVATE_BYTES]);
+        private_token.write(&mut private_data);
+        token::encrypt_connect_token_private(
+            &mut private_data,
+            protocol_id,
+            expire_timestamp,
+            &nonce,
+            private_key,
+        )
+        .unwrap();
+        let mac: [u8; MAC_BYTES] =
+            private_data[CONNECT_TOKEN_PRIVATE_BYTES - MAC_BYTES..].try_into().unwrap();
+        token::decrypt_connect_token_private(
+            &mut private_data,
+            protocol_id,
+            expire_timestamp,
+            &nonce,
+            private_key,
+        )
+        .unwrap();
+        (*private_data, mac)
+    }
+
+    /// Two tokens minted for one server, two clients, and a response that arrives
+    /// under one mapping's keys carrying the other mapping's challenge: it must be
+    /// refused, not connected as the other mapping's client id with its user data.
+    #[test]
+    fn server_refuses_a_response_with_another_mappings_challenge() {
+        let private_key = crypto::generate_key();
+        let mut server = Server::new(test_address(0), TEST_PROTOCOL_ID, &private_key, 0.0).unwrap();
+        server.start(2).unwrap();
+        server.min_connect_token_expire_timestamp = 0;
+
+        let x_addr = test_address(41000);
+        let y_addr = test_address(41001);
+
+        let mut user_data_a = [0u8; USER_DATA_BYTES];
+        user_data_a[0] = 0xA1;
+        let mut user_data_b = [0u8; USER_DATA_BYTES];
+        user_data_b[0] = 0xB2;
+
+        let (private_a, mac_a) =
+            mint_private_token_data(0x1111, &user_data_a, &private_key, TEST_PROTOCOL_ID, server.address());
+        let (private_b, mac_b) =
+            mint_private_token_data(0x2222, &user_data_b, &private_key, TEST_PROTOCOL_ID, server.address());
+
+        // X presents token A, then Y presents token B: the server mints challenge A
+        // (sequence 0) and challenge B (sequence 1).
+        server.process_connection_request(x_addr, &private_a, 1_000_000, 0);
+        server.process_connection_request(y_addr, &private_b, 1_000_000, 0);
+
+        let challenge_a = ChallengeToken { client_id: 0x1111, user_data: user_data_a };
+        let mut challenge_a_data = [0u8; CHALLENGE_TOKEN_BYTES];
+        challenge_a.write(&mut challenge_a_data);
+        token::encrypt_challenge_token(&mut challenge_a_data, 0, &server.challenge_key, &mac_a)
+            .unwrap();
+
+        let challenge_b = ChallengeToken { client_id: 0x2222, user_data: user_data_b };
+        let mut challenge_b_data = [0u8; CHALLENGE_TOKEN_BYTES];
+        challenge_b.write(&mut challenge_b_data);
+        token::encrypt_challenge_token(&mut challenge_b_data, 1, &server.challenge_key, &mac_b)
+            .unwrap();
+
+        let y_encryption_index =
+            server.encryption_manager.find_encryption_mapping(y_addr, server.time).unwrap();
+
+        // Y answers under B's keys with A's challenge: refused, no client 0x1111.
+        server.process_connection_response(y_addr, 0, challenge_a_data, Some(y_encryption_index));
+        assert_eq!(
+            server.num_connected_clients(),
+            0,
+            "a response carrying another mapping's challenge was accepted as its client id"
+        );
+
+        // Y's own challenge admits it as B with B's user data.
+        server.process_connection_response(y_addr, 1, challenge_b_data, Some(y_encryption_index));
+        assert_eq!(server.num_connected_clients(), 1);
+        assert_eq!(server.client_id(0), 0x2222);
+        assert_eq!(server.client_user_data(0).unwrap()[0], 0xB2);
     }
 }

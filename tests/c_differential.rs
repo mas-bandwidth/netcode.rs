@@ -395,9 +395,14 @@ fn global_nonce_transcript() -> Vec<String> {
 
 /// Two servers started from fresh, and one server stopped and started again, plus a
 /// client that connects, disconnects and connects with the same token. The C oracle
-/// (`["global_nonce"]`) drives the reference with an override transport and an
-/// explicit time. Each sequence line is `<step> <property> <0|1>`; the client line
-/// is `client reuse <state>`. Random values are not printed.
+/// (built with `-DNETCODE_ORACLE_GLOBAL_NONCE`) drives the reference with an override
+/// transport and an explicit time. Each sequence line is `<step> <property> <0|1>`;
+/// the client line is `client reuse <state>`. Random values are not printed.
+///
+/// Verified against mas-bandwidth/netcode branch `sprint/netcode-audit-fixes` at
+/// `1c58478` (the land of `netfix-global-packet-nonces-differ-between-servers-sharing-a-token`):
+/// the transcripts match byte for byte with this port's fix, and first differ at
+/// `pair differ` (C `1` vs port `0`) with this port's fix reverted.
 #[test]
 #[ignore = "requires a C reference checkout; see the file docs"]
 fn global_nonces_match_the_c_reference() {
@@ -405,7 +410,7 @@ fn global_nonces_match_the_c_reference() {
         eprintln!(
             "SKIP c_differential (global_nonce): NETCODE_C_DIR is unset; set it to a checkout of \
              mas-bandwidth/netcode holding the fix (branch sprint/netcode-audit-fixes at or after \
-             the commit that lands netfix-global-packet-nonces-differ-between-servers-sharing-a-token), \
+             1c58478, the land of netfix-global-packet-nonces-differ-between-servers-sharing-a-token), \
              then run:\n    \
              NETCODE_C_DIR=<checkout> cargo test --test c_differential -- --ignored --test-threads=1"
         );

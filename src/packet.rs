@@ -433,6 +433,16 @@ fn read_connection_request_packet(
         return None;
     }
 
+    // a token that never expires, or whose expiry is further past now than the
+    // maximum lifetime, always clears the restart floor, so the floor guarantee
+    // cannot hold for it; refuse it here, before the decrypt
+    if expire_timestamp > max_connect_token_expire_timestamp {
+        debug!(
+            "ignored connection request packet. connect token expiry exceeds the maximum lifetime"
+        );
+        return None;
+    }
+
     // the floor is whole seconds (start time + max lifetime) and a token's expiry
     // is whole seconds, so a full-lifetime token issued earlier in the same second
     // as the start has expiry equal to the floor; equality must be refused

@@ -266,7 +266,11 @@ const PRECONNECT_MAPPING_SECONDS: i32 = 10;
 /// update, or hold one of the encryption-mapping slots forever for a request that
 /// is never answered, so a pre-connect mapping gets its own bounded lifetime.
 fn preconnect_expire_time(now: f64, timeout_seconds: i32) -> f64 {
-    if timeout_seconds >= 0 { now + timeout_seconds as f64 } else { -1.0 }
+    now + if timeout_seconds > 0 {
+        timeout_seconds as f64
+    } else {
+        PRECONNECT_MAPPING_SECONDS as f64
+    }
 }
 
 // ----------------------------------------------------------------
@@ -926,11 +930,7 @@ impl Server {
             return;
         }
 
-        let expire_time = if private_token.timeout_seconds >= 0 {
-            self.time + private_token.timeout_seconds as f64
-        } else {
-            -1.0
-        };
+        let expire_time = preconnect_expire_time(self.time, private_token.timeout_seconds);
 
         if !self.encryption_manager.add_encryption_mapping(
             from,
@@ -1888,11 +1888,16 @@ mod tests {
             test_address(0),
             TEST_PROTOCOL_ID,
             &private_key,
-            ServerConfig { max_connect_token_lifetime: 10 },
+            ServerConfig { max_connect_token_lifetime: 60 },
             0.0,
         )
         .unwrap();
         server.start(1).unwrap();
+        // this test is about the global packet sequence, not the token lifetime
+        // bounds; a full-lifetime token minted in the same second as the start
+        // would sit at the restart floor, and the floor would refuse it, so the
+        // floor is disabled here
+        server.min_connect_token_expire_timestamp = 0;
 
         let connect_token = generate_connect_token(
             &[server.address()],
@@ -1916,6 +1921,7 @@ mod tests {
 
         server.stop();
         server.start(1).unwrap();
+        server.min_connect_token_expire_timestamp = 0;
 
         // the same client, the same connect token, and therefore the same
         // server-to-client key as before the restart

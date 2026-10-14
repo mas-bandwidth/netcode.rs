@@ -1210,6 +1210,11 @@ impl Drop for Server {
 /// Test seam for the C differential test: builds the port-side transcript for the
 /// scripted challenge-token scenario `tests/c/oracle.c` runs. Hidden from docs; not
 /// part of the supported API.
+///
+/// This is a functional seam, not a unit test: it constructs a real `Server`
+/// (which binds a `UdpSocket`) and `start`s it (which reads the wall clock via
+/// `token::unix_timestamp`). The pure unit test that pins the defect is
+/// `challenge_token_binds_to_its_connect_token` in `src/token.rs`.
 #[doc(hidden)]
 pub fn challenge_token_transcript() -> Vec<String> {
     let protocol_id = 0x1122334455667788u64;
@@ -1717,6 +1722,12 @@ mod tests {
     /// Two tokens minted for one server, two clients, and a response that arrives
     /// under one mapping's keys carrying the other mapping's challenge: it must be
     /// refused, not connected as the other mapping's client id with its user data.
+    ///
+    /// This scenario test is functional rather than pure: `Server::new` binds a
+    /// real `UdpSocket` and `Server::start` reads the wall clock, so the seam the
+    /// card asks for (a `Datagram`/`FakeTransport` with an injectable timestamp) is
+    /// out of reach without a transport trait. The pure red test that pins the
+    /// defect is `challenge_token_binds_to_its_connect_token` in `src/token.rs`.
     #[test]
     fn server_refuses_a_response_with_another_mappings_challenge() {
         let private_key = crypto::generate_key();

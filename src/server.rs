@@ -1173,6 +1173,148 @@ impl Drop for Server {
     }
 }
 
+/// Test seam for the C differential test: builds the port-side transcript for the
+/// scripted challenge-token scenario `tests/c/oracle.c` runs. Hidden from docs; not
+/// part of the supported API.
+#[doc(hidden)]
+pub fn challenge_token_transcript() -> Vec<String> {
+    let protocol_id = 0x1122334455667788u64;
+    let private_key = crypto::generate_key();
+
+    let mut server =
+        match Server::new("127.0.0.1:0".parse().unwrap(), protocol_id, &private_key, 0.0) {
+            Ok(server) => server,
+            Err(error) => return vec![format!("error creating server: {error}")],
+        };
+    if server.start(2).is_err() {
+        return vec!["error starting server".to_string()];
+    }
+    server.min_connect_token_expire_timestamp = 0;
+
+    let x_addr: SocketAddr = "127.0.0.1:41000".parse().unwrap();
+    let y_addr: SocketAddr = "127.0.0.1:41001".parse().unwrap();
+
+    fn mint(
+        client_id: u64,
+        first_byte: u8,
+        private_key: &Key,
+        protocol_id: u64,
+        server_address: SocketAddr,
+    ) -> ([u8; CONNECT_TOKEN_PRIVATE_BYTES], [u8; MAC_BYTES], UserData) {
+        let mut user_data = [0u8; USER_DATA_BYTES];
+        user_data[0] = first_byte;
+        let private_token = PrivateConnectToken::generate(client_id, 5, &[server_address], &user_data);
+
+        let expire_timestamp = 1_000_000u64;
+        let mut nonce = [0u8; crate::token::CONNECT_TOKEN_NONCE_BYTES];
+        crypto::random_bytes(&mut nonce);
+
+        let mut private_data = Box::new([0u8; CONNECT_TOKEN_PRIVATE_BYTES]);
+        private_token.write(&mut private_data);
+        token::encrypt_connect_token_private(
+            &mut private_data,
+            protocol_id,
+            expire_timestamp,
+            &nonce,
+            private_key,
+        )
+        .unwrap();
+        let mac: [u8; MAC_BYTES] =
+            private_data[CONNECT_TOKEN_PRIVATE_BYTES - MAC_BYTES..].try_into().unwrap();
+        token::decrypt_connect_token_private(
+            &mut private_data,
+            protocol_id,
+            expire_timestamp,
+            &nonce,
+            private_key,
+        )
+        .unwrap();
+        (*private_data, mac, user_data)
+    }
+
+    fn mint_challenge(
+        client_id: u64,
+        user_data: &UserData,
+        sequence: u64,
+        challenge_key: &Key,
+        mac: &[u8; MAC_BYTES],
+    ) -> [u8; CHALLENGE_TOKEN_BYTES] {
+        let challenge = ChallengeToken { client_id, user_data: *user_data };
+        let mut data = [0u8; CHALLENGE_TOKEN_BYTES];
+        challenge.write(&mut data);
+        token::encrypt_challenge_token(&mut data, sequence, challenge_key, mac).unwrap();
+        data
+    }
+
+    fn connected(server: &Server) -> String {
+        let mut clients: Vec<(u64, u8)> = Vec::new();
+        for index in 0..server.max_clients {
+            if server.client_connected(index) {
+                clients.push((server.client_id(index), server.client_user_data(index).unwrap()[0]));
+            }
+        }
+        clients.sort();
+        let mut line = String::from(" connected");
+        for (id, _) in &clients {
+            line.push_str(&format!(" 0x{id:x}"));
+        }
+        line.push_str(" userdata");
+        for (_, byte) in &clients {
+            line.push_str(&format!(" {byte:02x}"));
+        }
+        line
+    }
+
+    let (private_a, mac_a, user_data_a) =
+        mint(0x1111, 0xA1, &private_key, protocol_id, server.address());
+    let (private_b, mac_b, user_data_b) =
+        mint(0x2222, 0xB2, &private_key, protocol_id, server.address());
+    let (private_c, mac_c, user_data_c) =
+        mint(0x3333, 0xC3, &private_key, protocol_id, server.address());
+
+    let mut lines = Vec::new();
+
+    // X presents token A, then Y presents token B.
+    server.process_connection_request(x_addr, &private_a, 1_000_000, 0);
+    lines.push(format!("present-a{}", connected(&server)));
+
+    server.process_connection_request(y_addr, &private_b, 1_000_000, 0);
+    lines.push(format!("present-b{}", connected(&server)));
+
+    let challenge_a = mint_challenge(0x1111, &user_data_a, 0, &server.challenge_key, &mac_a);
+    let challenge_b = mint_challenge(0x2222, &user_data_b, 1, &server.challenge_key, &mac_b);
+
+    let y_index = server.encryption_manager.find_encryption_mapping(y_addr, server.time).unwrap();
+
+    // Y answers under B's keys with A's challenge: refused.
+    server.process_connection_response(y_addr, 0, challenge_a, Some(y_index));
+    lines.push(format!("answer-cross{}", connected(&server)));
+
+    // Y answers with its own challenge: connected as B.
+    server.process_connection_response(y_addr, 1, challenge_b, Some(y_index));
+    lines.push(format!("answer-own{}", connected(&server)));
+
+    // X moves to token C twice, two challenges in flight.
+    server.process_connection_request(x_addr, &private_c, 1_000_000, 0);
+    lines.push(format!("present-c{}", connected(&server)));
+
+    server.process_connection_request(x_addr, &private_c, 1_000_000, 0);
+    lines.push(format!("present-c-again{}", connected(&server)));
+
+    let challenge_c = mint_challenge(0x3333, &user_data_c, 2, &server.challenge_key, &mac_c);
+    let x_index = server.encryption_manager.find_encryption_mapping(x_addr, server.time).unwrap();
+
+    // X answers under C's keys with A's challenge: refused.
+    server.process_connection_response(x_addr, 0, challenge_a, Some(x_index));
+    lines.push(format!("answer-stale{}", connected(&server)));
+
+    // X answers with the older C challenge: connected as C.
+    server.process_connection_response(x_addr, 2, challenge_c, Some(x_index));
+    lines.push(format!("answer-c{}", connected(&server)));
+
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;

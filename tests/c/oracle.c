@@ -58,6 +58,18 @@
     user_data, out token buffer, returning int).
 */
 
+void __attribute__((no_instrument_function)) __cyg_profile_func_enter( void * this_fn, void * call_site )
+{
+    (void) this_fn;
+    (void) call_site;
+}
+
+void __attribute__((no_instrument_function)) __cyg_profile_func_exit( void * this_fn, void * call_site )
+{
+    (void) this_fn;
+    (void) call_site;
+}
+
 static void global_nonce_send( void * context, struct netcode_address_t * to, NETCODE_CONST uint8_t * packet_data, int packet_bytes )
 {
     (void) context;

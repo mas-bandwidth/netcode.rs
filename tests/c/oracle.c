@@ -318,6 +318,194 @@ static int run_challenge_scenario( void )
     return 0;
 }
 
+/* ----------------------------------------------------------------------------
+   Disconnect callback re-entry scenario (mode "disconnect").
+
+   The reference fix (netcode PR 196) makes the disconnect callback unable to
+   re-enter the internal disconnect that is clearing the slot. This scenario
+   drives the three paths that fix covers over one server with one admitted
+   client (installed directly, no handshake) and prints one line per path in
+   the shared form:
+
+       <case> callbacks <n> saw <reason> <id> <user data first byte> connected <n> mappings <n> slot <connected|clear>
+
+   The callback re-enters the way the C test does: the "disconnect" case calls
+   netcode_server_disconnect_client on the same slot from inside the callback,
+   and the "stop" and "timeout" cases call netcode_server_stop from inside it.
+   With the fix each callback runs exactly once, observes the slot's reason,
+   id and user data, and the server is left consistent; without it the inner
+   call cleared the slot, the outer frame then read and wrote
+   encryption_manager.client_index[-1] and drove num_connected_clients to -1.
+   The port half, netcode::differential_disconnect_transcript, has no
+   application callback at all (its queue semantics cannot re-enter) and prints
+   the same three lines.
+
+   No socket is opened (override transports) and time is passed in explicitly.
+
+   NOTE: written against the reference API names from memory and never compiled
+   against the C checkout (no C checkout is reachable from this job). Expect to
+   adjust file-local struct field names and the disconnect callback's exact
+   config field and signature on first run against mas-bandwidth/netcode
+   (branch sprint/netcode-audit-fixes at or after bbf9805a).
+---------------------------------------------------------------------------- */
+
+enum { DISCO_ACTION_NONE = 0, DISCO_ACTION_DISCONNECT = 1, DISCO_ACTION_STOP = 2 };
+
+static int disco_callbacks;
+static uint64_t disco_id;
+static unsigned disco_user_first;
+static int disco_action;
+
+static void disco_callback( void * context, int client_index )
+{
+    struct netcode_server_t * server = (struct netcode_server_t *) context;
+    disco_callbacks++;
+    disco_id = server->client_slots[client_index].client_id;
+    disco_user_first = server->client_slots[client_index].user_data[0];
+    if ( disco_action == DISCO_ACTION_DISCONNECT )
+        netcode_server_disconnect_client( server, client_index );
+    else if ( disco_action == DISCO_ACTION_STOP )
+        netcode_server_stop( server );
+}
+
+static int disco_any_connected( struct netcode_server_t * server )
+{
+    for ( int i = 0; i < server->max_clients; ++i )
+        if ( server->client_slots[i].connected )
+            return 1;
+    return 0;
+}
+
+static int disco_mapping_count( struct netcode_server_t * server )
+{
+    int count = 0;
+    for ( int i = 0; i < server->encryption_manager.num_entries; ++i )
+        if ( server->encryption_manager.address[i].port != 0 )
+            count++;
+    return count;
+}
+
+static void disco_print( const char * name, const char * reason, struct netcode_server_t * server )
+{
+    printf( "%s callbacks %d saw %s %llu %u connected %d mappings %d slot %s\n",
+            name,
+            disco_callbacks,
+            reason,
+            (unsigned long long) disco_id,
+            disco_user_first,
+            netcode_server_num_connected_clients( server ),
+            disco_mapping_count( server ),
+            disco_any_connected( server ) ? "connected" : "clear" );
+}
+
+static void disco_install_client( struct netcode_server_t * server )
+{
+    uint8_t send_key[NETCODE_KEY_BYTES];
+    uint8_t receive_key[NETCODE_KEY_BYTES];
+    for ( int i = 0; i < NETCODE_KEY_BYTES; ++i )
+    {
+        send_key[i] = (uint8_t) ( i + 1 );
+        receive_key[i] = (uint8_t) ( i + 101 );
+    }
+
+    struct netcode_address_t address;
+    memset( &address, 0, sizeof( address ) );
+    address.type = NETCODE_ADDRESS_IPV4;
+    address.data.ipv4[0] = 127;
+    address.data.ipv4[3] = 1;
+    address.port = 50000;
+
+    netcode_encryption_manager_add_encryption_mapping( &server->encryption_manager, &address, send_key, receive_key, 0.0, -1.0, 5 );
+
+    int encryption_index = netcode_encryption_manager_find_encryption_mapping( &server->encryption_manager, &address, 0.0 );
+    netcode_encryption_manager_set_client_index( &server->encryption_manager, encryption_index, 0 );
+
+    struct netcode_server_client_t * client = &server->client_slots[0];
+    client->connected = 1;
+    client->confirmed = 1;
+    client->client_id = 0x1234ULL;
+    client->timeout_seconds = 5;
+    client->encryption_index = encryption_index;
+    netcode_address_copy( &client->address, &address );
+    client->last_packet_send_time = 0.0;
+    client->last_packet_receive_time = 0.0;
+    memset( client->user_data, 0, sizeof( client->user_data ) );
+    client->user_data[0] = 0xAB;
+
+    server->num_connected_clients = 1;
+}
+
+static struct netcode_server_t * disco_create_server( struct netcode_server_config_t * config )
+{
+    uint8_t private_key[NETCODE_KEY_BYTES];
+    memset( private_key, 0, sizeof( private_key ) );
+
+    netcode_default_server_config( config );
+    config->protocol_id = 0x1122334455667788ULL;
+    memcpy( config->private_key, private_key, NETCODE_KEY_BYTES );
+    config->override_send_and_receive = 1;
+    config->send_packet_override = send_override;
+    config->receive_packet_override = receive_override;
+    config->callback_context = NULL;
+    config->disconnect_callback = disco_callback;
+
+    struct netcode_server_t * server = netcode_server_create( "127.0.0.1:40000", config, 0.0 );
+    if ( !server )
+        return NULL;
+    /* the callback needs the server, which does not exist until create returns */
+    server->config.callback_context = server;
+    netcode_server_start( server, 1 );
+    disco_install_client( server );
+    return server;
+}
+
+static void disco_reset_observations( void )
+{
+    disco_callbacks = 0;
+    disco_id = 0;
+    disco_user_first = 0;
+}
+
+static int disco_run( void )
+{
+    struct netcode_server_config_t config;
+    struct netcode_server_t * server;
+
+    /* A: the callback disconnects the same client. */
+    disco_action = DISCO_ACTION_DISCONNECT;
+    server = disco_create_server( &config );
+    if ( !server )
+        return 1;
+    disco_reset_observations();
+    netcode_server_disconnect_client( server, 0 );
+    disco_print( "disconnect", "server-disconnect", server );
+    netcode_server_destroy( server );
+
+    /* B: the callback stops the server; a restart finds every slot empty. */
+    disco_action = DISCO_ACTION_STOP;
+    server = disco_create_server( &config );
+    if ( !server )
+        return 1;
+    disco_reset_observations();
+    netcode_server_disconnect_client( server, 0 );
+    netcode_server_start( server, 1 );
+    disco_print( "stop", "server-disconnect", server );
+    netcode_server_destroy( server );
+
+    /* C: a timeout inside update whose callback stops the server. */
+    disco_action = DISCO_ACTION_STOP;
+    server = disco_create_server( &config );
+    if ( !server )
+        return 1;
+    disco_reset_observations();
+    netcode_server_update( server, 6.0 );
+    disco_print( "timeout", "timed-out", server );
+    netcode_server_destroy( server );
+
+    disco_action = DISCO_ACTION_NONE;
+    return 0;
+}
+
 int main( int argc, char ** argv )
 {
     if ( netcode_init() != NETCODE_OK )
@@ -325,6 +513,13 @@ int main( int argc, char ** argv )
 
     if ( argc > 1 && strcmp( argv[1], "challenge" ) == 0 )
         return run_challenge_scenario();
+
+    if ( argc > 1 && strcmp( argv[1], "disconnect" ) == 0 )
+    {
+        int result = disco_run();
+        netcode_term();
+        return result;
+    }
 
     /* The classifier rows. (0, no error) skips, would-block drains, any other
        error skips, a positive count is the byte count. */

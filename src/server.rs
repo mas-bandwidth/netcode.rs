@@ -76,6 +76,8 @@ struct EncryptionEntry {
     last_access_time: f64,
     client_index: Option<usize>,
     connect_token_entry_index: Option<usize>,
+    client_id: u64,
+    user_data: UserData,
     send_key: Key,
     receive_key: Key,
 }
@@ -89,6 +91,8 @@ impl EncryptionEntry {
             last_access_time: -1000.0,
             client_index: None,
             connect_token_entry_index: None,
+            client_id: 0,
+            user_data: [0; USER_DATA_BYTES],
             send_key: [0; KEY_BYTES],
             receive_key: [0; KEY_BYTES],
         }
@@ -129,6 +133,8 @@ impl EncryptionManager {
         expire_time: f64,
         timeout_seconds: i32,
         connect_token_entry_index: usize,
+        client_id: u64,
+        user_data: &UserData,
     ) -> bool {
         for index in 0..self.num_entries {
             let entry = &mut self.entries[index];
@@ -139,6 +145,8 @@ impl EncryptionManager {
                 entry.send_key = *send_key;
                 entry.receive_key = *receive_key;
                 entry.connect_token_entry_index = Some(connect_token_entry_index);
+                entry.client_id = client_id;
+                entry.user_data = *user_data;
                 return true;
             }
         }
@@ -153,6 +161,8 @@ impl EncryptionManager {
                     last_access_time: time,
                     client_index: None,
                     connect_token_entry_index: Some(connect_token_entry_index),
+                    client_id,
+                    user_data: *user_data,
                     send_key: *send_key,
                     receive_key: *receive_key,
                 };
@@ -223,6 +233,14 @@ impl EncryptionManager {
 
     fn connect_token_entry_index(&self, index: usize) -> Option<usize> {
         self.entries[index].connect_token_entry_index
+    }
+
+    fn client_id(&self, index: usize) -> u64 {
+        self.entries[index].client_id
+    }
+
+    fn user_data(&self, index: usize) -> UserData {
+        self.entries[index].user_data
     }
 
     fn send_key(&self, index: usize) -> Key {
@@ -908,6 +926,8 @@ impl Server {
             expire_time,
             private_token.timeout_seconds,
             connect_token_entry_index,
+            private_token.client_id,
+            &private_token.user_data,
         ) {
             debug!("server ignored connection request. failed to add encryption mapping");
             return;
@@ -923,7 +943,7 @@ impl Server {
             &mut challenge_token_data,
             self.challenge_sequence,
             &self.challenge_key,
-            &[],
+            &mac,
         )
         .is_err()
         {
@@ -948,11 +968,27 @@ impl Server {
         mut challenge_token_data: [u8; CHALLENGE_TOKEN_BYTES],
         encryption_index: Option<usize>,
     ) {
+        let Some(encryption_index) = encryption_index else {
+            debug!("server ignored connection response. no packet send key");
+            return;
+        };
+
+        // a challenge decrypts only under the MAC of the connect token that
+        // minted it, so a response is decrypted with its own mapping's MAC and a
+        // mapping with no connect-token entry has nothing to decrypt against
+        let Some(connect_token_entry_index) =
+            self.encryption_manager.connect_token_entry_index(encryption_index)
+        else {
+            debug!("server ignored connection response. mapping has no connect token entry");
+            return;
+        };
+
+        let mac = self.connect_token_entries[connect_token_entry_index].mac;
         if token::decrypt_challenge_token(
             &mut challenge_token_data,
             challenge_token_sequence,
             &self.challenge_key,
-            &[],
+            &mac[..],
         )
         .is_err()
         {
@@ -960,12 +996,10 @@ impl Server {
             return;
         }
 
-        let challenge_token = ChallengeToken::read(&challenge_token_data);
-
-        let Some(encryption_index) = encryption_index else {
-            debug!("server ignored connection response. no packet send key");
-            return;
-        };
+        // the mapping, not the challenge token, is the source of the client's
+        // identity and user data
+        let client_id = self.encryption_manager.client_id(encryption_index);
+        let user_data = self.encryption_manager.user_data(encryption_index);
 
         if self.find_client_index_by_address(from).is_some() {
             debug!(
@@ -974,7 +1008,7 @@ impl Server {
             return;
         }
 
-        if self.find_client_index_by_id(challenge_token.client_id).is_some() {
+        if self.find_client_index_by_id(client_id).is_some() {
             debug!(
                 "server ignored connection response. a client with this id is already connected"
             );
@@ -993,10 +1027,10 @@ impl Server {
         self.connect_client(
             client_index,
             from,
-            challenge_token.client_id,
+            client_id,
             encryption_index,
             timeout_seconds,
-            &challenge_token.user_data,
+            &user_data,
         );
     }
 
@@ -1203,7 +1237,8 @@ pub fn challenge_token_transcript() -> Vec<String> {
     ) -> ([u8; CONNECT_TOKEN_PRIVATE_BYTES], [u8; MAC_BYTES], UserData) {
         let mut user_data = [0u8; USER_DATA_BYTES];
         user_data[0] = first_byte;
-        let private_token = PrivateConnectToken::generate(client_id, 5, &[server_address], &user_data);
+        let private_token =
+            PrivateConnectToken::generate(client_id, 5, &[server_address], &user_data);
 
         let expire_timestamp = 1_000_000u64;
         let mut nonce = [0u8; crate::token::CONNECT_TOKEN_NONCE_BYTES];
@@ -1359,6 +1394,8 @@ mod tests {
                 time + 5.0,
                 5,
                 0,
+                0x1111 + port as u64,
+                &[0x42; USER_DATA_BYTES],
             ));
         }
 
@@ -1392,6 +1429,8 @@ mod tests {
             105.0,
             -1,
             0,
+            0x2222,
+            &[0; USER_DATA_BYTES],
         ));
         assert!(manager.find_encryption_mapping(test_address(40000), 104.0).is_some());
         assert!(manager.find_encryption_mapping(test_address(40000), 106.0).is_none());
@@ -1641,8 +1680,12 @@ mod tests {
         protocol_id: u64,
         server_address: SocketAddr,
     ) -> ([u8; CONNECT_TOKEN_PRIVATE_BYTES], [u8; MAC_BYTES]) {
-        let private_token =
-            PrivateConnectToken::generate(client_id, TEST_TOKEN_TIMEOUT, &[server_address], user_data);
+        let private_token = PrivateConnectToken::generate(
+            client_id,
+            TEST_TOKEN_TIMEOUT,
+            &[server_address],
+            user_data,
+        );
 
         let expire_timestamp = 1_000_000u64;
         let mut nonce = [0u8; crate::token::CONNECT_TOKEN_NONCE_BYTES];
@@ -1689,10 +1732,20 @@ mod tests {
         let mut user_data_b = [0u8; USER_DATA_BYTES];
         user_data_b[0] = 0xB2;
 
-        let (private_a, mac_a) =
-            mint_private_token_data(0x1111, &user_data_a, &private_key, TEST_PROTOCOL_ID, server.address());
-        let (private_b, mac_b) =
-            mint_private_token_data(0x2222, &user_data_b, &private_key, TEST_PROTOCOL_ID, server.address());
+        let (private_a, mac_a) = mint_private_token_data(
+            0x1111,
+            &user_data_a,
+            &private_key,
+            TEST_PROTOCOL_ID,
+            server.address(),
+        );
+        let (private_b, mac_b) = mint_private_token_data(
+            0x2222,
+            &user_data_b,
+            &private_key,
+            TEST_PROTOCOL_ID,
+            server.address(),
+        );
 
         // X presents token A, then Y presents token B: the server mints challenge A
         // (sequence 0) and challenge B (sequence 1).

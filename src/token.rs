@@ -11,8 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::bytes::{Reader, Writer};
 use crate::crypto::{self, XNONCE_BYTES};
 use crate::{
-    CONNECT_TOKEN_BYTES, Error, KEY_BYTES, Key, MAC_BYTES, MAX_SERVERS_PER_CONNECT, USER_DATA_BYTES,
-    UserData, VERSION_INFO,
+    CONNECT_TOKEN_BYTES, Error, KEY_BYTES, Key, MAX_SERVERS_PER_CONNECT, USER_DATA_BYTES, UserData,
+    VERSION_INFO,
 };
 
 pub(crate) const CONNECT_TOKEN_PRIVATE_BYTES: usize = 1024;
@@ -152,6 +152,10 @@ impl ChallengeToken {
         writer.zero_pad_to_end();
     }
 
+    // the challenge token body is read only by the round-trip and vector tests:
+    // the server takes the connected client's identity from its encryption
+    // mapping, never from the decrypted challenge token
+    #[allow(dead_code)]
     pub fn read(buffer: &[u8; CHALLENGE_TOKEN_BYTES]) -> Self {
         let mut reader = Reader::new(buffer);
         Self {
@@ -171,7 +175,7 @@ pub(crate) fn encrypt_challenge_token(
     key: &Key,
     associated_data: &[u8],
 ) -> Result<(), Error> {
-    crypto::encrypt_aead(buffer, &[], &crypto::sequence_nonce(sequence), key)
+    crypto::encrypt_aead(buffer, associated_data, &crypto::sequence_nonce(sequence), key)
 }
 
 pub(crate) fn decrypt_challenge_token(
@@ -180,7 +184,7 @@ pub(crate) fn decrypt_challenge_token(
     key: &Key,
     associated_data: &[u8],
 ) -> Result<(), Error> {
-    crypto::decrypt_aead(buffer, &[], &crypto::sequence_nonce(sequence), key)
+    crypto::decrypt_aead(buffer, associated_data, &crypto::sequence_nonce(sequence), key)
 }
 
 // ----------------------------------------------------------------
@@ -344,6 +348,7 @@ pub fn generate_connect_token(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MAC_BYTES;
     use crate::generate_key;
 
     const TEST_PROTOCOL_ID: u64 = 0x1122334455667788;
@@ -489,6 +494,31 @@ mod tests {
         decrypt_challenge_token(&mut null, sequence, &key, &[]).unwrap();
         assert_eq!(ChallengeToken::read(&null).client_id, token.client_id);
         assert_eq!(ChallengeToken::read(&null).user_data, token.user_data);
+    }
+
+    /// The challenge token encrypted with a bound connect token MAC as associated
+    /// data pins the fix's ciphertext. The vector was produced by the C reference
+    /// at the fix commit; a change that breaks this breaks the with-MAC challenge
+    /// ciphertext against every other netcode implementation.
+    #[test]
+    fn challenge_token_bound_matches_c() {
+        let key: Key = std::array::from_fn(|i| (i as u8).wrapping_mul(3));
+        let sequence: u64 = 1000;
+        let mac: [u8; MAC_BYTES] = std::array::from_fn(|i| (0xA1u8).wrapping_add(i as u8));
+        let client_id: u64 = 0x0102030405060708;
+        let user_data: UserData = std::array::from_fn(|i| i as u8);
+
+        let challenge_token = ChallengeToken { client_id, user_data };
+        let mut buffer = [0u8; CHALLENGE_TOKEN_BYTES];
+        challenge_token.write(&mut buffer);
+        encrypt_challenge_token(&mut buffer, sequence, &key, &mac).unwrap();
+        assert_eq!(&buffer, include_bytes!("../tests/vectors/challenge_token_bound.bin"));
+
+        let mut decrypted = *include_bytes!("../tests/vectors/challenge_token_bound.bin");
+        decrypt_challenge_token(&mut decrypted, sequence, &key, &mac).unwrap();
+        let output = ChallengeToken::read(&decrypted);
+        assert_eq!(output.client_id, client_id);
+        assert_eq!(output.user_data, user_data);
     }
 
     #[test]

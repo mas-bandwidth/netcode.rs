@@ -456,6 +456,130 @@ fn read_connection_request_packet(
     Some(Packet::Request { protocol_id: packet_protocol_id, expire_timestamp, nonce, private_data })
 }
 
+/// Test seam for the C differential test: builds the port-side transcript for the
+/// replay top-sequence and restart-floor edges `tests/c/oracle.c` runs, in the
+/// shared line form. Every input is pure or uses explicit timestamps and a real
+/// but local key; no socket and no clock. Hidden from docs; not part of the
+/// supported API.
+#[doc(hidden)]
+pub fn replay_transcript() -> Vec<String> {
+    const PROTOCOL_ID: u64 = 0x1122334455667788;
+
+    let mut lines = Vec::new();
+
+    // the sequence list the card names; for each, probe before advancing, advance,
+    // then re-probe every sequence advanced so far
+    let sequences: [u64; 10] = [
+        0,
+        1,
+        255,
+        256,
+        257,
+        u64::MAX - 257,
+        u64::MAX - 256,
+        u64::MAX - 255,
+        u64::MAX - 1,
+        u64::MAX,
+    ];
+
+    let mut replay_protection = ReplayProtection::new();
+    for (index, &sequence) in sequences.iter().enumerate() {
+        lines.push(format!(
+            "probe {sequence} -> {}",
+            u8::from(replay_protection.already_received(sequence))
+        ));
+        replay_protection.advance_sequence(sequence);
+        for &advanced in &sequences[..=index] {
+            lines.push(format!(
+                "recheck {advanced} -> {}",
+                u8::from(replay_protection.already_received(advanced))
+            ));
+        }
+    }
+
+    // a keep-alive whose prefix byte says eight sequence bytes, all 0xFF, read
+    // after the window is already at u64::MAX
+    let key = crate::generate_key();
+    let mut keep_alive = [0u8; crate::MAX_PACKET_BYTES];
+    let written = write_packet(
+        &Packet::KeepAlive { client_index: 7, max_clients: 16 },
+        &mut keep_alive,
+        u64::MAX,
+        &key,
+        PROTOCOL_ID,
+    )
+    .unwrap();
+    let mut kept = ReplayProtection::new();
+    kept.advance_sequence(u64::MAX);
+    let accepted = read_packet(
+        &mut keep_alive[..written],
+        Some(&key),
+        PROTOCOL_ID,
+        0,
+        None,
+        AllowedPackets::CLIENT,
+        Some(&mut kept),
+    )
+    .is_some();
+    lines.push(format!(
+        "keepalive {} -> {}",
+        u64::MAX,
+        if accepted { "accepted" } else { "refused" }
+    ));
+
+    // connection request bytes with expire F-1, F and F+1 against a floor F and a
+    // current time below F
+    let private_key = crate::generate_key();
+    let floor = 1_000_030u64;
+    let current_timestamp = floor - 30;
+    for expire_timestamp in [floor - 1, floor, floor + 1] {
+        let mut nonce = [0u8; CONNECT_TOKEN_NONCE_BYTES];
+        crypto::random_bytes(&mut nonce);
+        let private_token = crate::token::PrivateConnectToken::generate(
+            0x1234,
+            10,
+            &["127.0.0.1:40000".parse().unwrap()],
+            &[0u8; crate::USER_DATA_BYTES],
+        );
+        let mut private_data = Box::new([0u8; CONNECT_TOKEN_PRIVATE_BYTES]);
+        private_token.write(&mut private_data);
+        crate::token::encrypt_connect_token_private(
+            &mut private_data,
+            PROTOCOL_ID,
+            expire_timestamp,
+            &nonce,
+            &private_key,
+        )
+        .unwrap();
+        let input = Packet::Request {
+            protocol_id: PROTOCOL_ID,
+            expire_timestamp,
+            nonce,
+            private_data,
+        };
+        let write_key = crate::generate_key();
+        let mut buffer = [0u8; crate::MAX_PACKET_BYTES];
+        let written = write_packet(&input, &mut buffer, 0, &write_key, PROTOCOL_ID).unwrap();
+        let accepted = read_packet_with_min_connect_token_expire_timestamp(
+            &mut buffer[..written],
+            None,
+            PROTOCOL_ID,
+            current_timestamp,
+            Some(&private_key),
+            AllowedPackets::SERVER,
+            None,
+            floor,
+        )
+        .is_some();
+        lines.push(format!(
+            "request {expire_timestamp} -> {}",
+            if accepted { "accepted" } else { "refused" }
+        ));
+    }
+
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -761,6 +885,20 @@ mod tests {
             )
             .is_some()
         );
+    }
+
+    #[test]
+    fn replay_transcript_pins_the_port_side_edges() {
+        // the port half of the C differential test, so its shape is checked even
+        // when no C checkout is reachable
+        let lines = replay_transcript();
+
+        assert!(lines.iter().any(|line| line == "probe 18446744073709551615 -> 0"));
+        assert!(lines.iter().any(|line| line == "recheck 18446744073709551615 -> 1"));
+        assert!(lines.iter().any(|line| line == "keepalive 18446744073709551615 -> refused"));
+        assert!(lines.iter().any(|line| line == "request 1000029 -> refused"));
+        assert!(lines.iter().any(|line| line == "request 1000030 -> refused"));
+        assert!(lines.iter().any(|line| line == "request 1000031 -> accepted"));
     }
 
     #[test]

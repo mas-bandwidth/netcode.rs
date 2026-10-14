@@ -506,6 +506,175 @@ static int disco_run( void )
     return 0;
 }
 
+/* ----------------------------------------------------------------------------
+   Replay top-sequence and restart-floor scenario (mode "replay").
+
+   Prints one line per input, of the form
+
+       <op> <sequence or expire> -> <0|1|accepted|refused>
+
+   in three groups: the sequence list the card names, with a probe before the
+   advance and a re-probe of every sequence advanced so far after it; a
+   keep-alive whose prefix byte says eight sequence bytes, all 0xFF, read after
+   the window is already at u64::MAX; and connection request bytes with expire
+   F-1, F and F+1 against a floor F and a current time below F. The replay
+   protection and the packet reads are driven by hand with explicit timestamps;
+   no socket is opened.
+
+   NOTE: written against the reference API names from memory and never compiled
+   against the C checkout (no C checkout is reachable from this job). Expect to
+   adjust file-local signatures and struct field names on first run against
+   mas-bandwidth/netcode (branch sprint/netcode-audit-fixes at or after
+   406e8d28).
+---------------------------------------------------------------------------- */
+
+static void replay_print_flag( const char * op, uint64_t value, int flag )
+{
+    printf( "%s %llu -> %d\n", op, (unsigned long long) value, flag ? 1 : 0 );
+}
+
+static void replay_print_verdict( const char * op, uint64_t value, int accepted )
+{
+    printf( "%s %llu -> %s\n", op, (unsigned long long) value, accepted ? "accepted" : "refused" );
+}
+
+/* Builds a connection request packet whose private data decrypts, in place, for
+   the given expiry timestamp: [0][version 13][protocol 8][expire 8][nonce 24]
+   [encrypted private 1024]. Returns the packet length. */
+static int replay_build_request( uint8_t * packet, uint8_t * private_key, uint64_t protocol_id, uint64_t expire_timestamp )
+{
+    uint8_t user_data[NETCODE_USER_DATA_BYTES];
+    char * server_addresses[1];
+    uint8_t * token;
+    int p = 0;
+
+    server_addresses[0] = "127.0.0.1:40000";
+    memset( user_data, 0, sizeof( user_data ) );
+    token = netcode_generate_connect_token( private_key, protocol_id, expire_timestamp - 5, 5,
+                                            0x1234, 10, server_addresses, 1, server_addresses, 1, user_data );
+    if ( !token )
+        return 0;
+
+    packet[p++] = 0;
+    memcpy( packet + p, token, 13 );
+    p += 13;
+    memcpy( packet + p, token + 13, 8 );
+    p += 8;
+    packet[p++] = (uint8_t) ( expire_timestamp & 0xFF );
+    packet[p++] = (uint8_t) ( ( expire_timestamp >> 8 ) & 0xFF );
+    packet[p++] = (uint8_t) ( ( expire_timestamp >> 16 ) & 0xFF );
+    packet[p++] = (uint8_t) ( ( expire_timestamp >> 24 ) & 0xFF );
+    packet[p++] = (uint8_t) ( ( expire_timestamp >> 32 ) & 0xFF );
+    packet[p++] = (uint8_t) ( ( expire_timestamp >> 40 ) & 0xFF );
+    packet[p++] = (uint8_t) ( ( expire_timestamp >> 48 ) & 0xFF );
+    packet[p++] = (uint8_t) ( ( expire_timestamp >> 56 ) & 0xFF );
+    memcpy( packet + p, token + 29, NETCODE_CONNECT_TOKEN_NONCE_BYTES );
+    p += NETCODE_CONNECT_TOKEN_NONCE_BYTES;
+    memcpy( packet + p, token + 29 + NETCODE_CONNECT_TOKEN_NONCE_BYTES, NETCODE_CONNECT_TOKEN_PRIVATE_BYTES );
+    p += NETCODE_CONNECT_TOKEN_PRIVATE_BYTES;
+
+    free( token );
+    return p;
+}
+
+static int replay_run( void )
+{
+    static const uint64_t sequences[10] = {
+        0, 1, 255, 256, 257,
+        UINT64_MAX - 257, UINT64_MAX - 256, UINT64_MAX - 255, UINT64_MAX - 1, UINT64_MAX
+    };
+    const uint64_t protocol_id = 0x1122334455667788ULL;
+    uint64_t floor = 1000030ULL;
+    uint64_t current_timestamp = floor - 30;
+    uint8_t private_key[NETCODE_KEY_BYTES];
+    struct netcode_replay_protection_t replay_protection;
+    int i, j;
+
+    /* group 1: the sequence list, probed before and re-probed after each advance */
+    netcode_replay_protection_reset( &replay_protection );
+    for ( i = 0; i < 10; ++i )
+    {
+        uint64_t sequence = sequences[i];
+        replay_print_flag( "probe", sequence,
+                           netcode_replay_protection_already_received( &replay_protection, sequence ) );
+        netcode_replay_protection_advance_sequence( &replay_protection, sequence );
+        for ( j = 0; j <= i; ++j )
+            replay_print_flag( "recheck", sequences[j],
+                               netcode_replay_protection_already_received( &replay_protection, sequences[j] ) );
+    }
+
+    /* group 2: a keep-alive at the top of the sequence space read after the window
+       is there. The packet is written with a key and read back with the window
+       already advanced to u64::MAX; the read is skipped when the window already
+       holds that sequence, mirroring the port's check before the decrypt. */
+    {
+        uint8_t write_key[NETCODE_KEY_BYTES];
+        uint8_t read_packet_key[NETCODE_KEY_BYTES];
+        uint8_t packet[NETCODE_MAX_PACKET_BYTES];
+        uint8_t additional_data[13 + 8 + 1];
+        uint8_t nonce[NETCODE_NONCE_BYTES];
+        struct netcode_replay_protection_t keep_protection;
+        uint64_t sequence = UINT64_MAX;
+        uint8_t packet_type = 0;
+        int p = 0, written, accepted = 0;
+
+        memset( write_key, 0x42, sizeof( write_key ) );
+        memset( read_packet_key, 0x42, sizeof( read_packet_key ) );
+        memset( packet, 0, sizeof( packet ) );
+
+        packet[p++] = (uint8_t) ( NETCODE_CONNECTION_KEEP_ALIVE_PACKET | ( 8 << 4 ) );
+        for ( i = 0; i < 8; ++i )
+            packet[p++] = 0xFF;
+        packet[p++] = 7;
+        packet[p++] = 0;
+        packet[p++] = 0;
+        packet[p++] = 0;
+        packet[p++] = 16;
+        packet[p++] = 0;
+        packet[p++] = 0;
+        packet[p++] = 0;
+
+        memcpy( additional_data, NETCODE_VERSION_INFO, 13 );
+        netcode_write_uint64( additional_data + 13, protocol_id );
+        additional_data[13 + 8] = packet[0];
+        netcode_sequence_nonce( nonce, sequence );
+        netcode_encrypt_aead( packet + 1 + 8, 8, additional_data, sizeof( additional_data ), nonce, write_key );
+        p += NETCODE_MAC_BYTES;
+        written = p;
+
+        netcode_replay_protection_reset( &keep_protection );
+        netcode_replay_protection_advance_sequence( &keep_protection, sequence );
+        if ( !netcode_replay_protection_already_received( &keep_protection, sequence ) )
+        {
+            if ( netcode_read_packet( packet, written, protocol_id, 0, 0, read_packet_key, NULL, 1 << NETCODE_CONNECTION_KEEP_ALIVE_PACKET, &packet_type, &sequence ) == NETCODE_OK )
+                accepted = 1;
+        }
+        replay_print_verdict( "keepalive", UINT64_MAX, accepted );
+    }
+
+    /* group 3: connection request bytes with expire F-1, F and F+1 against floor F
+       and a current time below F. The bytes decrypt, so a refusal here is the floor,
+       not the decrypt. */
+    memset( private_key, 0x60, sizeof( private_key ) );
+    for ( i = -1; i <= 1; ++i )
+    {
+        uint64_t expire_timestamp = floor + (uint64_t) i;
+        uint8_t packet[NETCODE_MAX_PACKET_BYTES];
+        uint8_t packet_type = 0;
+        uint64_t sequence = 0;
+        int length, accepted = 0;
+
+        length = replay_build_request( packet, private_key, protocol_id, expire_timestamp );
+        if ( length > 0 &&
+             netcode_read_packet( packet, length, protocol_id, current_timestamp, floor, NULL, private_key,
+                                 1 << NETCODE_CONNECTION_REQUEST_PACKET, &packet_type, &sequence ) == NETCODE_OK )
+            accepted = 1;
+        replay_print_verdict( "request", expire_timestamp, accepted );
+    }
+
+    return 0;
+}
+
 int main( int argc, char ** argv )
 {
     if ( netcode_init() != NETCODE_OK )
@@ -517,6 +686,13 @@ int main( int argc, char ** argv )
     if ( argc > 1 && strcmp( argv[1], "disconnect" ) == 0 )
     {
         int result = disco_run();
+        netcode_term();
+        return result;
+    }
+
+    if ( argc > 1 && strcmp( argv[1], "replay" ) == 0 )
+    {
+        int result = replay_run();
         netcode_term();
         return result;
     }

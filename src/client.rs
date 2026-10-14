@@ -654,4 +654,39 @@ mod tests {
         assert!(client.connect(&connect_token).is_err());
         assert_eq!(client.state(), ClientState::InvalidConnectToken);
     }
+
+    fn connect_token_with(addresses: &[&str]) -> [u8; CONNECT_TOKEN_BYTES] {
+        let server_addresses: Vec<SocketAddr> =
+            addresses.iter().map(|address| address.parse().unwrap()).collect();
+        let token = ConnectToken {
+            protocol_id: 0,
+            create_timestamp: 0,
+            expire_timestamp: u64::MAX,
+            nonce: [0; crate::token::CONNECT_TOKEN_NONCE_BYTES],
+            private_data: Box::new([0u8; crate::token::CONNECT_TOKEN_PRIVATE_BYTES]),
+            timeout_seconds: 10,
+            server_addresses,
+            client_to_server_key: [0; KEY_BYTES],
+            server_to_client_key: [0; KEY_BYTES],
+        };
+        let mut buffer = [0u8; CONNECT_TOKEN_BYTES];
+        token.write(&mut buffer);
+        buffer
+    }
+
+    #[test]
+    fn connect_refuses_an_address_family_it_has_no_socket_for() {
+        let mut client = Client::create(None, None, true, 0.0).unwrap();
+        let connect_token = connect_token_with(&["[::1]:40000"]);
+        assert!(client.connect(&connect_token).is_err());
+        assert_eq!(client.state(), ClientState::InvalidConnectToken);
+
+        let mut client =
+            Client::create(Some("127.0.0.1:0".parse().unwrap()), None, true, 0.0).unwrap();
+        let connect_token = connect_token_with(&["[::1]:40000", "127.0.0.1:40000"]);
+        assert!(client.connect(&connect_token).is_ok());
+        assert_eq!(client.state(), ClientState::SendingConnectionRequest);
+        assert_eq!(client.server_address(), Some("127.0.0.1:40000".parse().unwrap()));
+        assert_eq!(client.server_address_index, 1);
+    }
 }

@@ -823,10 +823,111 @@ static int lifetime_run( void )
     return 0;
 }
 
+/* ----------------------------------------------------------------------------
+   Client address-family refusal scenario (mode "connect_family").
+
+   Prints one line per input, of the form
+
+       <label> state <state> address <index|none>
+
+   for tokens whose server address lists are [[::1]:40000],
+   [[::1]:40000, 127.0.0.1:40000] and [127.0.0.1:40000], fed to a client with
+   only an IPv4 socket. The client is created with the override transport and an
+   explicit time; no socket is opened. The IPv6 socket is cleared so the client
+   has no socket for the [::1] family, the way the C test does; the reference's
+   socket handle assert stays a programmer-error check and this scenario never
+   trips it.
+
+   NOTE: written against the reference API names from memory and never compiled
+   against the C checkout (no C checkout is reachable from this job). Expect to
+   adjust file-local signatures and struct field names on first run against
+   mas-bandwidth/netcode (branch sprint/netcode-audit-fixes at or after the
+   commit that lands
+   netfix-client-refuses-a-server-address-it-has-no-socket-for).
+---------------------------------------------------------------------------- */
+
+static const char * connect_family_state_name( int state )
+{
+    switch ( state )
+    {
+        case NETCODE_CLIENT_STATE_INVALID_CONNECT_TOKEN:      return "invalid_connect_token";
+        case NETCODE_CLIENT_STATE_SENDING_CONNECTION_REQUEST: return "sending_connection_request";
+        case NETCODE_CLIENT_STATE_SENDING_CONNECTION_RESPONSE:return "sending_connection_response";
+        case NETCODE_CLIENT_STATE_CONNECTED:                  return "connected";
+        case NETCODE_CLIENT_STATE_DISCONNECTED:               return "disconnected";
+        default:                                              return "unknown";
+    }
+}
+
+static int connect_family_run( void )
+{
+    const uint64_t protocol_id = 0x1122334455667788ULL;
+    const char * labels[3] = { "ipv6-only", "ipv6-then-ipv4", "ipv4-only" };
+    char * addresses[3][2];
+    int counts[3] = { 1, 2, 1 };
+    uint8_t private_key[NETCODE_KEY_BYTES];
+    int t;
+
+    memset( private_key, 0x60, sizeof( private_key ) );
+
+    addresses[0][0] = "[::1]:40000";
+    addresses[1][0] = "[::1]:40000";
+    addresses[1][1] = "127.0.0.1:40000";
+    addresses[2][0] = "127.0.0.1:40000";
+
+    for ( t = 0; t < 3; ++t )
+    {
+        struct netcode_client_config_t client_config;
+        struct netcode_client_t * client;
+        uint8_t * token;
+        int index;
+
+        netcode_default_client_config( &client_config );
+        client_config.protocol_id = protocol_id;
+        memcpy( client_config.private_key, private_key, NETCODE_KEY_BYTES );
+        client_config.override_send_and_receive = 1;
+        client_config.send_packet_override = send_override;
+        client_config.receive_packet_override = receive_override;
+
+        client = netcode_client_create( "127.0.0.1:0", &client_config, 100.0 );
+
+        /* the client is IPv4-only: clear the IPv6 socket so the [::1] family has
+           no open handle */
+        memset( &client->socket_ipv6, 0, sizeof( client->socket_ipv6 ) );
+
+        token = netcode_generate_connect_token( private_key, protocol_id, 1000000, 10,
+                                                0x1234, NETCODE_MAX_SERVERS_PER_CONNECT,
+                                                addresses[t], counts[t], addresses[t], counts[t] );
+
+        netcode_client_connect( client, token );
+
+        index = ( client->state == NETCODE_CLIENT_STATE_INVALID_CONNECT_TOKEN )
+              ? -1 : client->server_address_index;
+
+        printf( "%s state %s address ", labels[t], connect_family_state_name( client->state ) );
+        if ( index < 0 )
+            printf( "none\n" );
+        else
+            printf( "%d\n", index );
+
+        netcode_client_destroy( client );
+        free( token );
+    }
+
+    return 0;
+}
+
 int main( int argc, char ** argv )
 {
     if ( netcode_init() != NETCODE_OK )
         return 1;
+
+    if ( argc > 1 && strcmp( argv[1], "connect_family" ) == 0 )
+    {
+        int result = connect_family_run();
+        netcode_term();
+        return result;
+    }
 
     if ( argc > 1 && strcmp( argv[1], "lifetime" ) == 0 )
     {

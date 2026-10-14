@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use netcode::{Client, ClientState, DisconnectReason, Key, Server, ServerEvent};
+use netcode::{Client, ClientState, DisconnectReason, Key, Server, ServerConfig, ServerEvent};
 
 const PROTOCOL_ID: u64 = 0x1122334455667788;
 const CONNECT_TOKEN_EXPIRY: i32 = 30;
@@ -18,10 +18,20 @@ struct Harness {
 
 impl Harness {
     fn new(max_clients: usize) -> Self {
-        // public port 0 binds an ephemeral port so parallel tests don't collide
+        // public port 0 binds an ephemeral port so parallel tests don't collide.
+        // the server floor is the start time plus max_connect_token_lifetime, and a
+        // token minted in the same whole second as the start has expiry equal to the
+        // floor, which the server refuses; a lifetime below CONNECT_TOKEN_EXPIRY keeps
+        // the tokens these tests mint strictly above the floor
         let private_key = netcode::generate_key();
-        let mut server =
-            Server::new("127.0.0.1:0".parse().unwrap(), PROTOCOL_ID, &private_key, 0.0).unwrap();
+        let mut server = Server::new_with_config(
+            "127.0.0.1:0".parse().unwrap(),
+            PROTOCOL_ID,
+            &private_key,
+            ServerConfig { max_connect_token_lifetime: 10 },
+            0.0,
+        )
+        .unwrap();
         server.start(max_clients).unwrap();
         Self { private_key, server, clients: Vec::new(), time: 0.0 }
     }

@@ -159,3 +159,41 @@ fn disconnect_paths_match_the_c_reference() {
         );
     }
 }
+
+/// The replay top-sequence and restart-floor edges, fed through the C reference
+/// and through this port and compared line by line, not by shape. The C oracle
+/// (`["replay"]`) drives the reference's file-local replay protection and packet
+/// read with explicit timestamps; the port half is
+/// `netcode::replay_transcript`. Each line is
+/// `<op> <sequence or expire> -> <0|1|accepted|refused>` in decimal.
+#[test]
+#[ignore = "requires a C reference checkout; see the file docs"]
+fn replay_edges_match_the_c_reference() {
+    let Ok(netcode_c_dir) = std::env::var("NETCODE_C_DIR") else {
+        eprintln!(
+            "SKIP c_differential (replay): NETCODE_C_DIR is unset; set it to a checkout of \
+             mas-bandwidth/netcode holding the fix (branch sprint/netcode-audit-fixes at or after \
+             406e8d28), then run:\n    \
+             NETCODE_C_DIR=<checkout> cargo test --test c_differential -- --ignored --test-threads=1"
+        );
+        return;
+    };
+
+    let c_lines = c_transcript_for(&netcode_c_dir, &["replay"]);
+    let port_lines = netcode::replay_transcript();
+
+    assert_eq!(
+        c_lines.len(),
+        port_lines.len(),
+        "the C and port replay transcripts have different lengths: C {} vs port {}",
+        c_lines.len(),
+        port_lines.len()
+    );
+    for (index, (c_line, port_line)) in c_lines.iter().zip(port_lines.iter()).enumerate() {
+        assert_eq!(
+            c_line, port_line,
+            "C and port replay transcripts first differ at line {index}: \
+             C {c_line:?} vs port {port_line:?}"
+        );
+    }
+}

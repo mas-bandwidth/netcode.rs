@@ -274,7 +274,8 @@ fn connect_family_transcript() -> Vec<String> {
         let _ = client.connect(&token);
 
         let state = client.state().to_string().replace(' ', "_");
-        let index = client.server_address().and_then(|address| addrs.iter().position(|&a| a == address));
+        let index =
+            client.server_address().and_then(|address| addrs.iter().position(|&a| a == address));
         let index = match index {
             Some(index) => index.to_string(),
             None => "none".to_string(),

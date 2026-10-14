@@ -206,16 +206,24 @@ impl Client {
             }
         };
 
-        self.server_address_index = 0;
-        self.server_address = Some(connect_token.server_addresses[0]);
+        let Some(index) = self.first_usable_server_address(&connect_token) else {
+            info!("client connect failed. no server address for an open socket family");
+            self.set_state(ClientState::InvalidConnectToken);
+            return Err(Error::InvalidConnectToken);
+        };
 
-        if connect_token.server_addresses.len() == 1 {
-            info!("client connecting to server {}", connect_token.server_addresses[0]);
+        self.server_address_index = index;
+        self.server_address = Some(connect_token.server_addresses[index]);
+
+        let num_server_addresses = connect_token.server_addresses.len();
+        if num_server_addresses == 1 {
+            info!("client connecting to server {}", connect_token.server_addresses[index]);
         } else {
             info!(
-                "client connecting to server {} [1/{}]",
-                connect_token.server_addresses[0],
-                connect_token.server_addresses.len()
+                "client connecting to server {} [{}/{}]",
+                connect_token.server_addresses[index],
+                index + 1,
+                num_server_addresses
             );
         }
 
@@ -403,19 +411,47 @@ impl Client {
         self.reset_connection_data(destination_state);
     }
 
-    fn connect_to_next_server(&mut self) -> bool {
-        let Some(connect_token) = self.connect_token.as_ref() else {
-            return false;
-        };
-        let num_server_addresses = connect_token.server_addresses.len();
+    fn has_socket_for(&self, address: SocketAddr) -> bool {
+        match address {
+            SocketAddr::V4(_) => self.socket_ipv4.is_some(),
+            SocketAddr::V6(_) => self.socket_ipv6.is_some(),
+        }
+    }
 
-        if self.server_address_index + 1 >= num_server_addresses {
+    fn first_usable_server_address(&self, connect_token: &ConnectToken) -> Option<usize> {
+        for (index, &address) in connect_token.server_addresses.iter().enumerate() {
+            if self.has_socket_for(address) {
+                return Some(index);
+            }
+            debug!("client has no socket for server address family, skipping: {address}");
+        }
+        None
+    }
+
+    fn connect_to_next_server(&mut self) -> bool {
+        let next = {
+            let Some(connect_token) = self.connect_token.as_ref() else {
+                return false;
+            };
+            let num_server_addresses = connect_token.server_addresses.len();
+            let mut found = None;
+            for index in (self.server_address_index + 1)..num_server_addresses {
+                let address = connect_token.server_addresses[index];
+                if self.has_socket_for(address) {
+                    found = Some((index, address, num_server_addresses));
+                    break;
+                }
+                debug!("client has no socket for server address family, skipping: {address}");
+            }
+            found
+        };
+
+        let Some((index, server_address, num_server_addresses)) = next else {
             debug!("client has no more servers to connect to");
             return false;
-        }
+        };
 
-        self.server_address_index += 1;
-        let server_address = connect_token.server_addresses[self.server_address_index];
+        self.server_address_index = index;
         self.server_address = Some(server_address);
 
         self.reset_before_next_connect();
@@ -423,7 +459,7 @@ impl Client {
         info!(
             "client connecting to next server {} [{}/{}]",
             server_address,
-            self.server_address_index + 1,
+            index + 1,
             num_server_addresses
         );
 
@@ -484,7 +520,6 @@ impl Client {
             Ok(packet_bytes) => packet_bytes,
             Err(_) => return,
         };
-        self.sequence += 1;
 
         let socket = match server_address {
             SocketAddr::V4(_) => self.socket_ipv4.as_ref(),
@@ -493,6 +528,7 @@ impl Client {
         match socket {
             Some(socket) => {
                 let _ = socket.send_to(&packet_data[..packet_bytes], server_address);
+                self.sequence += 1;
             }
             None => {
                 debug!("client has no socket for server address family: {server_address}");

@@ -214,13 +214,10 @@ fn connect_token_cannot_be_reused_after_disconnect() {
     harness.server.disconnect_client(0);
     harness.run_until(1000, |h| h.clients[0].state() == ClientState::Disconnected);
 
-    // Reuse the same client socket and token after the session has ended. The
-    // token was consumed when the first client was installed.
-    harness.clients[0].connect(&connect_token).unwrap();
-    for _ in 0..300 {
-        harness.update();
-        assert_ne!(harness.clients[0].state(), ClientState::Connected);
-    }
+    // The same client and the same token bytes would encrypt the next session from
+    // sequence zero under the same client-to-server key. The client refuses.
+    assert!(harness.clients[0].connect(&connect_token).is_err());
+    assert_eq!(harness.clients[0].state(), ClientState::InvalidConnectToken);
     assert_eq!(harness.server.num_connected_clients(), 0);
 }
 

@@ -691,6 +691,23 @@ mod tests {
         assert_eq!(client.state(), ClientState::InvalidConnectToken);
     }
 
+    /// A second connect with the same token bytes repeats sequence 0 under the same
+    /// client-to-server key. The client refuses it.
+    #[test]
+    fn client_refuses_a_reused_connect_token() {
+        let mut client = Client::new("127.0.0.1:0".parse().unwrap(), 0.0).unwrap();
+        let connect_token = connect_token_with(&["127.0.0.1:40000"]);
+
+        assert!(client.connect(&connect_token).is_ok());
+        assert_eq!(client.state(), ClientState::SendingConnectionRequest);
+
+        client.disconnect();
+        assert_eq!(client.state(), ClientState::Disconnected);
+
+        assert!(client.connect(&connect_token).is_err());
+        assert_eq!(client.state(), ClientState::InvalidConnectToken);
+    }
+
     fn connect_token_with(addresses: &[&str]) -> [u8; CONNECT_TOKEN_BYTES] {
         let server_addresses: Vec<SocketAddr> =
             addresses.iter().map(|address| address.parse().unwrap()).collect();

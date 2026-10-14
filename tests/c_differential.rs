@@ -238,3 +238,88 @@ fn token_lifetimes_match_the_c_reference() {
         );
     }
 }
+
+/// Builds the port half of the address-family refusal transcript with the public
+/// client API: an IPv4-only client (`Client::new` on 127.0.0.1) is fed three
+/// connect tokens whose server address lists are [[::1]:40000],
+/// [[::1]:40000, 127.0.0.1:40000] and [127.0.0.1]:40000]. One line per token:
+/// `<label> state <state> address <index|none>`.
+fn connect_family_transcript() -> Vec<String> {
+    use std::net::SocketAddr;
+
+    let key = netcode::generate_key();
+    let protocol_id = 0x1122334455667788u64;
+    let cases: [(&str, &[&str]); 3] = [
+        ("ipv6-only", &["[::1]:40000"]),
+        ("ipv6-then-ipv4", &["[::1]:40000", "127.0.0.1:40000"]),
+        ("ipv4-only", &["127.0.0.1:40000"]),
+    ];
+
+    let mut lines = Vec::new();
+    for (label, addresses) in cases {
+        let addrs: Vec<SocketAddr> = addresses.iter().map(|a| a.parse().unwrap()).collect();
+        let mut client = netcode::Client::new("127.0.0.1:0".parse().unwrap(), 0.0).unwrap();
+        let token = netcode::generate_connect_token(
+            &addrs,
+            &addrs,
+            30,
+            10,
+            1,
+            protocol_id,
+            &key,
+            &[0u8; netcode::USER_DATA_BYTES],
+        )
+        .unwrap();
+
+        let _ = client.connect(&token);
+
+        let state = client.state().to_string().replace(' ', "_");
+        let index =
+            client.server_address().and_then(|address| addrs.iter().position(|&a| a == address));
+        let index = match index {
+            Some(index) => index.to_string(),
+            None => "none".to_string(),
+        };
+        lines.push(format!("{label} state {state} address {index}"));
+    }
+    lines
+}
+
+/// The address-family refusal edge, fed through the C reference and through this
+/// port and compared line by line, not by shape. The C oracle
+/// (`["connect_family"]`) drives the reference's client connect with an override
+/// transport and an explicit time, the IPv6 socket cleared; the port half is
+/// [`connect_family_transcript`]. The port must settle on the same server
+/// address index as C, or reach `invalid_connect_token`, on each token.
+#[test]
+#[ignore = "requires a C reference checkout; see the file docs"]
+fn connect_family_matches_the_c_reference() {
+    let Ok(netcode_c_dir) = std::env::var("NETCODE_C_DIR") else {
+        eprintln!(
+            "SKIP c_differential (connect_family): NETCODE_C_DIR is unset; set it to a checkout of \
+             mas-bandwidth/netcode holding the fix (branch sprint/netcode-audit-fixes at or after \
+             the commit that lands netfix-client-refuses-a-server-address-it-has-no-socket-for), \
+             then run:\n    \
+             NETCODE_C_DIR=<checkout> cargo test --test c_differential -- --ignored --test-threads=1"
+        );
+        return;
+    };
+
+    let c_lines = c_transcript_for(&netcode_c_dir, &["connect_family"]);
+    let port_lines = connect_family_transcript();
+
+    assert_eq!(
+        c_lines.len(),
+        port_lines.len(),
+        "the C and port connect_family transcripts have different lengths: C {} vs port {}",
+        c_lines.len(),
+        port_lines.len()
+    );
+    for (index, (c_line, port_line)) in c_lines.iter().zip(port_lines.iter()).enumerate() {
+        assert_eq!(
+            c_line, port_line,
+            "C and port connect_family transcripts first differ at line {index}: \
+             C {c_line:?} vs port {port_line:?}"
+        );
+    }
+}

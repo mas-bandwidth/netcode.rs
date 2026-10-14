@@ -9,7 +9,9 @@
 //!
 //! This is a functional test: it builds and runs a local C program on fixed
 //! inputs with no socket and no clock anywhere in the comparison. It is
-//! `#[ignore]`d and gated on `NETCODE_C_DIR` so the unit gate stays hermetic:
+//! `#[ignore = "functional"]` so the unit gate stays hermetic. The functional
+//! run fails, it does not pass, when `NETCODE_C_DIR` is unset: a skip that
+//! returns is counted as a pass by libtest.
 //!
 //! ```console
 //! NETCODE_C_DIR=<checkout> cargo test --test c_differential -- --ignored --test-threads=1
@@ -20,6 +22,21 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+
+/// Resolves `NETCODE_C_DIR` for a functional (`#[ignore = "functional"]`) test.
+///
+/// Unset is a failure. Returning early would let libtest count the functional
+/// run as a pass when no C reference was compared.
+fn require_netcode_c_dir(scenario: &str) -> String {
+    std::env::var("NETCODE_C_DIR").unwrap_or_else(|_| {
+        panic!(
+            "c_differential ({scenario}): NETCODE_C_DIR is unset under the functional tag; \
+             this test fails rather than passing. Set it to a checkout of mas-bandwidth/netcode \
+             holding the fix, then run:\n    \
+             NETCODE_C_DIR=<checkout> cargo test --test c_differential -- --ignored --test-threads=1"
+        )
+    })
+}
 
 /// Builds and runs the C oracle, returning its stdout split into lines.
 ///
@@ -36,6 +53,13 @@ fn c_transcript(netcode_c_dir: &str) -> Vec<String> {
 /// (`["challenge"]` for the challenge-token binding scenario, `["disconnect"]`
 /// for the disconnect-callback re-entry scenario).
 fn c_transcript_for(netcode_c_dir: &str, args: &[&str]) -> Vec<String> {
+    c_transcript_cc(netcode_c_dir, args, &[])
+}
+
+/// Like [`c_transcript_for`], but passes extra flags to `cc`. The global-nonce
+/// scenario is built with `-DNETCODE_ORACLE_GLOBAL_NONCE` so the oracle compiles
+/// only that scenario against the reference.
+fn c_transcript_cc(netcode_c_dir: &str, args: &[&str], extra_cc: &[&str]) -> Vec<String> {
     let oracle = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/c/oracle.c");
     let out_dir = std::env::temp_dir().join("netcode-c-differential");
     std::fs::create_dir_all(&out_dir).expect("create temp build dir");
@@ -43,6 +67,7 @@ fn c_transcript_for(netcode_c_dir: &str, args: &[&str]) -> Vec<String> {
 
     let status = Command::new("cc")
         .args(["-O2", "-ffp-contract=off", "-finstrument-functions"])
+        .args(extra_cc)
         .arg(format!("-I{netcode_c_dir}"))
         .arg(format!("-I{netcode_c_dir}/sodium"))
         .arg(&oracle)
@@ -61,16 +86,9 @@ fn c_transcript_for(netcode_c_dir: &str, args: &[&str]) -> Vec<String> {
 }
 
 #[test]
-#[ignore = "requires a C reference checkout; see the file docs"]
+#[ignore = "functional"]
 fn receive_drain_matches_the_c_reference() {
-    let Ok(netcode_c_dir) = std::env::var("NETCODE_C_DIR") else {
-        eprintln!(
-            "SKIP c_differential: NETCODE_C_DIR is unset; set it to a checkout of \
-             mas-bandwidth/netcode holding the fix, then run:\n    \
-             NETCODE_C_DIR=<checkout> cargo test --test c_differential -- --ignored --test-threads=1"
-        );
-        return;
-    };
+    let netcode_c_dir = require_netcode_c_dir("receive_drain");
 
     let c_lines = c_transcript(&netcode_c_dir);
     let port_lines = netcode::differential_transcript();
@@ -91,17 +109,9 @@ fn receive_drain_matches_the_c_reference() {
 }
 
 #[test]
-#[ignore = "requires a C reference checkout; see the file docs"]
+#[ignore = "functional"]
 fn challenge_token_binds_matches_the_c_reference() {
-    let Ok(netcode_c_dir) = std::env::var("NETCODE_C_DIR") else {
-        eprintln!(
-            "SKIP c_differential: NETCODE_C_DIR is unset; set it to a checkout of \
-             mas-bandwidth/netcode holding the fix (branch sprint/netcode-audit-fixes at or after \
-             5cc4798d), then run:\n    \
-             NETCODE_C_DIR=<checkout> cargo test --test c_differential -- --ignored --test-threads=1"
-        );
-        return;
-    };
+    let netcode_c_dir = require_netcode_c_dir("challenge");
 
     let c_lines = c_transcript_for(&netcode_c_dir, &["challenge"]);
     let port_lines = netcode::challenge_token_transcript();
@@ -130,16 +140,9 @@ fn challenge_token_binds_matches_the_c_reference() {
 /// `netcode::differential_disconnect_transcript` has no callback at all, so the
 /// comparison is over the observable contract both must print.
 #[test]
-#[ignore = "requires a C reference checkout; see the file docs"]
+#[ignore = "functional"]
 fn disconnect_paths_match_the_c_reference() {
-    let Ok(netcode_c_dir) = std::env::var("NETCODE_C_DIR") else {
-        eprintln!(
-            "SKIP c_differential (disconnect): NETCODE_C_DIR is unset; set it to a checkout of \
-             mas-bandwidth/netcode holding the fix, then run:\n    \
-             NETCODE_C_DIR=<checkout> cargo test --test c_differential -- --ignored --test-threads=1"
-        );
-        return;
-    };
+    let netcode_c_dir = require_netcode_c_dir("disconnect");
 
     let c_lines = c_transcript_for(&netcode_c_dir, &["disconnect"]);
     let port_lines = netcode::differential_disconnect_transcript();
@@ -167,17 +170,9 @@ fn disconnect_paths_match_the_c_reference() {
 /// `netcode::replay_transcript`. Each line is
 /// `<op> <sequence or expire> -> <0|1|accepted|refused>` in decimal.
 #[test]
-#[ignore = "requires a C reference checkout; see the file docs"]
+#[ignore = "functional"]
 fn replay_edges_match_the_c_reference() {
-    let Ok(netcode_c_dir) = std::env::var("NETCODE_C_DIR") else {
-        eprintln!(
-            "SKIP c_differential (replay): NETCODE_C_DIR is unset; set it to a checkout of \
-             mas-bandwidth/netcode holding the fix (branch sprint/netcode-audit-fixes at or after \
-             406e8d28), then run:\n    \
-             NETCODE_C_DIR=<checkout> cargo test --test c_differential -- --ignored --test-threads=1"
-        );
-        return;
-    };
+    let netcode_c_dir = require_netcode_c_dir("replay");
 
     let c_lines = c_transcript_for(&netcode_c_dir, &["replay"]);
     let port_lines = netcode::replay_transcript();
@@ -207,18 +202,9 @@ fn replay_edges_match_the_c_reference() {
 /// `preconnect-response <timeout> -> <connects|refused>`, or
 /// `request <expire> -> <accepted|refused>`.
 #[test]
-#[ignore = "requires a C reference checkout; see the file docs"]
+#[ignore = "functional"]
 fn token_lifetimes_match_the_c_reference() {
-    let Ok(netcode_c_dir) = std::env::var("NETCODE_C_DIR") else {
-        eprintln!(
-            "SKIP c_differential (lifetime): NETCODE_C_DIR is unset; set it to a checkout of \
-             mas-bandwidth/netcode holding the fix (branch sprint/netcode-audit-fixes at or after \
-             the commit that lands netfix-never-expiring-tokens-are-refused-or-documented-against-the-restart-floor), \
-             then run:\n    \
-             NETCODE_C_DIR=<checkout> cargo test --test c_differential -- --ignored --test-threads=1"
-        );
-        return;
-    };
+    let netcode_c_dir = require_netcode_c_dir("lifetime");
 
     let c_lines = c_transcript_for(&netcode_c_dir, &["lifetime"]);
     let port_lines = netcode::token_lifetime_transcript();
@@ -292,18 +278,9 @@ fn connect_family_transcript() -> Vec<String> {
 /// [`connect_family_transcript`]. The port must settle on the same server
 /// address index as C, or reach `invalid_connect_token`, on each token.
 #[test]
-#[ignore = "requires a C reference checkout; see the file docs"]
+#[ignore = "functional"]
 fn connect_family_matches_the_c_reference() {
-    let Ok(netcode_c_dir) = std::env::var("NETCODE_C_DIR") else {
-        eprintln!(
-            "SKIP c_differential (connect_family): NETCODE_C_DIR is unset; set it to a checkout of \
-             mas-bandwidth/netcode holding the fix (branch sprint/netcode-audit-fixes at or after \
-             the commit that lands netfix-client-refuses-a-server-address-it-has-no-socket-for), \
-             then run:\n    \
-             NETCODE_C_DIR=<checkout> cargo test --test c_differential -- --ignored --test-threads=1"
-        );
-        return;
-    };
+    let netcode_c_dir = require_netcode_c_dir("connect_family");
 
     let c_lines = c_transcript_for(&netcode_c_dir, &["connect_family"]);
     let port_lines = connect_family_transcript();
@@ -319,6 +296,106 @@ fn connect_family_matches_the_c_reference() {
         assert_eq!(
             c_line, port_line,
             "C and port connect_family transcripts first differ at line {index}: \
+             C {c_line:?} vs port {port_line:?}"
+        );
+    }
+}
+
+fn client_state_name(state: netcode::ClientState) -> &'static str {
+    match state {
+        netcode::ClientState::ConnectTokenExpired => "connect_token_expired",
+        netcode::ClientState::InvalidConnectToken => "invalid_connect_token",
+        netcode::ClientState::ConnectionTimedOut => "connection_timed_out",
+        netcode::ClientState::ConnectionResponseTimedOut => "connection_response_timed_out",
+        netcode::ClientState::ConnectionRequestTimedOut => "connection_request_timed_out",
+        netcode::ClientState::ConnectionDenied => "connection_denied",
+        netcode::ClientState::Disconnected => "disconnected",
+        netcode::ClientState::SendingConnectionRequest => "sending_connection_request",
+        netcode::ClientState::SendingConnectionResponse => "sending_connection_response",
+        netcode::ClientState::Connected => "connected",
+    }
+}
+
+/// Boolean properties of two started servers and of one server stopped and started
+/// again, plus the state after a client connects, disconnects and connects with the
+/// same token. Random sequence values are not printed.
+fn global_nonce_transcript() -> Vec<String> {
+    let key = netcode::generate_key();
+    let mut server_a = netcode::Server::new("127.0.0.1:0".parse().unwrap(), 1, &key, 0.0).unwrap();
+    let mut server_b = netcode::Server::new("127.0.0.1:0".parse().unwrap(), 1, &key, 0.0).unwrap();
+    server_a.start(1).unwrap();
+    server_b.start(1).unwrap();
+
+    let floor = 1u64 << 63;
+    let mut lines = vec![
+        format!("start-a above-floor {}", u8::from(server_a.global_sequence() >= floor)),
+        format!("start-b above-floor {}", u8::from(server_b.global_sequence() >= floor)),
+        format!(
+            "pair differ {}",
+            u8::from(server_a.global_sequence() != server_b.global_sequence())
+        ),
+    ];
+
+    let first = server_a.global_sequence();
+    server_a.stop();
+    server_a.start(1).unwrap();
+    lines.push(format!("restart above-floor {}", u8::from(server_a.global_sequence() >= floor)));
+    lines.push(format!("restart differ {}", u8::from(server_a.global_sequence() != first)));
+
+    let address = "127.0.0.1:40000".parse().unwrap();
+    let token = netcode::generate_connect_token(
+        &[address],
+        &[address],
+        30,
+        10,
+        1,
+        0x1122334455667788,
+        &key,
+        &[0u8; netcode::USER_DATA_BYTES],
+    )
+    .unwrap();
+    let mut client = netcode::Client::new("127.0.0.1:0".parse().unwrap(), 0.0).unwrap();
+    let _ = client.connect(&token);
+    client.disconnect();
+    let _ = client.connect(&token);
+    lines.push(format!("client reuse {}", client_state_name(client.state())));
+    lines
+}
+
+/// Two servers started from fresh, and one server stopped and started again, plus a
+/// client that connects, disconnects and connects with the same token. The C oracle
+/// (built with `-DNETCODE_ORACLE_GLOBAL_NONCE`) drives the reference with an override
+/// transport and an explicit time. Each sequence line is `<step> <property> <0|1>`;
+/// the client line is `client reuse <state>`. Random values are not printed.
+///
+/// Written against mas-bandwidth/netcode branch `sprint/netcode-audit-fixes` at
+/// or after `1c58478` (the land of
+/// `netfix-global-packet-nonces-differ-between-servers-sharing-a-token`).
+#[test]
+#[ignore = "functional"]
+fn global_nonces_match_the_c_reference() {
+    let netcode_c_dir = require_netcode_c_dir("global_nonce");
+
+    let c_lines = c_transcript_cc(&netcode_c_dir, &[], &["-DNETCODE_ORACLE_GLOBAL_NONCE"]);
+    let port_lines = global_nonce_transcript();
+    for (index, (c_line, port_line)) in c_lines.iter().zip(port_lines.iter()).enumerate() {
+        eprintln!("compare {index}: C {c_line:?} port {port_line:?}");
+    }
+
+    assert_eq!(
+        c_lines.len(),
+        port_lines.len(),
+        "the C and port global_nonce transcripts have different lengths: C {} vs port {}",
+        c_lines.len(),
+        port_lines.len()
+    );
+    for (index, (c_line, port_line)) in c_lines.iter().zip(port_lines.iter()).enumerate() {
+        if c_line != port_line {
+            eprintln!("first differing line {index}: C {c_line:?} vs port {port_line:?}");
+        }
+        assert_eq!(
+            c_line, port_line,
+            "C and port global_nonce transcripts first differ at line {index}: \
              C {c_line:?} vs port {port_line:?}"
         );
     }

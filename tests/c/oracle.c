@@ -34,6 +34,145 @@
 
 #include "netcode.c"
 
+#ifdef NETCODE_ORACLE_GLOBAL_NONCE
+
+/*
+    Global-sequence and reused-token scenario.
+
+    Built with -DNETCODE_ORACLE_GLOBAL_NONCE so this translation unit does not
+    also compile the other scenarios, whose calls target an older shape of the
+    reference. Two servers started from fresh, then one stopped and started
+    again. Prints only boolean properties of the global sequence:
+
+        <step> <property> <0|1>
+        client reuse <state>
+
+    Override transports and a passed-in time only. No socket is opened.
+
+    Written against mas-bandwidth/netcode branch sprint/netcode-audit-fixes at
+    or after 1c58478 (the land of
+    netfix-global-packet-nonces-differ-between-servers-sharing-a-token). The
+    netcode_generate_connect_token call here uses the signature netcode.h
+    declares (num_server_addresses, public addresses, internal addresses,
+    expire_seconds, timeout_seconds, client_id, protocol_id, private_key,
+    user_data, out token buffer, returning int).
+*/
+
+void __attribute__((no_instrument_function)) __cyg_profile_func_enter( void * this_fn, void * call_site )
+{
+    (void) this_fn;
+    (void) call_site;
+}
+
+void __attribute__((no_instrument_function)) __cyg_profile_func_exit( void * this_fn, void * call_site )
+{
+    (void) this_fn;
+    (void) call_site;
+}
+
+static void global_nonce_send( void * context, struct netcode_address_t * to, NETCODE_CONST uint8_t * packet_data, int packet_bytes )
+{
+    (void) context;
+    (void) to;
+    (void) packet_data;
+    (void) packet_bytes;
+}
+
+static int global_nonce_receive( void * context, struct netcode_address_t * from, uint8_t * packet_data, int max_packet_bytes )
+{
+    (void) context;
+    (void) from;
+    (void) packet_data;
+    (void) max_packet_bytes;
+    return 0;
+}
+
+static const char * global_nonce_state_name( int state )
+{
+    switch ( state )
+    {
+        case NETCODE_CLIENT_STATE_INVALID_CONNECT_TOKEN:      return "invalid_connect_token";
+        case NETCODE_CLIENT_STATE_SENDING_CONNECTION_REQUEST: return "sending_connection_request";
+        case NETCODE_CLIENT_STATE_SENDING_CONNECTION_RESPONSE:return "sending_connection_response";
+        case NETCODE_CLIENT_STATE_CONNECTED:                  return "connected";
+        case NETCODE_CLIENT_STATE_DISCONNECTED:               return "disconnected";
+        default:                                              return "unknown";
+    }
+}
+
+int main( void )
+{
+    struct netcode_server_config_t server_config;
+    struct netcode_server_t * server_a;
+    struct netcode_server_t * server_b;
+    struct netcode_client_config_t client_config;
+    struct netcode_client_t * client;
+    uint8_t private_key[NETCODE_KEY_BYTES];
+    uint8_t user_data[NETCODE_USER_DATA_BYTES];
+    uint8_t token[NETCODE_CONNECT_TOKEN_BYTES];
+    const char * address = "127.0.0.1:40000";
+    const char * addresses[1];
+    uint64_t floor = 1ULL << 63;
+    uint64_t first;
+
+    if ( netcode_init() != NETCODE_OK )
+        return 1;
+
+    netcode_default_server_config( &server_config );
+    server_config.override_send_and_receive = 1;
+    server_config.send_packet_override = global_nonce_send;
+    server_config.receive_packet_override = global_nonce_receive;
+
+    server_a = netcode_server_create( "127.0.0.1:40000", &server_config, 0.0 );
+    server_b = netcode_server_create( "127.0.0.1:40001", &server_config, 0.0 );
+    if ( !server_a || !server_b )
+        return 1;
+
+    netcode_server_start( server_a, 1 );
+    netcode_server_start( server_b, 1 );
+
+    printf( "start-a above-floor %d\n", server_a->global_sequence >= floor );
+    printf( "start-b above-floor %d\n", server_b->global_sequence >= floor );
+    printf( "pair differ %d\n", server_a->global_sequence != server_b->global_sequence );
+
+    first = server_a->global_sequence;
+    netcode_server_stop( server_a );
+    netcode_server_start( server_a, 1 );
+
+    printf( "restart above-floor %d\n", server_a->global_sequence >= floor );
+    printf( "restart differ %d\n", server_a->global_sequence != first );
+
+    netcode_server_destroy( server_a );
+    netcode_server_destroy( server_b );
+
+    netcode_default_client_config( &client_config );
+    client_config.override_send_and_receive = 1;
+    client_config.send_packet_override = global_nonce_send;
+    client_config.receive_packet_override = global_nonce_receive;
+
+    client = netcode_client_create( "127.0.0.1:50000", &client_config, 0.0 );
+    if ( !client )
+        return 1;
+
+    memset( private_key, 0x60, sizeof( private_key ) );
+    memset( user_data, 0, sizeof( user_data ) );
+    addresses[0] = address;
+    if ( netcode_generate_connect_token( 1, addresses, addresses, 30, 10, 1,
+                                         0x1122334455667788ULL, private_key, user_data, token ) != NETCODE_OK )
+        return 1;
+
+    netcode_client_connect( client, token );
+    netcode_client_disconnect( client );
+    netcode_client_connect( client, token );
+    printf( "client reuse %s\n", global_nonce_state_name( client->state ) );
+
+    netcode_client_destroy( client );
+    netcode_term();
+    return 0;
+}
+
+#else
+
 #define SERVER_CAP ( 64 * NETCODE_MAX_CLIENTS )
 #define CLIENT_CAP 64
 
@@ -917,10 +1056,95 @@ static int connect_family_run( void )
     return 0;
 }
 
+/*
+    Global-sequence and reused-token scenario (mode "global_nonce").
+
+    Two servers started from fresh, then one stopped and started again. Prints
+    only boolean properties of the global sequence, never the random values:
+
+        <step> <property> <0|1>
+        client reuse <state>
+*/
+static int global_nonce_run( void )
+{
+    struct netcode_server_config_t server_config;
+    struct netcode_server_t * server_a;
+    struct netcode_server_t * server_b;
+    struct netcode_client_config_t client_config;
+    struct netcode_client_t * client;
+    uint8_t private_key[NETCODE_KEY_BYTES];
+    uint8_t user_data[NETCODE_USER_DATA_BYTES];
+    uint8_t token[NETCODE_CONNECT_TOKEN_BYTES];
+    const char * address = "127.0.0.1:40000";
+    const char * addresses[1];
+    uint64_t floor = 1ULL << 63;
+    uint64_t first;
+    int ok;
+
+    netcode_default_server_config( &server_config );
+    server_config.override_send_and_receive = 1;
+    server_config.send_packet_override = send_override;
+    server_config.receive_packet_override = receive_override;
+
+    server_a = netcode_server_create( "127.0.0.1:40000", &server_config, 0.0 );
+    server_b = netcode_server_create( "127.0.0.1:40001", &server_config, 0.0 );
+    if ( !server_a || !server_b )
+        return 1;
+
+    netcode_server_start( server_a, 1 );
+    netcode_server_start( server_b, 1 );
+
+    printf( "start-a above-floor %d\n", server_a->global_sequence >= floor );
+    printf( "start-b above-floor %d\n", server_b->global_sequence >= floor );
+    printf( "pair differ %d\n", server_a->global_sequence != server_b->global_sequence );
+
+    first = server_a->global_sequence;
+    netcode_server_stop( server_a );
+    netcode_server_start( server_a, 1 );
+
+    printf( "restart above-floor %d\n", server_a->global_sequence >= floor );
+    printf( "restart differ %d\n", server_a->global_sequence != first );
+
+    netcode_server_destroy( server_a );
+    netcode_server_destroy( server_b );
+
+    netcode_default_client_config( &client_config );
+    client_config.override_send_and_receive = 1;
+    client_config.send_packet_override = send_override;
+    client_config.receive_packet_override = receive_override;
+
+    client = netcode_client_create( "127.0.0.1:50000", &client_config, 0.0 );
+    if ( !client )
+        return 1;
+
+    memset( private_key, 0x60, sizeof( private_key ) );
+    memset( user_data, 0, sizeof( user_data ) );
+    addresses[0] = address;
+    ok = netcode_generate_connect_token( 1, addresses, addresses, 30, 10, 1,
+                                         0x1122334455667788ULL, private_key, user_data, token );
+    if ( ok != NETCODE_OK )
+        return 1;
+
+    netcode_client_connect( client, token );
+    netcode_client_disconnect( client );
+    netcode_client_connect( client, token );
+    printf( "client reuse %s\n", connect_family_state_name( client->state ) );
+
+    netcode_client_destroy( client );
+    return 0;
+}
+
 int main( int argc, char ** argv )
 {
     if ( netcode_init() != NETCODE_OK )
         return 1;
+
+    if ( argc > 1 && strcmp( argv[1], "global_nonce" ) == 0 )
+    {
+        int result = global_nonce_run();
+        netcode_term();
+        return result;
+    }
 
     if ( argc > 1 && strcmp( argv[1], "connect_family" ) == 0 )
     {
@@ -1065,3 +1289,5 @@ int main( int argc, char ** argv )
     netcode_term();
     return 0;
 }
+
+#endif

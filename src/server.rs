@@ -407,6 +407,19 @@ impl ClientSlot {
     }
 }
 
+/// A random sequence in `[2^63, 2^63 + 2^62)`.
+///
+/// One connect token carries one server-to-client key for every server it lists.
+/// Two servers that both start at 2^63 encrypt their first global packet under that
+/// shared key at the same nonce. The offset is 62 bits so the sequence stays in the
+/// top half and never meets a per-client sequence, which starts at zero.
+fn global_sequence_seed() -> u64 {
+    let mut offset = [0u8; 8];
+    crypto::random_bytes(&mut offset);
+    let offset = u64::from_le_bytes(offset);
+    (1 << 63) + (offset & 0x3FFF_FFFF_FFFF_FFFF)
+}
+
 /// A netcode dedicated server.
 ///
 /// Create it with the public address clients connect to, [`start`](Server::start) it
@@ -529,8 +542,10 @@ impl Server {
         // global packets (challenge, denied) encrypt with the same per-token
         // server-to-client keys as per-client packets, whose sequences start at zero,
         // so the global sequence takes the top half of the space to keep AEAD nonces
-        // disjoint under a shared key
-        self.global_sequence = 1 << 63;
+        // disjoint under a shared key. stop zeroes it, so every start draws again.
+        // one connect token carries one server-to-client key for every server it
+        // lists, so the draw is a random offset in the top half rather than a constant.
+        self.global_sequence = global_sequence_seed();
         self.clients = (0..max_clients).map(|_| ClientSlot::new()).collect();
 
         Ok(())
@@ -547,7 +562,7 @@ impl Server {
         self.running = false;
         self.max_clients = 0;
         self.num_connected_clients = 0;
-        self.global_sequence = 1 << 63;
+        self.global_sequence = 0;
         self.challenge_sequence = 0;
         self.challenge_key = [0; KEY_BYTES];
         self.min_connect_token_expire_timestamp = 0;
@@ -681,6 +696,15 @@ impl Server {
             return None;
         }
         Some(&self.clients[client_index].user_data)
+    }
+
+    /// The sequence number of the next global packet (challenge or denied).
+    ///
+    /// Hidden from docs. The differential test reads it to print boolean properties
+    /// only; callers must not put the value on the wire themselves.
+    #[doc(hidden)]
+    pub fn global_sequence(&self) -> u64 {
+        self.global_sequence
     }
 
     /// The sequence number of the next packet the server will send to the client in
@@ -1963,36 +1987,43 @@ mod tests {
         assert_eq!(server.clients[0].sequence, 0, "client sequences start at zero after a start");
     }
 
-    /// Every entry point that can leave the server ready to send global packets has to
-    /// establish the floor itself, rather than inheriting it from another one — which
-    /// is the whole of the upstream fix, since creation alone used to seed it.
+    /// Create seeds the floor exactly. Start draws a sequence at or above 2^63, and a
+    /// later start draws a different one. Stop zeroes the sequence so a restart cannot
+    /// inherit it.
     #[test]
     fn create_start_and_stop_each_reseed_the_global_sequence() {
         let private_key = crypto::generate_key();
         let mut server = Server::new(test_address(0), TEST_PROTOCOL_ID, &private_key, 0.0).unwrap();
-        assert!(
-            server.global_sequence > GLOBAL_SEQUENCE_FLOOR,
-            "a new server starts below the global sequence floor: {}",
-            server.global_sequence
-        );
+        let mut other = Server::new(test_address(0), TEST_PROTOCOL_ID, &private_key, 0.0).unwrap();
+        assert_eq!(server.global_sequence, 1 << 63, "create seeds the floor exactly");
 
-        // starting a stopped server whose sequence was left down in the client range
-        server.global_sequence = 0;
         server.start(1).unwrap();
-        assert!(
-            server.global_sequence > GLOBAL_SEQUENCE_FLOOR,
-            "start did not reseed the global sequence: {}",
-            server.global_sequence
+        other.start(1).unwrap();
+        assert!(server.global_sequence >= 1 << 63, "{}", server.global_sequence);
+        assert!(other.global_sequence >= 1 << 63, "{}", other.global_sequence);
+        assert_ne!(
+            server.global_sequence, other.global_sequence,
+            "two started servers share a global sequence"
         );
 
-        // and stopping one, so that a later start cannot inherit a low sequence
-        server.global_sequence = 0;
+        let first = server.global_sequence;
         server.stop();
-        assert!(
-            server.global_sequence > GLOBAL_SEQUENCE_FLOOR,
-            "stop did not reseed the global sequence: {}",
-            server.global_sequence
-        );
+        assert_eq!(server.global_sequence, 0, "stop zeroes the global sequence");
+        server.start(1).unwrap();
+        assert!(server.global_sequence >= 1 << 63, "{}", server.global_sequence);
+        assert_ne!(server.global_sequence, first, "a restart reused the previous global sequence");
+    }
+
+    /// Two draws of the start seed differ, and both sit in `[2^63, 2^63 + 2^62)`.
+    #[test]
+    fn create_start_and_stop_each_reseed_with_a_random_offset() {
+        let floor = 1u64 << 63;
+        let ceiling = floor + (1 << 62);
+        let a = super::global_sequence_seed();
+        let b = super::global_sequence_seed();
+        assert!(a >= floor && a < ceiling, "{a}");
+        assert!(b >= floor && b < ceiling, "{b}");
+        assert_ne!(a, b, "the global sequence seed is a constant");
     }
 
     /// Builds the decrypted private connect token data a connection request carries,

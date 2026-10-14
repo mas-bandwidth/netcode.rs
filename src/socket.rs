@@ -156,4 +156,54 @@ mod tests {
         );
         assert_eq!(*attempts.last().unwrap(), SOCKET_BUFFER_MIN_SIZE);
     }
+
+    /// The classifier's rows, exactly as the C reference fixes them: a zero-length
+    /// datagram (`Ok(0)`) is a skip, a would-block is the only drain, any other
+    /// receive error is a skip, and a positive count is a datagram.
+    #[test]
+    fn classify_receive_matches_c_rows() {
+        assert_eq!(classify_receive(0, None), ReceiveStatus::Skip);
+        assert_eq!(
+            classify_receive(-1, Some(io::ErrorKind::WouldBlock)),
+            ReceiveStatus::Drained
+        );
+        assert_eq!(
+            classify_receive(-1, Some(io::ErrorKind::ConnectionRefused)),
+            ReceiveStatus::Skip
+        );
+        assert_eq!(classify_receive(5, None), ReceiveStatus::Datagram(5));
+    }
+
+    /// The per-update drain: empty datagrams and receive errors are skipped, a
+    /// would-block ends it, and a flood is cut off at the cap so an unauthenticated
+    /// sender of empty datagrams cannot hold the update open.
+    #[test]
+    fn drain_with_cap_skips_empty_and_stops_at_the_cap() {
+        use std::collections::VecDeque;
+
+        let cap = crate::SERVER_MAX_RECEIVE_PACKETS;
+
+        // A flood of one more than the cap plus ten is consumed exactly to the cap,
+        // leaving the rest for the next update.
+        let flood = RefCell::new(VecDeque::from(vec![ReceiveStatus::Datagram(1); cap + 10]));
+        let counts =
+            drain_with_cap(cap, || flood.borrow_mut().pop_front().unwrap_or(ReceiveStatus::Drained));
+        assert_eq!(counts.consumed, cap);
+        assert_eq!(counts.processed, cap);
+        assert_eq!(flood.borrow().len(), 10);
+
+        // [junk, empty, junk] is drained whole: the empty datagram is skipped and
+        // never ends the loop early.
+        let queue = RefCell::new(VecDeque::from(vec![
+            ReceiveStatus::Datagram(3),
+            ReceiveStatus::Skip,
+            ReceiveStatus::Datagram(7),
+        ]));
+        let counts =
+            drain_with_cap(cap, || queue.borrow_mut().pop_front().unwrap_or(ReceiveStatus::Drained));
+        assert_eq!(counts.processed, 2);
+        assert!(queue.borrow().is_empty());
+        // the final would-block attempt is an iteration too, so it counts as consumed
+        assert_eq!(counts.consumed, 4);
+    }
 }

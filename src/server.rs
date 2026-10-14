@@ -256,6 +256,23 @@ impl EncryptionManager {
     }
 }
 
+/// The fallback lifetime, in seconds, of an encryption mapping that has not yet
+/// been promoted to a connected client.
+const PRECONNECT_MAPPING_SECONDS: i32 = 10;
+
+/// The expiry time for a pre-connect mapping added when a connection request is
+/// accepted, before any response can promote it to a connected client. A
+/// non-positive token timeout would otherwise expire the mapping on the next
+/// update, or hold one of the encryption-mapping slots forever for a request that
+/// is never answered, so a pre-connect mapping gets its own bounded lifetime.
+fn preconnect_expire_time(now: f64, timeout_seconds: i32) -> f64 {
+    now + if timeout_seconds > 0 {
+        timeout_seconds as f64
+    } else {
+        PRECONNECT_MAPPING_SECONDS as f64
+    }
+}
+
 // ----------------------------------------------------------------
 
 const MAX_CONNECT_TOKEN_ENTRIES: usize = MAX_CLIENTS * 8;
@@ -761,6 +778,7 @@ impl Server {
                 AllowedPackets::SERVER,
                 replay_protection,
                 self.min_connect_token_expire_timestamp,
+                current_timestamp.saturating_add(self.max_connect_token_lifetime),
             )
         else {
             return;
@@ -912,11 +930,7 @@ impl Server {
             return;
         }
 
-        let expire_time = if private_token.timeout_seconds >= 0 {
-            self.time + private_token.timeout_seconds as f64
-        } else {
-            -1.0
-        };
+        let expire_time = preconnect_expire_time(self.time, private_token.timeout_seconds);
 
         if !self.encryption_manager.add_encryption_mapping(
             from,
@@ -1520,6 +1534,95 @@ pub fn differential_disconnect_transcript() -> Vec<String> {
     lines
 }
 
+/// Test seam for the C differential test: the port-side transcript for the
+/// pre-connect mapping lifetime and the never-expiring token refusal the C fix
+/// bounds, one line per input in the shared format. Hidden from docs; not part of
+/// the supported API.
+///
+/// Pure: every input is a constant and every time is explicit. The pre-connect
+/// lifetime is read from `preconnect_expire_time` under the same live rule the
+/// encryption manager uses (a mapping is live while its expiry is not in the
+/// past, and a negative expiry never expires); the request refusals go through
+/// the port's pure packet read.
+#[doc(hidden)]
+pub fn token_lifetime_transcript() -> Vec<String> {
+    const PROTOCOL_ID: u64 = 0x1122334455667788;
+    const BASE: f64 = 100.0;
+
+    let mut lines = Vec::new();
+
+    for timeout in [-1, 0, 1, 5, 30] {
+        let expire = preconnect_expire_time(BASE, timeout);
+        let offset = if expire < 0.0 {
+            "never".to_string()
+        } else {
+            ((expire - BASE).floor() as i64 + 1).to_string()
+        };
+        lines.push(format!("preconnect {timeout} -> {offset}"));
+        let connects = expire < 0.0 || expire >= BASE + 0.1;
+        lines.push(format!(
+            "preconnect-response {timeout} -> {}",
+            if connects { "connects" } else { "refused" }
+        ));
+    }
+
+    let private_key = crate::generate_key();
+    let current_timestamp = 1_000_000u64;
+    let max_lifetime = 30u64;
+    let max_expire = current_timestamp + max_lifetime;
+    for expire_timestamp in [
+        u64::MAX,
+        current_timestamp + 2 * max_lifetime,
+        max_expire + 1,
+        max_expire,
+        current_timestamp + 1,
+        current_timestamp,
+    ] {
+        let mut nonce = [0u8; crate::token::CONNECT_TOKEN_NONCE_BYTES];
+        crypto::random_bytes(&mut nonce);
+        let private_token = PrivateConnectToken::generate(
+            0x1234,
+            10,
+            &["127.0.0.1:40000".parse().unwrap()],
+            &[0u8; USER_DATA_BYTES],
+        );
+        let mut private_data = Box::new([0u8; CONNECT_TOKEN_PRIVATE_BYTES]);
+        private_token.write(&mut private_data);
+        token::encrypt_connect_token_private(
+            &mut private_data,
+            PROTOCOL_ID,
+            expire_timestamp,
+            &nonce,
+            &private_key,
+        )
+        .unwrap();
+        let input =
+            Packet::Request { protocol_id: PROTOCOL_ID, expire_timestamp, nonce, private_data };
+        let write_key = crate::generate_key();
+        let mut buffer = [0u8; MAX_PACKET_BYTES];
+        let written =
+            crate::packet::write_packet(&input, &mut buffer, 0, &write_key, PROTOCOL_ID).unwrap();
+        let accepted = crate::packet::read_packet_with_min_connect_token_expire_timestamp(
+            &mut buffer[..written],
+            None,
+            PROTOCOL_ID,
+            current_timestamp,
+            Some(&private_key),
+            AllowedPackets::SERVER,
+            None,
+            0,
+            max_expire,
+        )
+        .is_some();
+        lines.push(format!(
+            "request {expire_timestamp} -> {}",
+            if accepted { "accepted" } else { "refused" }
+        ));
+    }
+
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -1604,6 +1707,45 @@ mod tests {
         ));
         assert!(manager.find_encryption_mapping(test_address(40000), 104.0).is_some());
         assert!(manager.find_encryption_mapping(test_address(40000), 106.0).is_none());
+    }
+
+    #[test]
+    fn preconnect_expire_time_is_bounded() {
+        // a pre-connect mapping must not expire on the next update (a zero timeout)
+        // or hold a slot forever (a negative timeout); both fall back to the fixed
+        // bounded lifetime, while a positive timeout is still honored exactly
+        let now = 1000.0;
+        assert_eq!(preconnect_expire_time(now, -1), now + 10.0);
+        assert_eq!(preconnect_expire_time(now, 0), now + 10.0);
+        assert_eq!(preconnect_expire_time(now, 1), now + 1.0);
+        assert_eq!(preconnect_expire_time(now, 5), now + 5.0);
+        assert_eq!(preconnect_expire_time(now, 30), now + 30.0);
+    }
+
+    #[test]
+    fn token_lifetime_transcript_pins_the_port_side_edges() {
+        // the port half of the C differential test, so its shape is checked even
+        // when no C checkout is reachable; the lines are the shared format the
+        // oracle prints, so a regression in the refusals or the mapping offsets
+        // is caught here
+        let lines = token_lifetime_transcript();
+
+        assert!(lines.iter().any(|line| line == "preconnect -1 -> 11"));
+        assert!(lines.iter().any(|line| line == "preconnect-response -1 -> connects"));
+        assert!(lines.iter().any(|line| line == "preconnect 0 -> 11"));
+        assert!(lines.iter().any(|line| line == "preconnect-response 0 -> connects"));
+        assert!(lines.iter().any(|line| line == "preconnect 1 -> 2"));
+        assert!(lines.iter().any(|line| line == "preconnect-response 1 -> connects"));
+        assert!(lines.iter().any(|line| line == "preconnect 5 -> 6"));
+        assert!(lines.iter().any(|line| line == "preconnect-response 5 -> connects"));
+        assert!(lines.iter().any(|line| line == "preconnect 30 -> 31"));
+        assert!(lines.iter().any(|line| line == "preconnect-response 30 -> connects"));
+        assert!(lines.iter().any(|line| line == "request 18446744073709551615 -> refused"));
+        assert!(lines.iter().any(|line| line == "request 1000060 -> refused"));
+        assert!(lines.iter().any(|line| line == "request 1000031 -> refused"));
+        assert!(lines.iter().any(|line| line == "request 1000030 -> accepted"));
+        assert!(lines.iter().any(|line| line == "request 1000001 -> accepted"));
+        assert!(lines.iter().any(|line| line == "request 1000000 -> refused"));
     }
 
     #[test]
@@ -1772,11 +1914,16 @@ mod tests {
             test_address(0),
             TEST_PROTOCOL_ID,
             &private_key,
-            ServerConfig { max_connect_token_lifetime: 10 },
+            ServerConfig { max_connect_token_lifetime: 60 },
             0.0,
         )
         .unwrap();
         server.start(1).unwrap();
+        // this test is about the global packet sequence, not the token lifetime
+        // bounds; a full-lifetime token minted in the same second as the start
+        // would sit at the restart floor, and the floor would refuse it, so the
+        // floor is disabled here
+        server.min_connect_token_expire_timestamp = 0;
 
         let connect_token = generate_connect_token(
             &[server.address()],
@@ -1800,6 +1947,7 @@ mod tests {
 
         server.stop();
         server.start(1).unwrap();
+        server.min_connect_token_expire_timestamp = 0;
 
         // the same client, the same connect token, and therefore the same
         // server-to-client key as before the restart

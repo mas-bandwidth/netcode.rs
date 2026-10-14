@@ -111,6 +111,9 @@ pub use token::generate_connect_token;
 #[doc(hidden)]
 pub use socket::differential_transcript;
 
+#[doc(hidden)]
+pub use server::challenge_token_transcript;
+
 /// The size of a connect token in bytes.
 pub const CONNECT_TOKEN_BYTES: usize = 2048;
 

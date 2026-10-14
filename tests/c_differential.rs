@@ -26,8 +26,10 @@ use std::process::Command;
 /// The oracle is `tests/c/oracle.c` beside this file. It `#include`s netcode.c,
 /// so netcode.c is not passed on the command line. `-finstrument-functions` is
 /// how the oracle counts entries into the reference's packet processor; without
-/// it those counts stay zero and the transcripts cannot match.
-fn c_transcript(netcode_c_dir: &str) -> Vec<String> {
+/// it those counts stay zero and the transcripts cannot match. `args` are passed
+/// to the oracle verbatim, selecting the scenario (empty for the receive-drain
+/// scenario, `["challenge"]` for the challenge-token binding scenario).
+fn c_transcript(netcode_c_dir: &str, args: &[&str]) -> Vec<String> {
     let oracle = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/c/oracle.c");
     let out_dir = std::env::temp_dir().join("netcode-c-differential");
     std::fs::create_dir_all(&out_dir).expect("create temp build dir");
@@ -46,7 +48,7 @@ fn c_transcript(netcode_c_dir: &str) -> Vec<String> {
         .expect("failed to run cc; is a C compiler installed?");
     assert!(status.success(), "failed to build the C oracle");
 
-    let output = Command::new(&binary).output().expect("failed to run the C oracle");
+    let output = Command::new(&binary).args(args).output().expect("failed to run the C oracle");
     assert!(output.status.success(), "the C oracle exited with a failure");
     let stdout = String::from_utf8(output.stdout).expect("the C oracle wrote non-UTF-8 output");
     stdout.lines().map(str::to_string).collect()
@@ -64,7 +66,7 @@ fn receive_drain_matches_the_c_reference() {
         return;
     };
 
-    let c_lines = c_transcript(&netcode_c_dir);
+    let c_lines = c_transcript(&netcode_c_dir, &[]);
     let port_lines = netcode::differential_transcript();
 
     assert_eq!(
@@ -78,6 +80,37 @@ fn receive_drain_matches_the_c_reference() {
         assert_eq!(
             c_line, port_line,
             "C and port transcripts first differ at line {index}: C {c_line:?} vs port {port_line:?}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires a C reference checkout; see the file docs"]
+fn challenge_token_binds_matches_the_c_reference() {
+    let Ok(netcode_c_dir) = std::env::var("NETCODE_C_DIR") else {
+        eprintln!(
+            "SKIP c_differential: NETCODE_C_DIR is unset; set it to a checkout of \
+             mas-bandwidth/netcode holding the fix (branch sprint/netcode-audit-fixes at or after \
+             5cc4798d), then run:\n    \
+             NETCODE_C_DIR=<checkout> cargo test --test c_differential -- --ignored --test-threads=1"
+        );
+        return;
+    };
+
+    let c_lines = c_transcript(&netcode_c_dir, &["challenge"]);
+    let port_lines = netcode::challenge_token_transcript();
+
+    assert_eq!(
+        c_lines.len(),
+        port_lines.len(),
+        "the C and port challenge transcripts have different lengths: C {} vs port {}",
+        c_lines.len(),
+        port_lines.len()
+    );
+    for (index, (c_line, port_line)) in c_lines.iter().zip(port_lines.iter()).enumerate() {
+        assert_eq!(
+            c_line, port_line,
+            "C and port challenge transcripts first differ at line {index}: C {c_line:?} vs port {port_line:?}"
         );
     }
 }

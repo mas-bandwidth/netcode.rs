@@ -76,6 +76,8 @@ struct EncryptionEntry {
     last_access_time: f64,
     client_index: Option<usize>,
     connect_token_entry_index: Option<usize>,
+    client_id: u64,
+    user_data: UserData,
     send_key: Key,
     receive_key: Key,
 }
@@ -89,6 +91,8 @@ impl EncryptionEntry {
             last_access_time: -1000.0,
             client_index: None,
             connect_token_entry_index: None,
+            client_id: 0,
+            user_data: [0; USER_DATA_BYTES],
             send_key: [0; KEY_BYTES],
             receive_key: [0; KEY_BYTES],
         }
@@ -129,6 +133,8 @@ impl EncryptionManager {
         expire_time: f64,
         timeout_seconds: i32,
         connect_token_entry_index: usize,
+        client_id: u64,
+        user_data: &UserData,
     ) -> bool {
         for index in 0..self.num_entries {
             let entry = &mut self.entries[index];
@@ -139,6 +145,8 @@ impl EncryptionManager {
                 entry.send_key = *send_key;
                 entry.receive_key = *receive_key;
                 entry.connect_token_entry_index = Some(connect_token_entry_index);
+                entry.client_id = client_id;
+                entry.user_data = *user_data;
                 return true;
             }
         }
@@ -153,6 +161,8 @@ impl EncryptionManager {
                     last_access_time: time,
                     client_index: None,
                     connect_token_entry_index: Some(connect_token_entry_index),
+                    client_id,
+                    user_data: *user_data,
                     send_key: *send_key,
                     receive_key: *receive_key,
                 };
@@ -223,6 +233,14 @@ impl EncryptionManager {
 
     fn connect_token_entry_index(&self, index: usize) -> Option<usize> {
         self.entries[index].connect_token_entry_index
+    }
+
+    fn client_id(&self, index: usize) -> u64 {
+        self.entries[index].client_id
+    }
+
+    fn user_data(&self, index: usize) -> UserData {
+        self.entries[index].user_data
     }
 
     fn send_key(&self, index: usize) -> Key {
@@ -908,6 +926,8 @@ impl Server {
             expire_time,
             private_token.timeout_seconds,
             connect_token_entry_index,
+            private_token.client_id,
+            &private_token.user_data,
         ) {
             debug!("server ignored connection request. failed to add encryption mapping");
             return;
@@ -923,6 +943,7 @@ impl Server {
             &mut challenge_token_data,
             self.challenge_sequence,
             &self.challenge_key,
+            &mac,
         )
         .is_err()
         {
@@ -947,10 +968,27 @@ impl Server {
         mut challenge_token_data: [u8; CHALLENGE_TOKEN_BYTES],
         encryption_index: Option<usize>,
     ) {
+        let Some(encryption_index) = encryption_index else {
+            debug!("server ignored connection response. no packet send key");
+            return;
+        };
+
+        // a challenge decrypts only under the MAC of the connect token that
+        // minted it, so a response is decrypted with its own mapping's MAC and a
+        // mapping with no connect-token entry has nothing to decrypt against
+        let Some(connect_token_entry_index) =
+            self.encryption_manager.connect_token_entry_index(encryption_index)
+        else {
+            debug!("server ignored connection response. mapping has no connect token entry");
+            return;
+        };
+
+        let mac = self.connect_token_entries[connect_token_entry_index].mac;
         if token::decrypt_challenge_token(
             &mut challenge_token_data,
             challenge_token_sequence,
             &self.challenge_key,
+            &mac[..],
         )
         .is_err()
         {
@@ -958,12 +996,10 @@ impl Server {
             return;
         }
 
-        let challenge_token = ChallengeToken::read(&challenge_token_data);
-
-        let Some(encryption_index) = encryption_index else {
-            debug!("server ignored connection response. no packet send key");
-            return;
-        };
+        // the mapping, not the challenge token, is the source of the client's
+        // identity and user data
+        let client_id = self.encryption_manager.client_id(encryption_index);
+        let user_data = self.encryption_manager.user_data(encryption_index);
 
         if self.find_client_index_by_address(from).is_some() {
             debug!(
@@ -972,7 +1008,7 @@ impl Server {
             return;
         }
 
-        if self.find_client_index_by_id(challenge_token.client_id).is_some() {
+        if self.find_client_index_by_id(client_id).is_some() {
             debug!(
                 "server ignored connection response. a client with this id is already connected"
             );
@@ -991,10 +1027,10 @@ impl Server {
         self.connect_client(
             client_index,
             from,
-            challenge_token.client_id,
+            client_id,
             encryption_index,
             timeout_seconds,
-            &challenge_token.user_data,
+            &user_data,
         );
     }
 
@@ -1171,6 +1207,154 @@ impl Drop for Server {
     }
 }
 
+/// Test seam for the C differential test: builds the port-side transcript for the
+/// scripted challenge-token scenario `tests/c/oracle.c` runs. Hidden from docs; not
+/// part of the supported API.
+///
+/// This is a functional seam, not a unit test: it constructs a real `Server`
+/// (which binds a `UdpSocket`) and `start`s it (which reads the wall clock via
+/// `token::unix_timestamp`). The pure unit test that pins the defect is
+/// `challenge_token_binds_to_its_connect_token` in `src/token.rs`.
+#[doc(hidden)]
+pub fn challenge_token_transcript() -> Vec<String> {
+    let protocol_id = 0x1122334455667788u64;
+    let private_key = crypto::generate_key();
+
+    let mut server =
+        match Server::new("127.0.0.1:0".parse().unwrap(), protocol_id, &private_key, 0.0) {
+            Ok(server) => server,
+            Err(error) => return vec![format!("error creating server: {error}")],
+        };
+    if server.start(2).is_err() {
+        return vec!["error starting server".to_string()];
+    }
+    server.min_connect_token_expire_timestamp = 0;
+
+    let x_addr: SocketAddr = "127.0.0.1:41000".parse().unwrap();
+    let y_addr: SocketAddr = "127.0.0.1:41001".parse().unwrap();
+
+    fn mint(
+        client_id: u64,
+        first_byte: u8,
+        private_key: &Key,
+        protocol_id: u64,
+        server_address: SocketAddr,
+    ) -> ([u8; CONNECT_TOKEN_PRIVATE_BYTES], [u8; MAC_BYTES], UserData) {
+        let mut user_data = [0u8; USER_DATA_BYTES];
+        user_data[0] = first_byte;
+        let private_token =
+            PrivateConnectToken::generate(client_id, 5, &[server_address], &user_data);
+
+        let expire_timestamp = 1_000_000u64;
+        let mut nonce = [0u8; crate::token::CONNECT_TOKEN_NONCE_BYTES];
+        crypto::random_bytes(&mut nonce);
+
+        let mut private_data = Box::new([0u8; CONNECT_TOKEN_PRIVATE_BYTES]);
+        private_token.write(&mut private_data);
+        token::encrypt_connect_token_private(
+            &mut private_data,
+            protocol_id,
+            expire_timestamp,
+            &nonce,
+            private_key,
+        )
+        .unwrap();
+        let mac: [u8; MAC_BYTES] =
+            private_data[CONNECT_TOKEN_PRIVATE_BYTES - MAC_BYTES..].try_into().unwrap();
+        token::decrypt_connect_token_private(
+            &mut private_data,
+            protocol_id,
+            expire_timestamp,
+            &nonce,
+            private_key,
+        )
+        .unwrap();
+        (*private_data, mac, user_data)
+    }
+
+    fn mint_challenge(
+        client_id: u64,
+        user_data: &UserData,
+        sequence: u64,
+        challenge_key: &Key,
+        mac: &[u8; MAC_BYTES],
+    ) -> [u8; CHALLENGE_TOKEN_BYTES] {
+        let challenge = ChallengeToken { client_id, user_data: *user_data };
+        let mut data = [0u8; CHALLENGE_TOKEN_BYTES];
+        challenge.write(&mut data);
+        token::encrypt_challenge_token(&mut data, sequence, challenge_key, mac).unwrap();
+        data
+    }
+
+    fn connected(server: &Server) -> String {
+        let mut clients: Vec<(u64, u8)> = Vec::new();
+        for index in 0..server.max_clients {
+            if server.client_connected(index) {
+                clients.push((server.client_id(index), server.client_user_data(index).unwrap()[0]));
+            }
+        }
+        clients.sort();
+        let mut line = String::from(" connected");
+        for (id, _) in &clients {
+            line.push_str(&format!(" 0x{id:x}"));
+        }
+        line.push_str(" userdata");
+        for (_, byte) in &clients {
+            line.push_str(&format!(" {byte:02x}"));
+        }
+        line
+    }
+
+    let (private_a, mac_a, user_data_a) =
+        mint(0x1111, 0xA1, &private_key, protocol_id, server.address());
+    let (private_b, mac_b, user_data_b) =
+        mint(0x2222, 0xB2, &private_key, protocol_id, server.address());
+    let (private_c, mac_c, user_data_c) =
+        mint(0x3333, 0xC3, &private_key, protocol_id, server.address());
+
+    let mut lines = Vec::new();
+
+    // X presents token A, then Y presents token B.
+    server.process_connection_request(x_addr, &private_a, 1_000_000, 0);
+    lines.push(format!("present-a{}", connected(&server)));
+
+    server.process_connection_request(y_addr, &private_b, 1_000_000, 0);
+    lines.push(format!("present-b{}", connected(&server)));
+
+    let challenge_a = mint_challenge(0x1111, &user_data_a, 0, &server.challenge_key, &mac_a);
+    let challenge_b = mint_challenge(0x2222, &user_data_b, 1, &server.challenge_key, &mac_b);
+
+    let y_index = server.encryption_manager.find_encryption_mapping(y_addr, server.time).unwrap();
+
+    // Y answers under B's keys with A's challenge: refused.
+    server.process_connection_response(y_addr, 0, challenge_a, Some(y_index));
+    lines.push(format!("answer-cross{}", connected(&server)));
+
+    // Y answers with its own challenge: connected as B.
+    server.process_connection_response(y_addr, 1, challenge_b, Some(y_index));
+    lines.push(format!("answer-own{}", connected(&server)));
+
+    // X moves to token C twice, two challenges in flight.
+    server.process_connection_request(x_addr, &private_c, 1_000_000, 0);
+    lines.push(format!("present-c{}", connected(&server)));
+
+    server.process_connection_request(x_addr, &private_c, 1_000_000, 0);
+    lines.push(format!("present-c-again{}", connected(&server)));
+
+    let challenge_c = mint_challenge(0x3333, &user_data_c, 2, &server.challenge_key, &mac_c);
+    let x_index = server.encryption_manager.find_encryption_mapping(x_addr, server.time).unwrap();
+
+    // X answers under C's keys with A's challenge: refused.
+    server.process_connection_response(x_addr, 0, challenge_a, Some(x_index));
+    lines.push(format!("answer-stale{}", connected(&server)));
+
+    // X answers with the older C challenge: connected as C.
+    server.process_connection_response(x_addr, 2, challenge_c, Some(x_index));
+    lines.push(format!("answer-c{}", connected(&server)));
+
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -1215,6 +1399,8 @@ mod tests {
                 time + 5.0,
                 5,
                 0,
+                0x1111 + port as u64,
+                &[0x42; USER_DATA_BYTES],
             ));
         }
 
@@ -1248,6 +1434,8 @@ mod tests {
             105.0,
             -1,
             0,
+            0x2222,
+            &[0; USER_DATA_BYTES],
         ));
         assert!(manager.find_encryption_mapping(test_address(40000), 104.0).is_some());
         assert!(manager.find_encryption_mapping(test_address(40000), 106.0).is_none());
@@ -1485,5 +1673,123 @@ mod tests {
             "stop did not reseed the global sequence: {}",
             server.global_sequence
         );
+    }
+
+    /// Builds the decrypted private connect token data a connection request carries,
+    /// with the original token HMAC left in the trailing 16 bytes, and returns it
+    /// beside that MAC (the bytes the challenge token must bind to).
+    fn mint_private_token_data(
+        client_id: u64,
+        user_data: &UserData,
+        private_key: &Key,
+        protocol_id: u64,
+        server_address: SocketAddr,
+    ) -> ([u8; CONNECT_TOKEN_PRIVATE_BYTES], [u8; MAC_BYTES]) {
+        let private_token = PrivateConnectToken::generate(
+            client_id,
+            TEST_TOKEN_TIMEOUT,
+            &[server_address],
+            user_data,
+        );
+
+        let expire_timestamp = 1_000_000u64;
+        let mut nonce = [0u8; crate::token::CONNECT_TOKEN_NONCE_BYTES];
+        crypto::random_bytes(&mut nonce);
+
+        let mut private_data = Box::new([0u8; CONNECT_TOKEN_PRIVATE_BYTES]);
+        private_token.write(&mut private_data);
+        token::encrypt_connect_token_private(
+            &mut private_data,
+            protocol_id,
+            expire_timestamp,
+            &nonce,
+            private_key,
+        )
+        .unwrap();
+        let mac: [u8; MAC_BYTES] =
+            private_data[CONNECT_TOKEN_PRIVATE_BYTES - MAC_BYTES..].try_into().unwrap();
+        token::decrypt_connect_token_private(
+            &mut private_data,
+            protocol_id,
+            expire_timestamp,
+            &nonce,
+            private_key,
+        )
+        .unwrap();
+        (*private_data, mac)
+    }
+
+    /// Two tokens minted for one server, two clients, and a response that arrives
+    /// under one mapping's keys carrying the other mapping's challenge: it must be
+    /// refused, not connected as the other mapping's client id with its user data.
+    ///
+    /// This scenario test is functional rather than pure: `Server::new` binds a
+    /// real `UdpSocket` and `Server::start` reads the wall clock, so the seam the
+    /// card asks for (a `Datagram`/`FakeTransport` with an injectable timestamp) is
+    /// out of reach without a transport trait. The pure red test that pins the
+    /// defect is `challenge_token_binds_to_its_connect_token` in `src/token.rs`.
+    #[test]
+    fn server_refuses_a_response_with_another_mappings_challenge() {
+        let private_key = crypto::generate_key();
+        let mut server = Server::new(test_address(0), TEST_PROTOCOL_ID, &private_key, 0.0).unwrap();
+        server.start(2).unwrap();
+        server.min_connect_token_expire_timestamp = 0;
+
+        let x_addr = test_address(41000);
+        let y_addr = test_address(41001);
+
+        let mut user_data_a = [0u8; USER_DATA_BYTES];
+        user_data_a[0] = 0xA1;
+        let mut user_data_b = [0u8; USER_DATA_BYTES];
+        user_data_b[0] = 0xB2;
+
+        let (private_a, mac_a) = mint_private_token_data(
+            0x1111,
+            &user_data_a,
+            &private_key,
+            TEST_PROTOCOL_ID,
+            server.address(),
+        );
+        let (private_b, mac_b) = mint_private_token_data(
+            0x2222,
+            &user_data_b,
+            &private_key,
+            TEST_PROTOCOL_ID,
+            server.address(),
+        );
+
+        // X presents token A, then Y presents token B: the server mints challenge A
+        // (sequence 0) and challenge B (sequence 1).
+        server.process_connection_request(x_addr, &private_a, 1_000_000, 0);
+        server.process_connection_request(y_addr, &private_b, 1_000_000, 0);
+
+        let challenge_a = ChallengeToken { client_id: 0x1111, user_data: user_data_a };
+        let mut challenge_a_data = [0u8; CHALLENGE_TOKEN_BYTES];
+        challenge_a.write(&mut challenge_a_data);
+        token::encrypt_challenge_token(&mut challenge_a_data, 0, &server.challenge_key, &mac_a)
+            .unwrap();
+
+        let challenge_b = ChallengeToken { client_id: 0x2222, user_data: user_data_b };
+        let mut challenge_b_data = [0u8; CHALLENGE_TOKEN_BYTES];
+        challenge_b.write(&mut challenge_b_data);
+        token::encrypt_challenge_token(&mut challenge_b_data, 1, &server.challenge_key, &mac_b)
+            .unwrap();
+
+        let y_encryption_index =
+            server.encryption_manager.find_encryption_mapping(y_addr, server.time).unwrap();
+
+        // Y answers under B's keys with A's challenge: refused, no client 0x1111.
+        server.process_connection_response(y_addr, 0, challenge_a_data, Some(y_encryption_index));
+        assert_eq!(
+            server.num_connected_clients(),
+            0,
+            "a response carrying another mapping's challenge was accepted as its client id"
+        );
+
+        // Y's own challenge admits it as B with B's user data.
+        server.process_connection_response(y_addr, 1, challenge_b_data, Some(y_encryption_index));
+        assert_eq!(server.num_connected_clients(), 1);
+        assert_eq!(server.client_id(0), 0x2222);
+        assert_eq!(server.client_user_data(0).unwrap()[0], 0xB2);
     }
 }

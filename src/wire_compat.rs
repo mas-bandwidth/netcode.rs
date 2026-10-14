@@ -178,12 +178,12 @@ fn challenge_token_matches_c() {
 
     let mut buffer = [0u8; CHALLENGE_TOKEN_BYTES];
     challenge_token.write(&mut buffer);
-    token::encrypt_challenge_token(&mut buffer, VECTOR_CHALLENGE_SEQUENCE, &challenge_key())
+    token::encrypt_challenge_token(&mut buffer, VECTOR_CHALLENGE_SEQUENCE, &challenge_key(), &[])
         .unwrap();
     assert_eq!(&buffer, CHALLENGE_TOKEN_ENCRYPTED);
 
     let mut buffer = *CHALLENGE_TOKEN_ENCRYPTED;
-    token::decrypt_challenge_token(&mut buffer, VECTOR_CHALLENGE_SEQUENCE, &challenge_key())
+    token::decrypt_challenge_token(&mut buffer, VECTOR_CHALLENGE_SEQUENCE, &challenge_key(), &[])
         .unwrap();
     let output = ChallengeToken::read(&buffer);
     assert_eq!(output.client_id, VECTOR_CLIENT_ID);

@@ -1,11 +1,11 @@
 //! Differential test against the reference C implementation for the per-update
 //! receive drain.
 //!
-//! Feeds the same scripted receive queues through the C reference's classifier
-//! and capped receive loop (`tests/c/oracle.c`) and through this port's pure
-//! `classify_receive` / `drain_with_cap` (re-exported as
-//! `netcode::differential_transcript`), then compares the two transcripts
-//! exactly, line by line, not by shape.
+//! Feeds the same scripted receive queues through the C reference and through
+//! this port, then compares the two transcripts exactly, line by line, not by
+//! shape. The C side (`tests/c/oracle.c`) installs `receive_packet_override`
+//! and calls `netcode_server_receive_packets` / `netcode_client_receive_packets`
+//! for one update; the port side is `netcode::differential_transcript`.
 //!
 //! This is a functional test: it builds and runs a local C program on fixed
 //! inputs with no socket and no clock anywhere in the comparison. It is
@@ -24,8 +24,9 @@ use std::process::Command;
 /// Builds and runs the C oracle, returning its stdout split into lines.
 ///
 /// The oracle is `tests/c/oracle.c` beside this file. It `#include`s netcode.c,
-/// so netcode.c is not passed on the command line; `cc` gets the flags the card
-/// names. `NETCODE_C_DIR` must point at the C checkout.
+/// so netcode.c is not passed on the command line. `-finstrument-functions` is
+/// how the oracle counts entries into the reference's packet processor; without
+/// it those counts stay zero and the transcripts cannot match.
 fn c_transcript(netcode_c_dir: &str) -> Vec<String> {
     let oracle = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/c/oracle.c");
     let out_dir = std::env::temp_dir().join("netcode-c-differential");
@@ -33,7 +34,7 @@ fn c_transcript(netcode_c_dir: &str) -> Vec<String> {
     let binary = out_dir.join("oracle");
 
     let status = Command::new("cc")
-        .args(["-O2", "-ffp-contract=off"])
+        .args(["-O2", "-ffp-contract=off", "-finstrument-functions"])
         .arg(format!("-I{netcode_c_dir}"))
         .arg(format!("-I{netcode_c_dir}/sodium"))
         .arg(&oracle)

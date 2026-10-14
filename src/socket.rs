@@ -63,24 +63,141 @@ pub(crate) fn create_socket(address: SocketAddr) -> io::Result<UdpSocket> {
     Ok(socket.into())
 }
 
-/// Receives one packet if available. Returns `None` when the socket would block.
-pub(crate) fn receive_packet(socket: &UdpSocket, buffer: &mut [u8]) -> Option<(usize, SocketAddr)> {
-    loop {
-        match socket.recv_from(buffer) {
-            Ok((0, _)) => return None,
-            Ok((packet_bytes, from)) => return Some((packet_bytes, normalize_address(from))),
-            Err(error) => match error.kind() {
-                io::ErrorKind::WouldBlock => return None,
-                // ICMP port unreachable surfaces as a connection error on some
-                // platforms; skip it and keep reading
-                io::ErrorKind::ConnectionRefused | io::ErrorKind::ConnectionReset => continue,
-                _ => {
-                    error!("recvfrom failed: {error}");
-                    return None;
-                }
-            },
+/// The outcome of one non-blocking receive attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReceiveStatus {
+    /// A datagram of this many bytes arrived.
+    Datagram(usize),
+    /// This datagram is to be ignored: a zero-length datagram, or a receive
+    /// error that is not a would-block. Keep draining.
+    Skip,
+    /// The socket has no more datagrams this update.
+    Drained,
+}
+
+/// Classifies one non-blocking receive result into the three-way outcome the
+/// receive loops act on.
+///
+/// A zero-length datagram is legal and `recv_from` reports it as `Ok(0)`;
+/// reading that as "the socket is drained" ends the loop for the update and
+/// lets an unauthenticated sender of empty datagrams starve every real client.
+/// A would-block is the only true drain; any other error skips the datagram
+/// and keeps draining. Matches the C reference's classifier rows exactly:
+/// `(0, no error)` skips, `(-1, would-block)` drains, `(-1, other error)`
+/// skips, and a positive count is a datagram.
+pub(crate) fn classify_receive(result: isize, error_kind: Option<io::ErrorKind>) -> ReceiveStatus {
+    if result > 0 {
+        ReceiveStatus::Datagram(result as usize)
+    } else if result == 0 {
+        ReceiveStatus::Skip
+    } else if error_kind == Some(io::ErrorKind::WouldBlock) {
+        ReceiveStatus::Drained
+    } else {
+        ReceiveStatus::Skip
+    }
+}
+
+/// Counts from one capped drain: every receive attempt is consumed, every
+/// datagram handed on is processed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct DrainCounts {
+    pub consumed: usize,
+    pub processed: usize,
+}
+
+/// Runs one update's receive drain: call `receive` up to `cap` times, skip
+/// skipped datagrams, and stop on a drain.
+///
+/// Every attempt counts toward the cap, so an unauthenticated sender of empty
+/// datagrams cannot hold the update open. The server and client use the caps
+/// the reference names.
+pub(crate) fn drain_with_cap(
+    cap: usize,
+    mut receive: impl FnMut() -> ReceiveStatus,
+) -> DrainCounts {
+    let mut counts = DrainCounts::default();
+    while counts.consumed < cap {
+        counts.consumed += 1;
+        match receive() {
+            ReceiveStatus::Datagram(_) => counts.processed += 1,
+            ReceiveStatus::Skip => {}
+            ReceiveStatus::Drained => break,
         }
     }
+    counts
+}
+
+/// Receives one datagram if available, classifying the result. The source
+/// address is present only for a `Datagram`.
+pub(crate) fn receive_datagram(
+    socket: &UdpSocket,
+    buffer: &mut [u8],
+) -> (ReceiveStatus, Option<SocketAddr>) {
+    match socket.recv_from(buffer) {
+        Ok((packet_bytes, from)) => {
+            let status = classify_receive(packet_bytes as isize, None);
+            let from = if packet_bytes > 0 { Some(normalize_address(from)) } else { None };
+            (status, from)
+        }
+        Err(error) => (classify_receive(-1, Some(error.kind())), None),
+    }
+}
+
+/// Test seam for the C differential test: builds the port-side transcript for
+/// the scripted receive queues `tests/c/oracle.c` runs. Hidden from docs; not
+/// part of the supported API.
+#[doc(hidden)]
+pub fn differential_transcript() -> Vec<String> {
+    let mut lines = Vec::new();
+
+    for (name, status) in [
+        ("classifier-0-0", classify_receive(0, None)),
+        ("classifier-1-would-block", classify_receive(-1, Some(io::ErrorKind::WouldBlock))),
+        ("classifier-1-other", classify_receive(-1, Some(io::ErrorKind::ConnectionRefused))),
+        ("classifier-5-0", classify_receive(5, None)),
+    ] {
+        let processed = usize::from(matches!(status, ReceiveStatus::Datagram(_)));
+        lines.push(format!("{name} classifier consumed 1 processed {processed}"));
+    }
+
+    fn datagram() -> ReceiveStatus {
+        ReceiveStatus::Datagram(12)
+    }
+
+    let server_cap = crate::SERVER_MAX_RECEIVE_PACKETS;
+    let client_cap = crate::CLIENT_MAX_RECEIVE_PACKETS;
+
+    let scripts: [(&str, Vec<ReceiveStatus>); 4] = [
+        ("junk-empty-junk-junk", vec![datagram(), ReceiveStatus::Skip, datagram(), datagram()]),
+        (
+            "empty-empty-empty-junk",
+            vec![ReceiveStatus::Skip, ReceiveStatus::Skip, ReceiveStatus::Skip, datagram()],
+        ),
+        ("flood", vec![datagram(); server_cap + 10]),
+        ("ends-with-drain", vec![datagram(), ReceiveStatus::Skip, ReceiveStatus::Drained]),
+    ];
+
+    for (name, script) in scripts {
+        for (side, cap) in [("server", server_cap), ("client", client_cap)] {
+            let queue = script.clone();
+            let mut index = 0;
+            let counts = drain_with_cap(cap, || {
+                if index < queue.len() {
+                    let status = queue[index];
+                    index += 1;
+                    status
+                } else {
+                    ReceiveStatus::Drained
+                }
+            });
+            lines.push(format!(
+                "{name} {side} consumed {} processed {}",
+                counts.consumed, counts.processed
+            ));
+        }
+    }
+
+    lines
 }
 
 /// Zeroes the IPv6 flow label and scope id so received addresses compare equal to
@@ -163,10 +280,7 @@ mod tests {
     #[test]
     fn classify_receive_matches_c_rows() {
         assert_eq!(classify_receive(0, None), ReceiveStatus::Skip);
-        assert_eq!(
-            classify_receive(-1, Some(io::ErrorKind::WouldBlock)),
-            ReceiveStatus::Drained
-        );
+        assert_eq!(classify_receive(-1, Some(io::ErrorKind::WouldBlock)), ReceiveStatus::Drained);
         assert_eq!(
             classify_receive(-1, Some(io::ErrorKind::ConnectionRefused)),
             ReceiveStatus::Skip
@@ -186,8 +300,9 @@ mod tests {
         // A flood of one more than the cap plus ten is consumed exactly to the cap,
         // leaving the rest for the next update.
         let flood = RefCell::new(VecDeque::from(vec![ReceiveStatus::Datagram(1); cap + 10]));
-        let counts =
-            drain_with_cap(cap, || flood.borrow_mut().pop_front().unwrap_or(ReceiveStatus::Drained));
+        let counts = drain_with_cap(cap, || {
+            flood.borrow_mut().pop_front().unwrap_or(ReceiveStatus::Drained)
+        });
         assert_eq!(counts.consumed, cap);
         assert_eq!(counts.processed, cap);
         assert_eq!(flood.borrow().len(), 10);
@@ -199,8 +314,9 @@ mod tests {
             ReceiveStatus::Skip,
             ReceiveStatus::Datagram(7),
         ]));
-        let counts =
-            drain_with_cap(cap, || queue.borrow_mut().pop_front().unwrap_or(ReceiveStatus::Drained));
+        let counts = drain_with_cap(cap, || {
+            queue.borrow_mut().pop_front().unwrap_or(ReceiveStatus::Drained)
+        });
         assert_eq!(counts.processed, 2);
         assert!(queue.borrow().is_empty());
         // the final would-block attempt is an iteration too, so it counts as consumed

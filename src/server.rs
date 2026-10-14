@@ -688,11 +688,18 @@ impl Server {
     fn receive_packets(&mut self) {
         let current_timestamp = token::unix_timestamp();
         let mut packet_data = [0u8; MAX_PACKET_BYTES];
-        while let Some((packet_bytes, from)) =
-            socket::receive_packet(&self.socket, &mut packet_data)
-        {
-            self.read_and_process_packet(from, &mut packet_data[..packet_bytes], current_timestamp);
-        }
+        socket::drain_with_cap(crate::SERVER_MAX_RECEIVE_PACKETS, || {
+            let (status, from) = socket::receive_datagram(&self.socket, &mut packet_data);
+            if let socket::ReceiveStatus::Datagram(packet_bytes) = status {
+                let from = from.expect("a datagram carries a source address");
+                self.read_and_process_packet(
+                    from,
+                    &mut packet_data[..packet_bytes],
+                    current_timestamp,
+                );
+            }
+            status
+        });
     }
 
     fn read_and_process_packet(

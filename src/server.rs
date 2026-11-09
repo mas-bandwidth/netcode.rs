@@ -1256,6 +1256,41 @@ mod tests {
     }
 
     #[test]
+    fn encryption_manager_zeroes_keys_when_shrinking_past_expired_entries() {
+        let mut manager = EncryptionManager::new();
+        let send_key = crypto::generate_key();
+        let receive_key = crypto::generate_key();
+
+        // entry 0 times out after 5 seconds, entry 1 after 100
+        assert!(manager.add_encryption_mapping(
+            test_address(40000),
+            &send_key,
+            &receive_key,
+            1000.0,
+            -1.0,
+            5,
+            0,
+        ));
+        assert!(manager.add_encryption_mapping(
+            test_address(40001),
+            &send_key,
+            &receive_key,
+            1000.0,
+            -1.0,
+            100,
+            1,
+        ));
+
+        // removing the last entry frees the expired entry before it as well
+        assert!(manager.remove_encryption_mapping(test_address(40001), 1010.0));
+        assert_eq!(manager.num_entries, 0);
+        assert_eq!(manager.entries[0].send_key, [0; KEY_BYTES]);
+        assert_eq!(manager.entries[0].receive_key, [0; KEY_BYTES]);
+        assert_eq!(manager.entries[1].send_key, [0; KEY_BYTES]);
+        assert_eq!(manager.entries[1].receive_key, [0; KEY_BYTES]);
+    }
+
+    #[test]
     fn server_start_sets_configured_connect_token_restart_guard() {
         let private_key = crypto::generate_key();
         let mut server = Server::new_with_config(

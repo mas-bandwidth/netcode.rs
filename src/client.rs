@@ -249,7 +249,9 @@ impl Client {
 
         if let Some(disconnect_state) = self.should_disconnect {
             debug!("client should disconnect -> {disconnect_state}");
-            if self.connect_to_next_server() {
+            // only a client still connecting tries the next server address. a connected
+            // client that receives a disconnect transitions straight to disconnected.
+            if self.state.is_connecting() && self.connect_to_next_server() {
                 return;
             }
             self.disconnect_internal(disconnect_state, false);

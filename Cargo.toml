@@ -2,7 +2,7 @@
 name = "netcode-official"
 version = "1.1.2"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.87"
 authors = ["Más Bandwidth LLC"]
 description = "The official Rust implementation of the netcode network protocol"
 license = "LicenseRef-MBSL"

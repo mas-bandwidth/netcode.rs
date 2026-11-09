@@ -1,5 +1,6 @@
 //! Integration tests: a real client and server exchanging packets over localhost UDP.
 
+use std::net::UdpSocket;
 use std::time::Duration;
 
 use netcode::{Client, ClientState, DisconnectReason, Key, Server, ServerEvent};
@@ -74,6 +75,42 @@ impl Harness {
             self.server.num_connected_clients()
         );
     }
+}
+
+#[test]
+fn connect_token_expires_while_advancing_through_servers() {
+    // Two server addresses that accept packets but never answer. The first connection
+    // request times out and the client moves to the second, but the token's lifetime
+    // must keep running from the original connect call rather than restarting.
+    let dead_server_1 = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let dead_server_2 = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let addresses = [dead_server_1.local_addr().unwrap(), dead_server_2.local_addr().unwrap()];
+
+    let connect_token = netcode::generate_connect_token(
+        &addresses,
+        &addresses,
+        4,
+        3,
+        1,
+        PROTOCOL_ID,
+        &netcode::generate_key(),
+        &[0u8; netcode::USER_DATA_BYTES],
+    )
+    .unwrap();
+
+    let mut client = Client::new("127.0.0.1:0".parse().unwrap(), 0.0).unwrap();
+    client.connect(&connect_token).unwrap();
+
+    let mut time = 0.0;
+    for _ in 0..=410 {
+        client.update(time);
+        time += DELTA_TIME;
+    }
+
+    assert_eq!(client.state(), ClientState::ConnectTokenExpired);
+
+    drop(dead_server_1);
+    drop(dead_server_2);
 }
 
 #[test]

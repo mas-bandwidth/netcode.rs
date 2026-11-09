@@ -223,6 +223,7 @@ impl Client {
         self.write_packet_key = connect_token.client_to_server_key;
         self.connect_token = Some(connect_token);
 
+        self.connect_start_time = self.time;
         self.reset_before_next_connect();
         self.set_state(ClientState::SendingConnectionRequest);
 
@@ -356,7 +357,6 @@ impl Client {
     }
 
     fn reset_before_next_connect(&mut self) {
-        self.connect_start_time = self.time;
         self.last_packet_send_time = self.time - 1.0;
         self.last_packet_receive_time = self.time;
         self.should_disconnect = None;

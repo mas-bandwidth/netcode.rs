@@ -176,6 +176,11 @@ fn connect_token_cannot_be_reused_from_another_address() {
     harness.clients.push(client1);
     harness.run_until(1000, |h| h.clients[0].state() == ClientState::Connected);
 
+    // End the first session before the second client presents the same token
+    // from a different address.
+    harness.clients[0].disconnect();
+    harness.run_until(1000, |h| h.server.num_connected_clients() == 0);
+
     // the same token sent from a different address must not connect
     let mut client2 = Client::new("127.0.0.1:0".parse().unwrap(), harness.time).unwrap();
     client2.connect(&connect_token).unwrap();
@@ -184,7 +189,7 @@ fn connect_token_cannot_be_reused_from_another_address() {
         harness.update();
         assert_ne!(harness.clients[1].state(), ClientState::Connected);
     }
-    assert_eq!(harness.server.num_connected_clients(), 1);
+    assert_eq!(harness.server.num_connected_clients(), 0);
 }
 
 #[test]

@@ -525,6 +525,10 @@ impl Client {
     }
 
     fn process_packet(&mut self, from: SocketAddr, packet_data: &mut [u8]) {
+        if Some(from) != self.server_address {
+            return;
+        }
+
         let Some(connect_token) = self.connect_token.as_ref() else {
             return;
         };
@@ -540,10 +544,6 @@ impl Client {
         ) else {
             return;
         };
-
-        if Some(from) != self.server_address {
-            return;
-        }
 
         match packet {
             Packet::Denied => {
@@ -652,5 +652,60 @@ mod tests {
         let connect_token = [0u8; CONNECT_TOKEN_BYTES];
         assert!(client.connect(&connect_token).is_err());
         assert_eq!(client.state(), ClientState::InvalidConnectToken);
+    }
+
+    #[test]
+    fn packets_from_an_unexpected_address_are_ignored() {
+        const PROTOCOL_ID: u64 = 0x1122334455667788;
+        const OTHER_SEQUENCE: u64 = 1000;
+        const SERVER_SEQUENCE: u64 = 1;
+
+        let server_address: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        let other_address: SocketAddr = "127.0.0.1:40001".parse().unwrap();
+        let private_key = crate::generate_key();
+        let connect_token = crate::generate_connect_token(
+            &[server_address],
+            &[server_address],
+            30,
+            5,
+            0x1234,
+            PROTOCOL_ID,
+            &private_key,
+            &[0; crate::USER_DATA_BYTES],
+        )
+        .unwrap();
+
+        let mut client = Client::new("127.0.0.1:0".parse().unwrap(), 0.0).unwrap();
+        client.connect(&connect_token).unwrap();
+        client.state = ClientState::Connected;
+
+        let key = ConnectToken::read(&connect_token).unwrap().server_to_client_key;
+        let mut packet_data = [0u8; MAX_PACKET_BYTES];
+
+        let packet_bytes = crate::packet::write_packet(
+            &Packet::Payload(vec![1, 2, 3]),
+            &mut packet_data,
+            OTHER_SEQUENCE,
+            &key,
+            PROTOCOL_ID,
+        )
+        .unwrap();
+        client.process_packet(other_address, &mut packet_data[..packet_bytes]);
+        assert!(
+            !client.replay_protection.already_received(OTHER_SEQUENCE),
+            "a packet from an address other than the server address advanced replay protection"
+        );
+        assert!(client.receive_packet().is_none());
+
+        let packet_bytes = crate::packet::write_packet(
+            &Packet::Payload(vec![4, 5, 6]),
+            &mut packet_data,
+            SERVER_SEQUENCE,
+            &key,
+            PROTOCOL_ID,
+        )
+        .unwrap();
+        client.process_packet(server_address, &mut packet_data[..packet_bytes]);
+        assert_eq!(client.receive_packet(), Some((vec![4, 5, 6], SERVER_SEQUENCE)));
     }
 }

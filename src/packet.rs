@@ -432,7 +432,7 @@ fn read_connection_request_packet(
         return None;
     }
 
-    if expire_timestamp < min_connect_token_expire_timestamp {
+    if expire_timestamp <= min_connect_token_expire_timestamp {
         debug!("ignored connection request packet. connect token predates the server start");
         return None;
     }

@@ -53,7 +53,7 @@ const MAX_ENCRYPTION_MAPPINGS: usize = MAX_CLIENTS * 4;
 #[derive(Debug, Clone, Copy)]
 pub struct ServerConfig {
     /// The longest lifetime, in seconds, of connect tokens issued by the backend.
-    /// A token whose expiry is earlier than the server start time plus this lifetime
+    /// A token whose expiry is at or before the server start time plus this lifetime
     /// is rejected. Values at or below zero use
     /// [`crate::DEFAULT_MAX_CONNECT_TOKEN_LIFETIME`].
     pub max_connect_token_lifetime: i32,
@@ -1183,7 +1183,9 @@ mod tests {
     use crate::{CONNECT_TOKEN_BYTES, generate_connect_token};
 
     const TEST_PROTOCOL_ID: u64 = 0x1122334455667788;
-    const TEST_TOKEN_EXPIRY: i32 = 30;
+    // one second above the default maximum token lifetime, so a token generated just
+    // after a server start expires strictly after the start floor rather than at it
+    const TEST_TOKEN_EXPIRY: i32 = crate::DEFAULT_MAX_CONNECT_TOKEN_LIFETIME + 1;
     const TEST_TOKEN_TIMEOUT: i32 = 5;
 
     /// The server stamps its global packets (challenge and denied) with sequence

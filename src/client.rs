@@ -713,4 +713,50 @@ mod tests {
         client.process_packet(server_address, &mut packet_data[..packet_bytes]);
         assert_eq!(client.receive_packet(), Some((vec![4, 5, 6], SERVER_SEQUENCE)));
     }
+
+    #[test]
+    fn keep_alive_with_client_slot_out_of_range_is_ignored() {
+        const PROTOCOL_ID: u64 = 0x1122334455667788;
+        const CLIENT_INDEX: usize = 3;
+        const MAX_CLIENTS: u32 = crate::MAX_CLIENTS as u32;
+
+        let server_address: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        let private_key = crate::generate_key();
+        let connect_token = crate::generate_connect_token(
+            &[server_address],
+            &[server_address],
+            30,
+            5,
+            0x1234,
+            PROTOCOL_ID,
+            &private_key,
+            &[0; crate::USER_DATA_BYTES],
+        )
+        .unwrap();
+
+        let mut client = Client::create(None, None, true, 1000.0).unwrap();
+        client.connect(&connect_token).unwrap();
+        client.state = ClientState::SendingConnectionResponse;
+        client.client_index = CLIENT_INDEX;
+        client.max_clients = 7;
+
+        let key = ConnectToken::read(&connect_token).unwrap().server_to_client_key;
+        let mut packet_data = [0u8; MAX_PACKET_BYTES];
+
+        let cases = [(u32::MAX, MAX_CLIENTS), (0, 0), (0, MAX_CLIENTS + 1), (5, 5), (6, 5)];
+        for (sequence, (client_index, max_clients)) in (1u64..).zip(cases) {
+            let packet_bytes = crate::packet::write_packet(
+                &Packet::KeepAlive { client_index, max_clients },
+                &mut packet_data,
+                sequence,
+                &key,
+                PROTOCOL_ID,
+            )
+            .unwrap();
+            client.process_packet(server_address, &mut packet_data[..packet_bytes]);
+            assert_eq!(client.client_index(), CLIENT_INDEX);
+            assert_eq!(client.max_clients(), 7);
+            assert_eq!(client.state(), ClientState::SendingConnectionResponse);
+        }
+    }
 }

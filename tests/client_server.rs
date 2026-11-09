@@ -105,24 +105,34 @@ fn server_skips_empty_datagrams_before_connection_request() {
     harness.clients.push(client);
 
     // Zero-length datagrams are valid UDP, so a burst of them can arrive ahead of a
-    // connection request. They must not stop the server from reading that request in
-    // the same tick.
+    // connection request. A burst goes out before every tick, so each request the
+    // client sends is queued behind EMPTY_PER_TICK of them. The server must read past
+    // all of them within one update: a server that read one per update would need more
+    // than MAX_TICKS updates to reach even the first request. UDP may drop any packet,
+    // and the client resends its request several times within MAX_TICKS, so the test
+    // only requires that some request is answered, not the first.
+    const EMPTY_PER_TICK: usize = 64;
+    const MAX_TICKS: usize = 50;
     let noise = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    for _ in 0..8 {
-        noise.send_to(&[], harness.server.address()).unwrap();
+    let answered = |state: ClientState| {
+        state == ClientState::SendingConnectionResponse || state == ClientState::Connected
+    };
+
+    for _ in 0..MAX_TICKS {
+        if answered(harness.clients[0].state()) {
+            break;
+        }
+        for _ in 0..EMPTY_PER_TICK {
+            noise.send_to(&[], harness.server.address()).unwrap();
+        }
+        harness.update();
     }
 
-    // Let the client emit its connection request behind the empty datagrams.
-    harness.clients[0].update(harness.time);
-
-    // One server tick must consume the empty datagrams and answer the request.
-    harness.server.update(harness.time);
-
-    // Read the challenge so the client records that the request was processed.
-    harness.time += DELTA_TIME;
-    harness.clients[0].update(harness.time);
-
-    assert_eq!(harness.clients[0].state(), ClientState::SendingConnectionResponse);
+    assert!(
+        answered(harness.clients[0].state()),
+        "connection request was never answered: client state is {}",
+        harness.clients[0].state()
+    );
 }
 
 #[test]

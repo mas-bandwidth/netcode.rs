@@ -8,6 +8,8 @@
 use std::net::SocketAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use zeroize::{Zeroize, ZeroizeOnDrop};
+
 use crate::bytes::{Reader, Writer};
 use crate::crypto::{self, XNONCE_BYTES};
 use crate::{
@@ -110,6 +112,15 @@ impl PrivateConnectToken {
         .ok_or(Error::InvalidConnectToken)
     }
 }
+
+impl Drop for PrivateConnectToken {
+    fn drop(&mut self) {
+        self.client_to_server_key.zeroize();
+        self.server_to_client_key.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for PrivateConnectToken {}
 
 /// Encrypts the first 1008 bytes of the buffer in place, storing the HMAC in the last
 /// 16 bytes.
@@ -258,6 +269,15 @@ impl ConnectToken {
         .ok_or(Error::InvalidConnectToken)
     }
 }
+
+impl Drop for ConnectToken {
+    fn drop(&mut self) {
+        self.client_to_server_key.zeroize();
+        self.server_to_client_key.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for ConnectToken {}
 
 pub(crate) fn unix_timestamp() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock is before 1970").as_secs()
@@ -493,6 +513,16 @@ mod tests {
         assert_eq!(private_token.client_to_server_key, token.client_to_server_key);
         assert_eq!(private_token.server_to_client_key, token.server_to_client_key);
         assert_eq!(private_token.user_data, user_data);
+    }
+
+    fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+
+    #[test]
+    fn connect_token_keys_are_zeroed_on_drop() {
+        // the server drops the decoded private token once a connection request is
+        // processed, and the client drops its connect token on disconnect
+        assert_zeroize_on_drop::<PrivateConnectToken>();
+        assert_zeroize_on_drop::<ConnectToken>();
     }
 
     #[test]

@@ -5,6 +5,7 @@ use std::fmt;
 use std::net::{SocketAddr, UdpSocket};
 
 use log::{debug, info};
+use zeroize::Zeroize;
 
 use crate::packet::{AllowedPackets, Packet};
 use crate::replay::ReplayProtection;
@@ -609,6 +610,8 @@ impl Client {
 impl Drop for Client {
     fn drop(&mut self) {
         self.disconnect();
+        self.write_packet_key.zeroize();
+        self.read_packet_key.zeroize();
     }
 }
 

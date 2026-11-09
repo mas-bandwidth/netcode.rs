@@ -15,13 +15,24 @@
 //! decrypt in *both* directions: if either side's packets failed to authenticate, the
 //! other side would time the connection out.
 
+use std::net::SocketAddr;
 use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use netcode::{Client, ClientState, Server, ServerEvent};
 
 const PROTOCOL_ID: u64 = 0x1122334455667788;
-const SERVER_ADDRESS: &str = "127.0.0.1:40000";
+const DEFAULT_SERVER_ADDRESS: &str = "127.0.0.1:40000";
+
+static INTEROP_LOCK: Mutex<()> = Mutex::new(());
+
+fn c_server_address() -> SocketAddr {
+    std::env::var("NETCODE_C_SERVER_ADDRESS")
+        .unwrap_or_else(|_| DEFAULT_SERVER_ADDRESS.to_string())
+        .parse()
+        .expect("invalid NETCODE_C_SERVER_ADDRESS")
+}
 const CONNECT_TOKEN_EXPIRY: i32 = 30;
 const CONNECT_TOKEN_TIMEOUT: i32 = 5;
 const DELTA_TIME: f64 = 1.0 / 60.0;
@@ -65,8 +76,8 @@ fn rust_client_connects_to_c_server() {
     let mut client = Client::new("0.0.0.0:0".parse().unwrap(), 0.0).unwrap();
 
     let connect_token = netcode::generate_connect_token(
-        &[SERVER_ADDRESS.parse().unwrap()],
-        &[SERVER_ADDRESS.parse().unwrap()],
+        &[c_server_address()],
+        &[c_server_address()],
         CONNECT_TOKEN_EXPIRY,
         CONNECT_TOKEN_TIMEOUT,
         0x1234,
@@ -126,8 +137,8 @@ fn rust_client_connects_to_c_server() {
 #[test]
 #[ignore = "requires the C reference binaries; see the file docs"]
 fn c_client_connects_to_rust_server() {
-    let mut server =
-        Server::new(SERVER_ADDRESS.parse().unwrap(), PROTOCOL_ID, &PRIVATE_KEY, 0.0).unwrap();
+    let _guard = INTEROP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut server = Server::new(c_server_address(), PROTOCOL_ID, &PRIVATE_KEY, 0.0).unwrap();
     server.start(16).unwrap();
 
     let _c_client = spawn("NETCODE_C_CLIENT");

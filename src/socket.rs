@@ -1,7 +1,14 @@
-//! Non-blocking UDP sockets with large kernel buffers.
+//! Non-blocking UDP sockets with large kernel buffers, plus an in-memory transport for
+//! deterministic unit tests.
 
+#[cfg(test)]
+use std::collections::{HashMap, VecDeque};
 use std::io;
+#[cfg(test)]
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::net::{SocketAddr, SocketAddrV6, UdpSocket};
+#[cfg(test)]
+use std::sync::{Arc, Mutex};
 
 use log::{error, info};
 use socket2::{Domain, Protocol, Socket, Type};
@@ -48,7 +55,114 @@ fn set_buffer_with_backoff(
     Ok(size)
 }
 
-pub(crate) fn create_socket(address: SocketAddr) -> io::Result<UdpSocket> {
+pub(crate) enum Transport {
+    Udp(UdpSocket),
+    #[cfg(test)]
+    Memory(MemorySocket),
+}
+
+impl Transport {
+    pub(crate) fn local_addr(&self) -> io::Result<SocketAddr> {
+        match self {
+            Self::Udp(socket) => socket.local_addr(),
+            #[cfg(test)]
+            Self::Memory(socket) => Ok(socket.local_addr()),
+        }
+    }
+
+    pub(crate) fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        match self {
+            Self::Udp(socket) => socket.send_to(buf, target),
+            #[cfg(test)]
+            Self::Memory(socket) => Ok(socket.send_to(buf, target)),
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct MemoryNetwork {
+    inner: Arc<Mutex<MemoryNetworkInner>>,
+}
+
+#[cfg(test)]
+struct MemoryNetworkInner {
+    next_port: u16,
+    queues: HashMap<SocketAddr, VecDeque<(Vec<u8>, SocketAddr)>>,
+}
+
+#[cfg(test)]
+impl Default for MemoryNetworkInner {
+    fn default() -> Self {
+        Self { next_port: 49152, queues: HashMap::new() }
+    }
+}
+
+#[cfg(test)]
+impl MemoryNetwork {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn bind(&self, address: SocketAddr) -> MemorySocket {
+        let mut inner = self.inner.lock().unwrap();
+        let ip = match address.ip() {
+            IpAddr::V4(v4) if v4.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(v6) if v6.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+            other => other,
+        };
+        let port = if address.port() == 0 {
+            let port = inner.next_port;
+            inner.next_port = inner.next_port.wrapping_add(1).max(49152);
+            port
+        } else {
+            address.port()
+        };
+        let bound = normalize_address(SocketAddr::new(ip, port));
+        inner.queues.entry(bound).or_default();
+        MemorySocket { address: bound, network: Arc::clone(&self.inner) }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct MemorySocket {
+    address: SocketAddr,
+    network: Arc<Mutex<MemoryNetworkInner>>,
+}
+
+#[cfg(test)]
+impl MemorySocket {
+    pub(crate) fn local_addr(&self) -> SocketAddr {
+        self.address
+    }
+
+    pub(crate) fn send_to(&self, buf: &[u8], target: SocketAddr) -> usize {
+        if buf.is_empty() {
+            return 0;
+        }
+        let target = normalize_address(target);
+        let mut inner = self.network.lock().unwrap();
+        if let Some(queue) = inner.queues.get_mut(&target) {
+            queue.push_back((buf.to_vec(), self.address));
+        }
+        buf.len()
+    }
+
+    pub(crate) fn recv_from(&self, buffer: &mut [u8]) -> Option<(usize, SocketAddr)> {
+        let mut inner = self.network.lock().unwrap();
+        let queue = inner.queues.get_mut(&self.address)?;
+        let (data, from) = queue.pop_front()?;
+        if data.is_empty() {
+            return None;
+        }
+        let len = data.len().min(buffer.len());
+        buffer[..len].copy_from_slice(&data[..len]);
+        Some((len, from))
+    }
+}
+
+pub(crate) fn create_socket(address: SocketAddr) -> io::Result<Transport> {
     let domain = if address.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
     if address.is_ipv6() {
@@ -60,26 +174,32 @@ pub(crate) fn create_socket(address: SocketAddr) -> io::Result<UdpSocket> {
     })?;
     socket.set_nonblocking(true)?;
     socket.bind(&address.into())?;
-    Ok(socket.into())
+    Ok(Transport::Udp(socket.into()))
 }
 
 /// Receives one packet if available. Returns `None` when the socket would block.
-pub(crate) fn receive_packet(socket: &UdpSocket, buffer: &mut [u8]) -> Option<(usize, SocketAddr)> {
-    loop {
-        match socket.recv_from(buffer) {
-            Ok((0, _)) => return None,
-            Ok((packet_bytes, from)) => return Some((packet_bytes, normalize_address(from))),
-            Err(error) => match error.kind() {
-                io::ErrorKind::WouldBlock => return None,
-                // ICMP port unreachable surfaces as a connection error on some
-                // platforms; skip it and keep reading
-                io::ErrorKind::ConnectionRefused | io::ErrorKind::ConnectionReset => continue,
-                _ => {
-                    error!("recvfrom failed: {error}");
-                    return None;
-                }
-            },
-        }
+pub(crate) fn receive_packet(socket: &Transport, buffer: &mut [u8]) -> Option<(usize, SocketAddr)> {
+    match socket {
+        Transport::Udp(socket) => loop {
+            match socket.recv_from(buffer) {
+                Ok((0, _)) => return None,
+                Ok((packet_bytes, from)) => return Some((packet_bytes, normalize_address(from))),
+                Err(error) => match error.kind() {
+                    io::ErrorKind::WouldBlock => return None,
+                    // ICMP port unreachable surfaces as a connection error on some
+                    // platforms; skip it and keep reading
+                    io::ErrorKind::ConnectionRefused | io::ErrorKind::ConnectionReset => continue,
+                    _ => {
+                        error!("recvfrom failed: {error}");
+                        return None;
+                    }
+                },
+            }
+        },
+        #[cfg(test)]
+        Transport::Memory(socket) => socket
+            .recv_from(buffer)
+            .map(|(packet_bytes, from)| (packet_bytes, normalize_address(from))),
     }
 }
 
@@ -100,11 +220,11 @@ mod tests {
     use std::cell::RefCell;
 
     fn enobufs() -> io::Error {
-        io::Error::from_raw_os_error(55) // ENOBUFS on the BSDs
+        io::Error::from_raw_os_error(55)
     }
 
-    /// The platform this ports FROM: Linux and Windows clamp silently, so the first
-    /// attempt succeeds and nothing is reduced.
+    /// When the OS accepts the full 4 MB on the first call, no halving happens and only
+    /// one attempt is made.
     #[test]
     fn accepts_the_requested_size_when_the_os_allows_it() {
         let attempts = RefCell::new(Vec::new());
@@ -117,9 +237,10 @@ mod tests {
         assert_eq!(*attempts.borrow(), vec![SOCKET_SNDBUF_SIZE]);
     }
 
-    /// The platform this ports FOR. OpenBSD's default sb_max is well under 4 MB, so the
-    /// large requests are rejected and the socket must settle for what fits rather than
-    /// refusing to start.
+    /// BSD behaviour: the kernel rejects requests above its cap with ENOBUFS rather than
+    /// clamping them, which is what the backoff loop exists FOR. OpenBSD's default sb_max
+    /// is well under 4 MB, so the large requests are rejected and the socket must settle
+    /// for what fits rather than refusing to start.
     #[test]
     fn backs_off_by_halving_until_the_os_accepts() {
         let limit = 1024 * 1024;
@@ -155,5 +276,25 @@ mod tests {
             "attempted a size below the floor: {attempts:?}"
         );
         assert_eq!(*attempts.last().unwrap(), SOCKET_BUFFER_MIN_SIZE);
+    }
+
+    #[test]
+    fn memory_network_routes_packets_and_assigns_ephemeral_ports() {
+        let network = MemoryNetwork::new();
+        let a = Transport::Memory(network.bind("127.0.0.1:0".parse().unwrap()));
+        let b = Transport::Memory(network.bind("[::1]:0".parse().unwrap()));
+        let a_addr = a.local_addr().unwrap();
+        let b_addr = b.local_addr().unwrap();
+        assert_ne!(a_addr.port(), 0);
+        assert_ne!(b_addr.port(), 0);
+
+        let mut buf = [0u8; 64];
+        assert!(receive_packet(&a, &mut buf).is_none());
+
+        a.send_to(&[1, 2, 3, 4], b_addr).unwrap();
+        let (len, from) = receive_packet(&b, &mut buf).unwrap();
+        assert_eq!(&buf[..len], &[1, 2, 3, 4]);
+        assert_eq!(from, a_addr);
+        assert!(receive_packet(&b, &mut buf).is_none());
     }
 }

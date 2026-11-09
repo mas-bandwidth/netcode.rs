@@ -740,6 +740,35 @@ mod tests {
     }
 
     #[test]
+    fn connect_to_next_server_skips_unsupported_address_families() {
+        const PROTOCOL_ID: u64 = 0x1122334455667788;
+
+        let first_ipv4_server: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        let ipv6_server: SocketAddr = "[::1]:40001".parse().unwrap();
+        let second_ipv4_server: SocketAddr = "127.0.0.1:40002".parse().unwrap();
+        let private_key = crate::generate_key();
+        let connect_token = crate::generate_connect_token(
+            &[first_ipv4_server, ipv6_server, second_ipv4_server],
+            &[first_ipv4_server, ipv6_server, second_ipv4_server],
+            30,
+            5,
+            0x1234,
+            PROTOCOL_ID,
+            &private_key,
+            &[0; crate::USER_DATA_BYTES],
+        )
+        .unwrap();
+
+        let mut client = Client::new("127.0.0.1:0".parse().unwrap(), 0.0).unwrap();
+        client.connect(&connect_token).unwrap();
+        assert_eq!(client.server_address(), Some(first_ipv4_server));
+
+        assert!(client.connect_to_next_server());
+        assert_eq!(client.state(), ClientState::SendingConnectionRequest);
+        assert_eq!(client.server_address(), Some(second_ipv4_server));
+    }
+
+    #[test]
     fn packets_from_an_unexpected_address_are_ignored() {
         const PROTOCOL_ID: u64 = 0x1122334455667788;
         const OTHER_SEQUENCE: u64 = 1000;

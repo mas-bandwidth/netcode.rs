@@ -1471,13 +1471,22 @@ mod tests {
 
     /// A server that is stopped and started again must not go back to stamping its
     /// global packets with sequence numbers a connected client's packets also use.
-    /// This drives a real connection request over UDP before and after a restart with
-    /// the same connect token, and reads the nonce off the challenge packets the
-    /// server actually sends.
+    /// This drives a real connection request over UDP before and after a restart and
+    /// reads the nonce off the challenge packets the server actually sends.
     #[test]
     fn restarted_server_keeps_global_packets_out_of_the_client_sequence_range() {
         let private_key = crypto::generate_key();
-        let mut server = Server::new(test_address(0), TEST_PROTOCOL_ID, &private_key, 0.0).unwrap();
+        // the start floor is the start time plus this lifetime, one second under the
+        // lifetime of the tokens minted below, so a token from the same second expires
+        // strictly above the floor
+        let mut server = Server::new_with_config(
+            test_address(0),
+            TEST_PROTOCOL_ID,
+            &private_key,
+            ServerConfig { max_connect_token_lifetime: TEST_TOKEN_EXPIRY - 1 },
+            0.0,
+        )
+        .unwrap();
         server.start(1).unwrap();
 
         let connect_token = generate_connect_token(
@@ -1491,6 +1500,11 @@ mod tests {
             &[0; USER_DATA_BYTES],
         )
         .unwrap();
+        assert!(
+            ConnectToken::read(&connect_token).unwrap().expire_timestamp
+                > server.min_connect_token_expire_timestamp,
+            "connect token expiry is above the server start floor"
+        );
 
         let socket = UdpSocket::bind(test_address(0)).unwrap();
         socket.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
@@ -1503,10 +1517,29 @@ mod tests {
         server.stop();
         server.start(1).unwrap();
 
-        // the same client, the same connect token, and therefore the same
-        // server-to-client key as before the restart
-        let after_restart =
-            challenge_sequence_on_the_wire(&mut server, &socket, &connect_token, &mut time);
+        let restarted_connect_token = generate_connect_token(
+            &[server.address()],
+            &[server.address()],
+            TEST_TOKEN_EXPIRY,
+            TEST_TOKEN_TIMEOUT,
+            0x1234,
+            TEST_PROTOCOL_ID,
+            &private_key,
+            &[0; USER_DATA_BYTES],
+        )
+        .unwrap();
+        assert!(
+            ConnectToken::read(&restarted_connect_token).unwrap().expire_timestamp
+                > server.min_connect_token_expire_timestamp,
+            "connect token expiry is above the server start floor"
+        );
+
+        let after_restart = challenge_sequence_on_the_wire(
+            &mut server,
+            &socket,
+            &restarted_connect_token,
+            &mut time,
+        );
         assert!(
             after_restart > GLOBAL_SEQUENCE_FLOOR,
             "a restarted server sent a global packet with sequence {after_restart}, which is in \

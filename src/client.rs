@@ -189,6 +189,13 @@ impl Client {
         Ok(client)
     }
 
+    fn has_socket_for(&self, server_address: SocketAddr) -> bool {
+        match server_address {
+            SocketAddr::V4(_) => self.socket_ipv4.is_some(),
+            SocketAddr::V6(_) => self.socket_ipv6.is_some(),
+        }
+    }
+
     /// Starts connecting to the servers listed in the connect token, trying each
     /// address in order until one accepts.
     ///
@@ -206,16 +213,34 @@ impl Client {
             }
         };
 
-        self.server_address_index = 0;
-        self.server_address = Some(connect_token.server_addresses[0]);
+        let num_server_addresses = connect_token.server_addresses.len();
+        let mut server_address_index = 0;
+        while server_address_index < num_server_addresses {
+            let address = connect_token.server_addresses[server_address_index];
+            if self.has_socket_for(address) {
+                break;
+            }
+            debug!("client skipping server address with no matching socket family: {address}");
+            server_address_index += 1;
+        }
+        if server_address_index == num_server_addresses {
+            debug!("client has no server address with a matching socket family");
+            self.set_state(ClientState::InvalidConnectToken);
+            return Err(Error::InvalidConnectToken);
+        }
 
-        if connect_token.server_addresses.len() == 1 {
-            info!("client connecting to server {}", connect_token.server_addresses[0]);
+        self.server_address_index = server_address_index;
+        let server_address = connect_token.server_addresses[server_address_index];
+        self.server_address = Some(server_address);
+
+        if num_server_addresses == 1 {
+            info!("client connecting to server {}", server_address);
         } else {
             info!(
-                "client connecting to server {} [1/{}]",
-                connect_token.server_addresses[0],
-                connect_token.server_addresses.len()
+                "client connecting to server {} [{}/{}]",
+                server_address,
+                server_address_index + 1,
+                num_server_addresses
             );
         }
 
@@ -411,13 +436,22 @@ impl Client {
         };
         let num_server_addresses = connect_token.server_addresses.len();
 
-        if self.server_address_index + 1 >= num_server_addresses {
+        let mut server_address_index = self.server_address_index + 1;
+        while server_address_index < num_server_addresses {
+            let address = connect_token.server_addresses[server_address_index];
+            if self.has_socket_for(address) {
+                break;
+            }
+            debug!("client skipping server address with no matching socket family: {address}");
+            server_address_index += 1;
+        }
+        if server_address_index >= num_server_addresses {
             debug!("client has no more servers to connect to");
             return false;
         }
 
-        self.server_address_index += 1;
-        let server_address = connect_token.server_addresses[self.server_address_index];
+        let server_address = connect_token.server_addresses[server_address_index];
+        self.server_address_index = server_address_index;
         self.server_address = Some(server_address);
 
         self.reset_before_next_connect();
@@ -425,7 +459,7 @@ impl Client {
         info!(
             "client connecting to next server {} [{}/{}]",
             server_address,
-            self.server_address_index + 1,
+            server_address_index + 1,
             num_server_addresses
         );
 
@@ -654,6 +688,55 @@ mod tests {
         let connect_token = [0u8; CONNECT_TOKEN_BYTES];
         assert!(client.connect(&connect_token).is_err());
         assert_eq!(client.state(), ClientState::InvalidConnectToken);
+    }
+
+    #[test]
+    fn connect_token_with_no_matching_socket_family_is_invalid() {
+        const PROTOCOL_ID: u64 = 0x1122334455667788;
+
+        let server_address: SocketAddr = "[::1]:40000".parse().unwrap();
+        let private_key = crate::generate_key();
+        let connect_token = crate::generate_connect_token(
+            &[server_address],
+            &[server_address],
+            30,
+            5,
+            0x1234,
+            PROTOCOL_ID,
+            &private_key,
+            &[0; crate::USER_DATA_BYTES],
+        )
+        .unwrap();
+
+        let mut client = Client::new("127.0.0.1:0".parse().unwrap(), 0.0).unwrap();
+        assert!(client.connect(&connect_token).is_err());
+        assert_eq!(client.state(), ClientState::InvalidConnectToken);
+    }
+
+    #[test]
+    fn connect_skips_server_addresses_without_a_matching_socket_family() {
+        const PROTOCOL_ID: u64 = 0x1122334455667788;
+
+        let ipv6_server: SocketAddr = "[::1]:40000".parse().unwrap();
+        let ipv4_server: SocketAddr = "127.0.0.1:40001".parse().unwrap();
+        let private_key = crate::generate_key();
+        let connect_token = crate::generate_connect_token(
+            &[ipv6_server, ipv4_server],
+            &[ipv6_server, ipv4_server],
+            30,
+            5,
+            0x1234,
+            PROTOCOL_ID,
+            &private_key,
+            &[0; crate::USER_DATA_BYTES],
+        )
+        .unwrap();
+
+        let mut client = Client::new("127.0.0.1:0".parse().unwrap(), 0.0).unwrap();
+        client.connect(&connect_token).unwrap();
+
+        assert_eq!(client.state(), ClientState::SendingConnectionRequest);
+        assert_eq!(client.server_address(), Some(ipv4_server));
     }
 
     #[test]

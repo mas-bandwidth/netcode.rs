@@ -92,9 +92,12 @@ struct MemoryNetworkInner {
 }
 
 #[cfg(test)]
+const FIRST_DYNAMIC_PORT: u16 = 49152;
+
+#[cfg(test)]
 impl Default for MemoryNetworkInner {
     fn default() -> Self {
-        Self { next_port: 49152, queues: HashMap::new() }
+        Self { next_port: FIRST_DYNAMIC_PORT, queues: HashMap::new() }
     }
 }
 
@@ -112,9 +115,20 @@ impl MemoryNetwork {
             other => other,
         };
         let port = if address.port() == 0 {
-            let port = inner.next_port;
-            inner.next_port = inner.next_port.wrapping_add(1).max(49152);
-            port
+            let start = inner.next_port;
+            loop {
+                let port = inner.next_port;
+                inner.next_port = if port == u16::MAX {
+                    FIRST_DYNAMIC_PORT
+                } else {
+                    (port + 1).max(FIRST_DYNAMIC_PORT)
+                };
+                let candidate = normalize_address(SocketAddr::new(ip, port));
+                if !inner.queues.contains_key(&candidate) {
+                    break port;
+                }
+                assert_ne!(inner.next_port, start, "no free in-memory ports remain");
+            }
         } else {
             address.port()
         };
@@ -314,6 +328,26 @@ mod tests {
         assert_eq!(&buf[..len], &[1, 2, 3, 4]);
         assert_eq!(from, a_addr);
         assert!(receive_packet(&b, &mut buf).is_none());
+    }
+
+    #[test]
+    fn memory_network_skips_ports_already_bound() {
+        let network = MemoryNetwork::new();
+        // Bind the first port the allocator would otherwise hand out, then ask for an
+        // ephemeral one: it must not alias the fixed socket's address and queue.
+        let fixed = Transport::Memory(network.bind("127.0.0.1:49152".parse().unwrap()));
+        let dynamic = Transport::Memory(network.bind("127.0.0.1:0".parse().unwrap()));
+        let fixed_addr = fixed.local_addr().unwrap();
+        let dynamic_addr = dynamic.local_addr().unwrap();
+        assert_ne!(dynamic_addr, fixed_addr);
+
+        let mut buf = [0u8; 64];
+        dynamic.send_to(b"to fixed", fixed_addr).unwrap();
+        let (len, from) = receive_packet(&fixed, &mut buf).unwrap();
+        assert_eq!(&buf[..len], b"to fixed");
+        assert_eq!(from, dynamic_addr);
+        // the dynamic socket's own queue stayed separate
+        assert!(receive_packet(&dynamic, &mut buf).is_none());
     }
 
     #[test]

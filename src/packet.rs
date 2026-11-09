@@ -375,7 +375,10 @@ pub(crate) fn read_packet_with_min_connect_token_expire_timestamp(
             Packet::Disconnect
         }
 
-        _ => unreachable!(),
+        _ => {
+            debug!("ignored encrypted packet. packet type {packet_type} has no encrypted form");
+            return None;
+        }
     };
 
     Some((packet, sequence))
@@ -698,6 +701,33 @@ mod tests {
                 0,
                 None,
                 AllowedPackets::CLIENT,
+                None,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn encrypted_packet_with_request_type_is_ignored() {
+        let key = generate_key();
+        let sequence: u64 = 1;
+        let prefix_byte = CONNECTION_REQUEST_PACKET | (1 << 4);
+
+        let mut buffer = [0u8; 1 + 1 + MAC_BYTES];
+        buffer[0] = prefix_byte;
+        buffer[1] = sequence as u8;
+        let additional_data = packet_additional_data(TEST_PROTOCOL_ID, prefix_byte);
+        let nonce = crypto::sequence_nonce(sequence);
+        crypto::encrypt_aead(&mut buffer[2..], &additional_data, &nonce, &key).unwrap();
+
+        assert!(
+            read_packet(
+                &mut buffer,
+                Some(&key),
+                TEST_PROTOCOL_ID,
+                0,
+                None,
+                AllowedPackets::SERVER,
                 None,
             )
             .is_none()

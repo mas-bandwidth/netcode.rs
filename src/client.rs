@@ -11,7 +11,7 @@ use crate::packet::{AllowedPackets, Packet};
 use crate::replay::ReplayProtection;
 use crate::token::{self, CHALLENGE_TOKEN_BYTES, ConnectToken};
 use crate::{
-    CONNECT_TOKEN_BYTES, Error, KEY_BYTES, Key, MAX_PACKET_BYTES, MAX_PAYLOAD_BYTES,
+    CONNECT_TOKEN_BYTES, Error, KEY_BYTES, Key, MAX_CLIENTS, MAX_PACKET_BYTES, MAX_PAYLOAD_BYTES,
     NUM_DISCONNECT_PACKETS, PACKET_QUEUE_SIZE, PACKET_SEND_RATE, socket,
 };
 
@@ -568,6 +568,16 @@ impl Client {
                 }
             }
 
+            Packet::KeepAlive { client_index, max_clients }
+                if max_clients == 0
+                    || max_clients as usize > MAX_CLIENTS
+                    || client_index >= max_clients =>
+            {
+                debug!(
+                    "ignored connection keep alive packet. client index or max clients is out of range"
+                );
+            }
+
             Packet::KeepAlive { client_index, max_clients } => match self.state {
                 ClientState::Connected => {
                     debug!("client received connection keep alive packet from server");
@@ -718,7 +728,7 @@ mod tests {
     fn keep_alive_with_client_slot_out_of_range_is_ignored() {
         const PROTOCOL_ID: u64 = 0x1122334455667788;
         const CLIENT_INDEX: usize = 3;
-        const MAX_CLIENTS: u32 = crate::MAX_CLIENTS as u32;
+        const MAX_SLOTS: u32 = MAX_CLIENTS as u32;
 
         let server_address: SocketAddr = "127.0.0.1:40000".parse().unwrap();
         let private_key = crate::generate_key();
@@ -743,7 +753,7 @@ mod tests {
         let key = ConnectToken::read(&connect_token).unwrap().server_to_client_key;
         let mut packet_data = [0u8; MAX_PACKET_BYTES];
 
-        let cases = [(u32::MAX, MAX_CLIENTS), (0, 0), (0, MAX_CLIENTS + 1), (5, 5), (6, 5)];
+        let cases = [(u32::MAX, MAX_SLOTS), (0, 0), (0, MAX_SLOTS + 1), (5, 5), (6, 5)];
         for (sequence, (client_index, max_clients)) in (1u64..).zip(cases) {
             let packet_bytes = crate::packet::write_packet(
                 &Packet::KeepAlive { client_index, max_clients },

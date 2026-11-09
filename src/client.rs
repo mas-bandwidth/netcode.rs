@@ -304,7 +304,9 @@ impl Client {
 
         if let Some(disconnect_state) = self.should_disconnect {
             debug!("client should disconnect -> {disconnect_state}");
-            if self.connect_to_next_server() {
+            // only a client still connecting tries the next server address. a connected
+            // client that receives a disconnect transitions straight to disconnected.
+            if self.state.is_connecting() && self.connect_to_next_server() {
                 return;
             }
             self.disconnect_internal(disconnect_state, false);
@@ -580,6 +582,10 @@ impl Client {
     }
 
     fn process_packet(&mut self, from: SocketAddr, packet_data: &mut [u8], current_timestamp: u64) {
+        if Some(from) != self.server_address {
+            return;
+        }
+
         let Some(connect_token) = self.connect_token.as_ref() else {
             return;
         };
@@ -595,10 +601,6 @@ impl Client {
         ) else {
             return;
         };
-
-        if Some(from) != self.server_address {
-            return;
-        }
 
         match packet {
             Packet::Denied => {
@@ -980,5 +982,62 @@ mod tests {
         server.update_at(time, TEST_TIMESTAMP + 1000);
         assert_eq!(client.state(), ClientState::Connected);
         assert_eq!(server.num_connected_clients(), 1);
+    }
+
+    #[test]
+    fn packets_from_an_unexpected_address_are_ignored() {
+        const PROTOCOL_ID: u64 = 0x1122334455667788;
+        const OTHER_SEQUENCE: u64 = 1000;
+        const SERVER_SEQUENCE: u64 = 1;
+
+        let network = socket::MemoryNetwork::new();
+        let server_address: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        let other_address: SocketAddr = "127.0.0.1:40001".parse().unwrap();
+        let private_key = crypto::generate_key();
+        let connect_token = generate_connect_token_at(
+            &[server_address],
+            &[server_address],
+            TEST_TIMESTAMP,
+            30,
+            5,
+            0x1234,
+            PROTOCOL_ID,
+            &private_key,
+            &[0; USER_DATA_BYTES],
+        )
+        .unwrap();
+
+        let mut client = Client::new_in_memory(&network, "127.0.0.1:0".parse().unwrap(), 0.0);
+        client.connect(&connect_token).unwrap();
+        client.state = ClientState::Connected;
+
+        let key = ConnectToken::read(&connect_token).unwrap().server_to_client_key;
+        let mut packet_data = [0u8; MAX_PACKET_BYTES];
+
+        let packet_bytes = crate::packet::write_packet(
+            &Packet::Payload(vec![1, 2, 3]),
+            &mut packet_data,
+            OTHER_SEQUENCE,
+            &key,
+            PROTOCOL_ID,
+        )
+        .unwrap();
+        client.process_packet(other_address, &mut packet_data[..packet_bytes], TEST_TIMESTAMP);
+        assert!(
+            !client.replay_protection.already_received(OTHER_SEQUENCE),
+            "a packet from an address other than the server address advanced replay protection"
+        );
+        assert!(client.receive_packet().is_none());
+
+        let packet_bytes = crate::packet::write_packet(
+            &Packet::Payload(vec![4, 5, 6]),
+            &mut packet_data,
+            SERVER_SEQUENCE,
+            &key,
+            PROTOCOL_ID,
+        )
+        .unwrap();
+        client.process_packet(server_address, &mut packet_data[..packet_bytes], TEST_TIMESTAMP);
+        assert_eq!(client.receive_packet(), Some((vec![4, 5, 6], SERVER_SEQUENCE)));
     }
 }

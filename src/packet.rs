@@ -685,6 +685,60 @@ mod tests {
     }
 
     #[test]
+    fn connection_request_rejects_token_expiring_at_server_start_floor() {
+        let private_key = generate_key();
+        let current_timestamp: u64 = 1000;
+        let expire_timestamp = current_timestamp + 30;
+
+        let mut nonce = [0u8; CONNECT_TOKEN_NONCE_BYTES];
+        crypto::random_bytes(&mut nonce);
+
+        let private_token = crate::token::PrivateConnectToken::generate(
+            0x1234,
+            10,
+            &["127.0.0.1:40000".parse().unwrap()],
+            &[0u8; crate::USER_DATA_BYTES],
+        );
+        let mut private_data = Box::new([0u8; CONNECT_TOKEN_PRIVATE_BYTES]);
+        private_token.write(&mut private_data);
+        crate::token::encrypt_connect_token_private(
+            &mut private_data,
+            TEST_PROTOCOL_ID,
+            expire_timestamp,
+            &nonce,
+            &private_key,
+        )
+        .unwrap();
+
+        let input = Packet::Request {
+            protocol_id: TEST_PROTOCOL_ID,
+            expire_timestamp,
+            nonce,
+            private_data,
+        };
+        let key = generate_key();
+        let mut buffer = [0u8; MAX_PACKET_BYTES];
+        let written = write_packet(&input, &mut buffer, 0, &key, TEST_PROTOCOL_ID).unwrap();
+
+        // the floor is the start time plus the maximum token lifetime: a token expiring
+        // exactly at the floor is refused, one expiring a second after it is accepted
+        for (floor, accepted) in [(expire_timestamp, false), (expire_timestamp - 1, true)] {
+            let mut copy = buffer;
+            let read = read_packet_with_min_connect_token_expire_timestamp(
+                &mut copy[..written],
+                None,
+                TEST_PROTOCOL_ID,
+                current_timestamp,
+                Some(&private_key),
+                AllowedPackets::SERVER,
+                None,
+                floor,
+            );
+            assert_eq!(read.is_some(), accepted, "floor {floor}, expire {expire_timestamp}");
+        }
+    }
+
+    #[test]
     fn client_rejects_request_and_response_packets() {
         let key = generate_key();
         let mut challenge_token_data = [0u8; CHALLENGE_TOKEN_BYTES];

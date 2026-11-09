@@ -686,11 +686,19 @@ impl Server {
     }
 
     fn receive_packets(&mut self) {
+        self.receive_packets_with(|server, buffer| socket::receive_packet(&server.socket, buffer));
+    }
+
+    /// One receive drain: reads and processes packets until `receive` reports the
+    /// receive queue is empty. Parameterised over the receive call so the drain can be
+    /// exercised without a live socket.
+    fn receive_packets_with(
+        &mut self,
+        mut receive: impl FnMut(&Self, &mut [u8]) -> Option<(usize, SocketAddr)>,
+    ) {
         let current_timestamp = token::unix_timestamp();
         let mut packet_data = [0u8; MAX_PACKET_BYTES];
-        while let Some((packet_bytes, from)) =
-            socket::receive_packet(&self.socket, &mut packet_data)
-        {
+        while let Some((packet_bytes, from)) = receive(self, &mut packet_data) {
             self.read_and_process_packet(from, &mut packet_data[..packet_bytes], current_timestamp);
         }
     }
@@ -1166,6 +1174,7 @@ impl Drop for Server {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
     use std::time::Duration;
 
     use super::*;
@@ -1398,6 +1407,66 @@ mod tests {
         }
 
         panic!("the server never replied to the connection request");
+    }
+
+    /// Zero-length datagrams are valid UDP. One receive drain must read past any number
+    /// of them and process the connection request queued behind them, rather than
+    /// treating the first empty datagram as the end of the receive queue.
+    #[test]
+    fn one_receive_drain_processes_a_request_behind_empty_datagrams() {
+        const EMPTY_DATAGRAMS: usize = 64;
+
+        let private_key = crypto::generate_key();
+        let mut server = Server::new(test_address(0), TEST_PROTOCOL_ID, &private_key, 0.0).unwrap();
+        server.start(1).unwrap();
+
+        let connect_token = generate_connect_token(
+            &[server.address()],
+            &[server.address()],
+            TEST_TOKEN_EXPIRY,
+            TEST_TOKEN_TIMEOUT,
+            0x1234,
+            TEST_PROTOCOL_ID,
+            &private_key,
+            &[0; USER_DATA_BYTES],
+        )
+        .unwrap();
+        let token = ConnectToken::read(&connect_token).unwrap();
+        let request = Packet::Request {
+            protocol_id: token.protocol_id,
+            expire_timestamp: token.expire_timestamp,
+            nonce: token.nonce,
+            private_data: token.private_data.clone(),
+        };
+        let mut request_data = [0u8; MAX_PACKET_BYTES];
+        let request_bytes =
+            write_packet(&request, &mut request_data, 0, &[0; KEY_BYTES], token.protocol_id)
+                .unwrap();
+
+        // the receive queue: EMPTY_DATAGRAMS empty datagrams, then the request, then nothing
+        let client_address = test_address(40000);
+        let mut queue: Vec<Option<usize>> = vec![Some(0); EMPTY_DATAGRAMS];
+        queue.push(Some(request_bytes));
+        queue.push(None);
+        let mut queue = queue.into_iter();
+
+        server.receive_packets_with(|_, buffer| {
+            socket::receive_packet_with(buffer, |buffer| match queue.next() {
+                Some(Some(bytes)) => {
+                    buffer[..bytes].copy_from_slice(&request_data[..bytes]);
+                    Ok((bytes, client_address))
+                }
+                Some(None) => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+                None => panic!("read past the end of the receive queue"),
+            })
+        });
+
+        assert!(queue.next().is_none(), "one receive drain did not reach the end of the queue");
+        let time = server.time;
+        assert!(
+            server.encryption_manager.find_encryption_mapping(client_address, time).is_some(),
+            "the connection request behind the empty datagrams was not processed"
+        );
     }
 
     /// A server that is stopped and started again must not go back to stamping its

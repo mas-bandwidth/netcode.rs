@@ -97,41 +97,43 @@ fn client_connects_to_server() {
 
 #[test]
 fn server_skips_empty_datagrams_before_connection_request() {
-    let mut harness = Harness::new(1);
-
-    let mut client = Client::new("127.0.0.1:0".parse().unwrap(), harness.time).unwrap();
-    let connect_token = harness.generate_connect_token(0x1234);
-    client.connect(&connect_token).unwrap();
-    harness.clients.push(client);
-
     // Zero-length datagrams are valid UDP, so a burst of them can arrive ahead of a
-    // connection request. A burst goes out before every tick, so each request the
-    // client sends is queued behind EMPTY_PER_TICK of them. The server must read past
-    // all of them within one update: a server that read one per update would need more
-    // than MAX_TICKS updates to reach even the first request. UDP may drop any packet,
-    // and the client resends its request several times within MAX_TICKS, so the test
-    // only requires that some request is answered, not the first.
-    const EMPTY_PER_TICK: usize = 64;
-    const MAX_TICKS: usize = 50;
-    let noise = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    let answered = |state: ClientState| {
-        state == ClientState::SendingConnectionResponse || state == ClientState::Connected
-    };
+    // connection request. Each trial uses a fresh server whose receive queue holds
+    // EMPTY_DATAGRAMS empty datagrams and then one connection request, and gives the
+    // server exactly ONE update before checking whether the client was answered. A
+    // server that stops reading at an empty datagram, or reads only part of the queue
+    // per update, never answers within its single update. UDP may drop any packet, so
+    // the test requires one answered trial, not every trial.
+    const EMPTY_DATAGRAMS: usize = 64;
+    const TRIALS: usize = 10;
 
-    for _ in 0..MAX_TICKS {
-        if answered(harness.clients[0].state()) {
-            break;
-        }
-        for _ in 0..EMPTY_PER_TICK {
+    let mut answered_trials = 0;
+    for _ in 0..TRIALS {
+        let mut harness = Harness::new(1);
+        harness.connect_client(0x1234);
+
+        let noise = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        for _ in 0..EMPTY_DATAGRAMS {
             noise.send_to(&[], harness.server.address()).unwrap();
         }
-        harness.update();
+
+        // the client sends its connection request on its first update
+        harness.clients[0].update(harness.time);
+        assert_eq!(harness.clients[0].state(), ClientState::SendingConnectionRequest);
+
+        harness.server.update(harness.time);
+
+        // the challenge, if the server sent one, is read on the client's next update
+        std::thread::sleep(Duration::from_millis(1));
+        harness.clients[0].update(harness.time);
+        if harness.clients[0].state() == ClientState::SendingConnectionResponse {
+            answered_trials += 1;
+        }
     }
 
     assert!(
-        answered(harness.clients[0].state()),
-        "connection request was never answered: client state is {}",
-        harness.clients[0].state()
+        answered_trials > 0,
+        "no connection request was answered in one server update in any of {TRIALS} trials"
     );
 }
 

@@ -75,7 +75,7 @@ pub(crate) fn receive_packet(socket: &UdpSocket, buffer: &mut [u8]) -> Option<(u
 /// Receive loop, parameterised over the actual receive call so the queue
 /// handling can be exercised without a live socket. Empty datagrams are legal
 /// and are skipped; only a would-block ends the receive queue for this call.
-fn receive_packet_with(
+pub(crate) fn receive_packet_with(
     buffer: &mut [u8],
     mut recv_from: impl FnMut(&mut [u8]) -> io::Result<(usize, SocketAddr)>,
 ) -> Option<(usize, SocketAddr)> {

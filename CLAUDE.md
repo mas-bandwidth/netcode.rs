@@ -63,8 +63,10 @@ cargo clippy --all-targets -- -D warnings
 cargo doc --no-deps                          # CI builds docs with -D warnings
 ```
 
-MSRV is 1.85 (`rust-version` in Cargo.toml); CI checks it with `cargo check` on that
-toolchain.
+MSRV is 1.87 (`rust-version` in Cargo.toml); CI checks it with `cargo check` on that
+toolchain. 1.87 is the lowest version on which the dependency tree resolves without the
+open advisory RUSTSEC-2026-0385: the resolver honours `rust-version`, and every fixed
+`ctutils` (>= 0.4.4, via chacha20poly1305 -> poly1305 -> universal-hash) needs 1.87.
 
 Interop tests, against the C reference built from mas-bandwidth/netcode with CMake:
 

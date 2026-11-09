@@ -159,7 +159,7 @@ cargo clippy --all-targets -- -D warnings    # lints
 cargo +nightly fuzz run fuzz_read_packet     # coverage-guided fuzzing (cargo install cargo-fuzz)
 ```
 
-CI runs the test suite on Linux, macOS and Windows (stable and beta Rust), checks formatting, clippy, rustdoc, the minimum supported Rust version (1.85), dependency licenses and security advisories with cargo-deny, live interoperability against the reference C implementation, and smoke-fuzzes the untrusted input surface with the harnesses in `fuzz/`.
+CI runs the test suite on Linux, macOS and Windows (stable and beta Rust), checks formatting, clippy, rustdoc, the minimum supported Rust version (1.87), dependency licenses and security advisories with cargo-deny, live interoperability against the reference C implementation, and smoke-fuzzes the untrusted input surface with the harnesses in `fuzz/`.
 
 To run the interoperability tests locally, build the [reference C implementation](https://github.com/mas-bandwidth/netcode) and point the tests at its example binaries:
 

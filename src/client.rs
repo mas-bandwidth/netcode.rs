@@ -104,6 +104,7 @@ pub struct Client {
     connect_start_time: f64,
     last_packet_send_time: f64,
     last_packet_receive_time: f64,
+    initial_timestamps_set: bool,
     should_disconnect: Option<ClientState>,
     sequence: u64,
     client_index: usize,
@@ -167,6 +168,7 @@ impl Client {
             connect_start_time: 0.0,
             last_packet_send_time: -1000.0,
             last_packet_receive_time: -1000.0,
+            initial_timestamps_set: true,
             should_disconnect: None,
             sequence: 0,
             client_index: 0,
@@ -234,6 +236,12 @@ impl Client {
     /// queued packets and keep-alives, and applies timeouts.
     pub fn update(&mut self, time: f64) {
         self.time = time;
+
+        if !self.initial_timestamps_set {
+            self.connect_start_time = time;
+            self.last_packet_receive_time = time;
+            self.initial_timestamps_set = true;
+        }
 
         self.receive_packets();
         self.send_packets();
@@ -362,6 +370,7 @@ impl Client {
         self.connect_start_time = self.time;
         self.last_packet_send_time = self.time - 1.0;
         self.last_packet_receive_time = self.time;
+        self.initial_timestamps_set = false;
         self.should_disconnect = None;
         self.challenge_token_sequence = 0;
         self.challenge_token_data = [0; CHALLENGE_TOKEN_BYTES];
@@ -657,6 +666,32 @@ mod tests {
         let connect_token = [0u8; CONNECT_TOKEN_BYTES];
         assert!(client.connect(&connect_token).is_err());
         assert_eq!(client.state(), ClientState::InvalidConnectToken);
+    }
+
+    #[test]
+    fn connect_before_first_update_does_not_expire_the_token() {
+        const PROTOCOL_ID: u64 = 0x1122334455667788;
+
+        let server_address: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        let token = ConnectToken {
+            protocol_id: PROTOCOL_ID,
+            create_timestamp: 1000,
+            expire_timestamp: 1030,
+            nonce: [0; crate::token::CONNECT_TOKEN_NONCE_BYTES],
+            private_data: Box::new([0; crate::token::CONNECT_TOKEN_PRIVATE_BYTES]),
+            timeout_seconds: 5,
+            server_addresses: vec![server_address],
+            client_to_server_key: [0; KEY_BYTES],
+            server_to_client_key: [0; KEY_BYTES],
+        };
+        let mut connect_token = [0u8; CONNECT_TOKEN_BYTES];
+        token.write(&mut connect_token);
+
+        let mut client = Client::create(None, None, true, 0.0).unwrap();
+        client.connect(&connect_token).unwrap();
+        client.update(100.0);
+
+        assert_eq!(client.state(), ClientState::SendingConnectionRequest);
     }
 
     #[test]

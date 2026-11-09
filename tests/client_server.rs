@@ -155,6 +155,59 @@ fn server_side_disconnect() {
 }
 
 #[test]
+fn server_disconnect_does_not_advance_to_next_server() {
+    let mut harness = Harness::new(1);
+    let private_key = harness.private_key;
+
+    let mut next_server =
+        Server::new("127.0.0.1:0".parse().unwrap(), PROTOCOL_ID, &private_key, 0.0).unwrap();
+    next_server.start(1).unwrap();
+
+    let connect_token = netcode::generate_connect_token(
+        &[harness.server.address(), next_server.address()],
+        &[harness.server.address(), next_server.address()],
+        CONNECT_TOKEN_EXPIRY,
+        CONNECT_TOKEN_TIMEOUT,
+        0x1234,
+        PROTOCOL_ID,
+        &private_key,
+        &[0u8; netcode::USER_DATA_BYTES],
+    )
+    .unwrap();
+
+    let mut client = Client::new("127.0.0.1:0".parse().unwrap(), harness.time).unwrap();
+    client.connect(&connect_token).unwrap();
+    harness.clients.push(client);
+
+    harness.run_until(1000, |h| h.clients[0].state() == ClientState::Connected);
+    assert_eq!(harness.clients[0].server_address(), Some(harness.server.address()));
+
+    harness.server.disconnect_client(0);
+
+    // a connected client that receives a server disconnect must stop, not move on
+    // to the next server address in the connect token.
+    let mut reached_disconnected = false;
+    for _ in 0..1000 {
+        harness.update();
+        next_server.update(harness.time);
+        let state = harness.clients[0].state();
+        if state == ClientState::Disconnected {
+            reached_disconnected = true;
+            break;
+        }
+        assert_eq!(
+            state,
+            ClientState::Connected,
+            "connected client advanced to another server after a server disconnect"
+        );
+    }
+
+    assert!(reached_disconnected, "client did not transition to disconnected");
+    assert_eq!(harness.clients[0].server_address(), None);
+    assert_eq!(next_server.num_connected_clients(), 0);
+}
+
+#[test]
 fn server_full_denies_next_client() {
     let mut harness = Harness::new(1);
     harness.connect_client(1);

@@ -96,6 +96,36 @@ fn client_connects_to_server() {
 }
 
 #[test]
+fn server_skips_empty_datagrams_before_connection_request() {
+    let mut harness = Harness::new(1);
+
+    let mut client = Client::new("127.0.0.1:0".parse().unwrap(), harness.time).unwrap();
+    let connect_token = harness.generate_connect_token(0x1234);
+    client.connect(&connect_token).unwrap();
+    harness.clients.push(client);
+
+    // Zero-length datagrams are valid UDP, so a burst of them can arrive ahead of a
+    // connection request. They must not stop the server from reading that request in
+    // the same tick.
+    let noise = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    for _ in 0..8 {
+        noise.send_to(&[], harness.server.address()).unwrap();
+    }
+
+    // Let the client emit its connection request behind the empty datagrams.
+    harness.clients[0].update(harness.time);
+
+    // One server tick must consume the empty datagrams and answer the request.
+    harness.server.update(harness.time);
+
+    // Read the challenge so the client records that the request was processed.
+    harness.time += DELTA_TIME;
+    harness.clients[0].update(harness.time);
+
+    assert_eq!(harness.clients[0].state(), ClientState::SendingConnectionResponse);
+}
+
+#[test]
 fn client_and_server_exchange_payload_packets() {
     let mut harness = Harness::new(1);
     harness.connect_client(0x1234);

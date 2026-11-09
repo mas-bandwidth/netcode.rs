@@ -63,22 +63,40 @@ pub(crate) fn create_socket(address: SocketAddr) -> io::Result<UdpSocket> {
     Ok(socket.into())
 }
 
+/// Consecutive receive errors skipped before giving up for this call. Bounds the
+/// work done when the socket reports an error that does not clear on its own.
+const MAX_RECEIVE_ERRORS: usize = 16;
+
 /// Receives one packet if available. Returns `None` when the socket would block.
 pub(crate) fn receive_packet(socket: &UdpSocket, buffer: &mut [u8]) -> Option<(usize, SocketAddr)> {
+    receive_packet_with(buffer, |buffer| socket.recv_from(buffer))
+}
+
+/// Receive loop, parameterised over the actual receive call so the queue
+/// handling can be exercised without a live socket. Empty datagrams are legal
+/// and are skipped; only a would-block ends the receive queue for this call.
+fn receive_packet_with(
+    buffer: &mut [u8],
+    mut recv_from: impl FnMut(&mut [u8]) -> io::Result<(usize, SocketAddr)>,
+) -> Option<(usize, SocketAddr)> {
+    let mut errors = 0;
     loop {
-        match socket.recv_from(buffer) {
-            Ok((0, _)) => return None,
+        match recv_from(buffer) {
+            Ok((0, _)) => continue,
             Ok((packet_bytes, from)) => return Some((packet_bytes, normalize_address(from))),
             Err(error) => match error.kind() {
                 io::ErrorKind::WouldBlock => return None,
                 // ICMP port unreachable surfaces as a connection error on some
                 // platforms; skip it and keep reading
-                io::ErrorKind::ConnectionRefused | io::ErrorKind::ConnectionReset => continue,
+                io::ErrorKind::ConnectionRefused | io::ErrorKind::ConnectionReset => errors += 1,
                 _ => {
                     error!("recvfrom failed: {error}");
-                    return None;
+                    errors += 1;
                 }
             },
+        }
+        if errors >= MAX_RECEIVE_ERRORS {
+            return None;
         }
     }
 }
@@ -155,5 +173,45 @@ mod tests {
             "attempted a size below the floor: {attempts:?}"
         );
         assert_eq!(*attempts.last().unwrap(), SOCKET_BUFFER_MIN_SIZE);
+    }
+
+    #[test]
+    fn empty_datagrams_are_skipped_not_treated_as_drained() {
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let mut results = vec![Ok((0, addr)), Ok((0, addr)), Ok((5, addr))].into_iter();
+        let mut buffer = [0u8; 64];
+
+        let received = receive_packet_with(&mut buffer, |_| results.next().unwrap());
+
+        assert_eq!(received, Some((5, addr)));
+        assert!(results.next().is_none(), "the packet after the empty datagrams was not read");
+    }
+
+    #[test]
+    fn would_block_is_the_end_of_the_receive_queue() {
+        let mut attempts = 0;
+        let mut buffer = [0u8; 64];
+
+        let received = receive_packet_with(&mut buffer, |_| {
+            attempts += 1;
+            Err(io::Error::from(io::ErrorKind::WouldBlock))
+        });
+
+        assert!(received.is_none());
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn receive_errors_are_bounded_per_call() {
+        let mut attempts = 0;
+        let mut buffer = [0u8; 64];
+
+        let received = receive_packet_with(&mut buffer, |_| {
+            attempts += 1;
+            Err(io::Error::from(io::ErrorKind::Other))
+        });
+
+        assert!(received.is_none());
+        assert_eq!(attempts, MAX_RECEIVE_ERRORS);
     }
 }

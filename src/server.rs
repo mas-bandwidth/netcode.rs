@@ -526,6 +526,8 @@ impl Server {
 
     /// Advances the server to the current time: receives and processes packets, sends
     /// keep-alives, and times out unresponsive clients.
+    ///
+    /// `time` must be monotonically non-decreasing across calls.
     pub fn update(&mut self, time: f64) {
         self.time = time;
         self.receive_packets();

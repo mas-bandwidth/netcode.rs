@@ -574,6 +574,15 @@ impl Client {
     }
 
     fn process_packet(&mut self, from: SocketAddr, packet_data: &mut [u8]) {
+        if !matches!(
+            self.state,
+            ClientState::SendingConnectionRequest
+                | ClientState::SendingConnectionResponse
+                | ClientState::Connected
+        ) {
+            return;
+        }
+
         if Some(from) != self.server_address {
             return;
         }
@@ -778,7 +787,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut client = Client::new("127.0.0.1:0".parse().unwrap(), 0.0).unwrap();
+        let mut client = Client::create(None, None, true, 0.0).unwrap();
         assert_eq!(client.state(), ClientState::Disconnected);
 
         let key = ConnectToken::read(&connect_token).unwrap().server_to_client_key;
@@ -811,5 +820,54 @@ mod tests {
             client.receive_packet().is_none(),
             "a datagram queued before connecting was processed after connecting"
         );
+    }
+
+    #[test]
+    fn datagrams_received_outside_a_connection_are_ignored() {
+        const PROTOCOL_ID: u64 = 0x1122334455667788;
+        const SERVER_SEQUENCE: u64 = 1;
+
+        let server_address: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        let private_key = crate::generate_key();
+        let connect_token = crate::generate_connect_token(
+            &[server_address],
+            &[server_address],
+            30,
+            5,
+            0x1234,
+            PROTOCOL_ID,
+            &private_key,
+            &[0; crate::USER_DATA_BYTES],
+        )
+        .unwrap();
+
+        let mut client = Client::create(None, None, true, 0.0).unwrap();
+        client.connect(&connect_token).unwrap();
+        client.state = ClientState::Disconnected;
+
+        let key = ConnectToken::read(&connect_token).unwrap().server_to_client_key;
+        let mut packet_data = [0u8; MAX_PACKET_BYTES];
+        let packet_bytes = crate::packet::write_packet(
+            &Packet::Payload(vec![7, 8, 9]),
+            &mut packet_data,
+            SERVER_SEQUENCE,
+            &key,
+            PROTOCOL_ID,
+        )
+        .unwrap();
+        client.receive_packet_override =
+            Some(VecDeque::from([(packet_data[..packet_bytes].to_vec(), server_address)]));
+
+        client.update(1.0);
+
+        assert!(
+            client.receive_packet_override.as_ref().unwrap().is_empty(),
+            "update outside a connection left datagrams queued"
+        );
+        assert!(
+            !client.replay_protection.already_received(SERVER_SEQUENCE),
+            "a datagram received outside a connection advanced replay protection"
+        );
+        assert!(client.receive_packet().is_none());
     }
 }

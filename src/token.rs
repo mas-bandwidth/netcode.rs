@@ -549,10 +549,7 @@ mod tests {
             "protocol_id",
             "never reusable",
         ] {
-            assert!(
-                docs.contains(phrase),
-                "generate_connect_token docs are missing {phrase:?}"
-            );
+            assert!(docs.contains(phrase), "generate_connect_token docs are missing {phrase:?}");
         }
     }
 

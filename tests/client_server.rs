@@ -100,13 +100,26 @@ fn connect_token_expires_while_advancing_through_servers() {
 
     let mut client = Client::new("127.0.0.1:0".parse().unwrap(), 0.0).unwrap();
     client.connect(&connect_token).unwrap();
+    assert_eq!(client.server_address(), Some(addresses[0]));
 
     let mut time = 0.0;
-    for _ in 0..=410 {
+    while time < 3.5 {
         client.update(time);
         time += DELTA_TIME;
     }
 
+    // The first request timed out and the client moved to the second address, but the
+    // token has not expired yet.
+    assert_eq!(client.server_address(), Some(addresses[1]));
+    assert_eq!(client.state(), ClientState::SendingConnectionRequest);
+
+    while time <= 4.1 {
+        client.update(time);
+        time += DELTA_TIME;
+    }
+
+    // The lifetime runs from the original connect call, so expiry beats the second
+    // request timeout that would otherwise fire at 6s.
     assert_eq!(client.state(), ClientState::ConnectTokenExpired);
 
     drop(dead_server_1);

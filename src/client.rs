@@ -647,6 +647,44 @@ mod tests {
     }
 
     #[test]
+    fn connect_token_expires_across_server_failover() {
+        let dead_server_1: SocketAddr = "127.0.0.1:40001".parse().unwrap();
+        let dead_server_2: SocketAddr = "127.0.0.1:40002".parse().unwrap();
+        let connect_token = crate::generate_connect_token(
+            &[dead_server_1, dead_server_2],
+            &[dead_server_1, dead_server_2],
+            4,
+            3,
+            1,
+            0x1122334455667788,
+            &crate::generate_key(),
+            &[0u8; crate::USER_DATA_BYTES],
+        )
+        .unwrap();
+
+        let mut client = Client::create(None, None, true, 0.0).unwrap();
+        client.connect(&connect_token).unwrap();
+        assert_eq!(client.server_address(), Some(dead_server_1));
+
+        let mut time = 0.0;
+        while time < 3.5 {
+            client.update(time);
+            time += 0.01;
+        }
+        assert_eq!(client.server_address(), Some(dead_server_2));
+        assert_eq!(client.state(), ClientState::SendingConnectionRequest);
+
+        while time < 4.0 {
+            client.update(time);
+            time += 0.01;
+        }
+        assert_eq!(client.state(), ClientState::SendingConnectionRequest);
+
+        client.update(4.0);
+        assert_eq!(client.state(), ClientState::ConnectTokenExpired);
+    }
+
+    #[test]
     fn invalid_connect_token() {
         let mut client = Client::new("127.0.0.1:0".parse().unwrap(), 0.0).unwrap();
         let connect_token = [0u8; CONNECT_TOKEN_BYTES];

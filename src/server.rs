@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use log::{debug, error, info};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::packet::{AllowedPackets, Packet};
 use crate::replay::ReplayProtection;
@@ -100,6 +101,15 @@ impl EncryptionEntry {
     }
 }
 
+impl Drop for EncryptionEntry {
+    fn drop(&mut self) {
+        self.send_key.zeroize();
+        self.receive_key.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for EncryptionEntry {}
+
 struct EncryptionManager {
     entries: Vec<EncryptionEntry>,
     /// One past the highest slot ever used, so lookups scan only the live prefix.
@@ -182,7 +192,7 @@ impl EncryptionManager {
                     if !entry.expired(time) || entry.client_index.is_some() {
                         break;
                     }
-                    self.entries[last - 1].address = None;
+                    self.entries[last - 1] = EncryptionEntry::new();
                     last -= 1;
                 }
                 self.num_entries = last;
@@ -192,6 +202,16 @@ impl EncryptionManager {
         }
 
         false
+    }
+
+    /// Frees expired mappings, wiping their keys. A mapping owned by a connected
+    /// client is kept: it goes only when that client disconnects.
+    fn remove_expired_mappings(&mut self, time: f64) {
+        for entry in &mut self.entries[..self.num_entries] {
+            if entry.client_index.is_none() && entry.expired(time) {
+                *entry = EncryptionEntry::new();
+            }
+        }
     }
 
     fn find_encryption_mapping(&mut self, address: SocketAddr, time: f64) -> Option<usize> {
@@ -225,12 +245,12 @@ impl EncryptionManager {
         self.entries[index].connect_token_entry_index
     }
 
-    fn send_key(&self, index: usize) -> Key {
-        self.entries[index].send_key
+    fn send_key(&self, index: usize) -> &Key {
+        &self.entries[index].send_key
     }
 
-    fn receive_key(&self, index: usize) -> Key {
-        self.entries[index].receive_key
+    fn receive_key(&self, index: usize) -> &Key {
+        &self.entries[index].receive_key
     }
 
     fn timeout(&self, index: usize) -> i32 {
@@ -785,17 +805,16 @@ impl Server {
         }
 
         let protocol_id = self.protocol_id;
-        let private_key = self.private_key;
         let replay_protection =
             client_index.map(|client_index| &mut self.clients[client_index].replay_protection);
 
         let Some((packet, sequence)) =
             crate::packet::read_packet_with_min_connect_token_expire_timestamp(
                 packet_data,
-                read_packet_key.as_ref(),
+                read_packet_key,
                 protocol_id,
                 current_timestamp,
-                Some(&private_key),
+                Some(&self.private_key),
                 AllowedPackets::SERVER,
                 replay_protection,
                 self.min_connect_token_expire_timestamp,
@@ -824,7 +843,7 @@ impl Server {
         current_timestamp: u64,
     ) {
         match packet {
-            Packet::Request { expire_timestamp, private_data, .. } => {
+            Packet::Request { expire_timestamp, mut private_data, .. } => {
                 debug!("server received connection request from {from}");
                 self.process_connection_request(
                     from,
@@ -832,6 +851,7 @@ impl Server {
                     expire_timestamp,
                     current_timestamp,
                 );
+                private_data.zeroize();
             }
 
             Packet::Response { challenge_token_sequence, challenge_token_data } => {
@@ -1037,8 +1057,9 @@ impl Server {
 
         if self.num_connected_clients == self.max_clients {
             debug!("server denied connection response. server is full");
-            let send_key = self.encryption_manager.send_key(encryption_index);
+            let mut send_key = *self.encryption_manager.send_key(encryption_index);
             self.send_global_packet(&Packet::Denied, from, &send_key);
+            send_key.zeroize();
             return;
         }
 
@@ -1171,7 +1192,7 @@ impl Server {
             packet,
             &mut packet_data,
             self.clients[client_index].sequence,
-            &packet_key,
+            packet_key,
             self.protocol_id,
         ) else {
             return;
@@ -1218,12 +1239,16 @@ impl Server {
                 self.disconnect_client_internal(client_index, false, DisconnectReason::TimedOut);
             }
         }
+
+        self.encryption_manager.remove_expired_mappings(self.time);
     }
 }
 
 impl Drop for Server {
     fn drop(&mut self) {
         self.stop();
+        self.private_key.zeroize();
+        self.challenge_key.zeroize();
     }
 }
 
@@ -1340,8 +1365,8 @@ mod tests {
 
         for port in 0..5u16 {
             let index = manager.find_encryption_mapping(test_address(40000 + port), time).unwrap();
-            assert_eq!(manager.send_key(index), send_key);
-            assert_eq!(manager.receive_key(index), receive_key);
+            assert_eq!(*manager.send_key(index), send_key);
+            assert_eq!(*manager.receive_key(index), receive_key);
         }
         assert!(manager.find_encryption_mapping(test_address(50000), time).is_none());
 
@@ -1371,6 +1396,98 @@ mod tests {
         ));
         assert!(manager.find_encryption_mapping(test_address(40000), 104.0).is_some());
         assert!(manager.find_encryption_mapping(test_address(40000), 106.0).is_none());
+    }
+
+    fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+
+    #[test]
+    fn encryption_entry_keys_are_zeroed_on_drop_and_reset() {
+        // reset replaces every entry, which drops the old ones
+        assert_zeroize_on_drop::<EncryptionEntry>();
+    }
+
+    #[test]
+    fn encryption_manager_zeroes_keys_when_shrinking_past_expired_entries() {
+        let mut manager = EncryptionManager::new();
+        let send_key = crypto::generate_key();
+        let receive_key = crypto::generate_key();
+
+        // entry 0 times out after 5 seconds, entry 1 after 100
+        assert!(manager.add_encryption_mapping(
+            test_address(40000),
+            &send_key,
+            &receive_key,
+            1000.0,
+            -1.0,
+            5,
+            0,
+        ));
+        assert!(manager.add_encryption_mapping(
+            test_address(40001),
+            &send_key,
+            &receive_key,
+            1000.0,
+            -1.0,
+            100,
+            1,
+        ));
+
+        // removing the last entry frees the expired entry before it as well
+        assert!(manager.remove_encryption_mapping(test_address(40001), 1010.0));
+        assert_eq!(manager.num_entries, 0);
+        assert_eq!(manager.entries[0].send_key, [0; KEY_BYTES]);
+        assert_eq!(manager.entries[0].receive_key, [0; KEY_BYTES]);
+        assert_eq!(manager.entries[1].send_key, [0; KEY_BYTES]);
+        assert_eq!(manager.entries[1].receive_key, [0; KEY_BYTES]);
+    }
+
+    #[test]
+    fn encryption_manager_zeroes_keys_of_expired_mappings() {
+        let mut manager = EncryptionManager::new();
+        let send_key = crypto::generate_key();
+        let receive_key = crypto::generate_key();
+
+        assert!(manager.add_encryption_mapping(
+            test_address(40000),
+            &send_key,
+            &receive_key,
+            1000.0,
+            1005.0,
+            5,
+            0,
+        ));
+
+        manager.remove_expired_mappings(1004.0);
+        assert_eq!(*manager.send_key(0), send_key);
+        assert_eq!(*manager.receive_key(0), receive_key);
+
+        manager.remove_expired_mappings(1010.0);
+        assert_eq!(manager.entries[0].address, None);
+        assert_eq!(*manager.send_key(0), [0; KEY_BYTES]);
+        assert_eq!(*manager.receive_key(0), [0; KEY_BYTES]);
+    }
+
+    #[test]
+    fn encryption_manager_keeps_keys_of_connected_client_past_timeout() {
+        let mut manager = EncryptionManager::new();
+        let send_key = crypto::generate_key();
+        let receive_key = crypto::generate_key();
+
+        assert!(manager.add_encryption_mapping(
+            test_address(40000),
+            &send_key,
+            &receive_key,
+            1000.0,
+            1005.0,
+            5,
+            0,
+        ));
+        manager.set_client_index(0, Some(0));
+
+        manager.remove_expired_mappings(1010.0);
+        assert_eq!(manager.entries[0].address, Some(test_address(40000)));
+        assert_eq!(*manager.send_key(0), send_key);
+        assert_eq!(*manager.receive_key(0), receive_key);
     }
 
     #[test]
@@ -1593,9 +1710,18 @@ mod tests {
     fn restarted_server_keeps_global_packets_out_of_the_client_sequence_range() {
         let network = socket::MemoryNetwork::new();
         let private_key = crypto::generate_key();
-        let mut server =
-            Server::new_in_memory(&network, test_address(0), TEST_PROTOCOL_ID, &private_key, 0.0)
-                .unwrap();
+        // the start floor is the start time plus this lifetime, one second under the
+        // lifetime of the tokens minted below, so a token from the same second expires
+        // strictly above the floor
+        let mut server = Server::new_in_memory_with_config(
+            &network,
+            test_address(0),
+            TEST_PROTOCOL_ID,
+            &private_key,
+            ServerConfig { max_connect_token_lifetime: TEST_TOKEN_EXPIRY - 1 },
+            0.0,
+        )
+        .unwrap();
         server.start_at(1, TEST_TIMESTAMP).unwrap();
 
         let connect_token = generate_connect_token_at(
@@ -1610,6 +1736,11 @@ mod tests {
             &[0; USER_DATA_BYTES],
         )
         .unwrap();
+        assert!(
+            ConnectToken::read(&connect_token).unwrap().expire_timestamp
+                > server.min_connect_token_expire_timestamp,
+            "connect token expiry is above the server start floor"
+        );
 
         let socket = network.bind(test_address(0));
 
@@ -1626,10 +1757,28 @@ mod tests {
         server.stop();
         server.start_at(1, TEST_TIMESTAMP).unwrap();
 
+        let restarted_connect_token = generate_connect_token_at(
+            &[server.address()],
+            &[server.address()],
+            TEST_TIMESTAMP,
+            TEST_TOKEN_EXPIRY,
+            TEST_TOKEN_TIMEOUT,
+            0x1234,
+            TEST_PROTOCOL_ID,
+            &private_key,
+            &[0; USER_DATA_BYTES],
+        )
+        .unwrap();
+        assert!(
+            ConnectToken::read(&restarted_connect_token).unwrap().expire_timestamp
+                > server.min_connect_token_expire_timestamp,
+            "connect token expiry is above the server start floor"
+        );
+
         let after_restart = challenge_sequence_on_the_wire(
             &mut server,
             &socket,
-            &connect_token,
+            &restarted_connect_token,
             &mut time,
             TEST_TIMESTAMP,
         );

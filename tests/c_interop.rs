@@ -43,6 +43,7 @@ fn c_server_address() -> SocketAddr {
         Err(_) => ephemeral_address(),
     }
 }
+
 const CONNECT_TOKEN_EXPIRY: i32 = 30;
 const CONNECT_TOKEN_TIMEOUT: i32 = 5;
 const DELTA_TIME: f64 = 1.0 / 60.0;
@@ -90,8 +91,8 @@ fn ephemeral_address_is_free_and_on_loopback() {
 fn rust_client_connects_to_c_server() {
     let _guard = INTEROP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let server_address = c_server_address();
-    // the C server example takes the UDP port to listen on
-    let _c_server = spawn("NETCODE_C_SERVER", server_address.port().to_string());
+    // the C server example takes the address to listen on
+    let _c_server = spawn("NETCODE_C_SERVER", server_address.to_string());
     std::thread::sleep(Duration::from_millis(500));
 
     let mut client = Client::new("0.0.0.0:0".parse().unwrap(), 0.0).unwrap();

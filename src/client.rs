@@ -243,6 +243,21 @@ impl Client {
         client
     }
 
+    /// The index of the first server address at or after `start` that the client
+    /// has a socket for, skipping addresses of a family it did not bind.
+    fn next_reachable_server(
+        &self,
+        server_addresses: &[SocketAddr],
+        start: usize,
+    ) -> Option<usize> {
+        reachable_server_index(
+            server_addresses,
+            start,
+            self.socket_ipv4.is_some(),
+            self.socket_ipv6.is_some(),
+        )
+    }
+
     /// Starts connecting to the servers listed in the connect token, trying each
     /// address in order until one accepts.
     ///
@@ -260,16 +275,27 @@ impl Client {
             }
         };
 
-        self.server_address_index = 0;
-        self.server_address = Some(connect_token.server_addresses[0]);
+        let num_server_addresses = connect_token.server_addresses.len();
+        let Some(server_address_index) =
+            self.next_reachable_server(&connect_token.server_addresses, 0)
+        else {
+            debug!("client has no server address with a matching socket family");
+            self.set_state(ClientState::InvalidConnectToken);
+            return Err(Error::InvalidConnectToken);
+        };
 
-        if connect_token.server_addresses.len() == 1 {
-            info!("client connecting to server {}", connect_token.server_addresses[0]);
+        self.server_address_index = server_address_index;
+        let server_address = connect_token.server_addresses[server_address_index];
+        self.server_address = Some(server_address);
+
+        if num_server_addresses == 1 {
+            info!("client connecting to server {}", server_address);
         } else {
             info!(
-                "client connecting to server {} [1/{}]",
-                connect_token.server_addresses[0],
-                connect_token.server_addresses.len()
+                "client connecting to server {} [{}/{}]",
+                server_address,
+                server_address_index + 1,
+                num_server_addresses
             );
         }
 
@@ -481,13 +507,15 @@ impl Client {
         };
         let num_server_addresses = connect_token.server_addresses.len();
 
-        if self.server_address_index + 1 >= num_server_addresses {
+        let Some(server_address_index) = self
+            .next_reachable_server(&connect_token.server_addresses, self.server_address_index + 1)
+        else {
             debug!("client has no more servers to connect to");
             return false;
-        }
+        };
 
-        self.server_address_index += 1;
-        let server_address = connect_token.server_addresses[self.server_address_index];
+        let server_address = connect_token.server_addresses[server_address_index];
+        self.server_address_index = server_address_index;
         self.server_address = Some(server_address);
 
         self.reset_before_next_connect();
@@ -495,7 +523,7 @@ impl Client {
         info!(
             "client connecting to next server {} [{}/{}]",
             server_address,
-            self.server_address_index + 1,
+            server_address_index + 1,
             num_server_addresses
         );
 
@@ -576,23 +604,25 @@ impl Client {
 
     fn receive_packets(&mut self, current_timestamp: u64) {
         let mut packet_data = [0u8; MAX_PACKET_BYTES];
-        loop {
-            // the client only talks to one server, so receive on the socket matching
-            // the current server address family. the socket borrow is scoped to the
-            // receive call so packet processing can borrow self mutably.
-            let socket = match self.server_address {
-                Some(SocketAddr::V4(_)) => self.socket_ipv4.as_ref(),
-                Some(SocketAddr::V6(_)) => self.socket_ipv6.as_ref(),
-                None => None,
-            };
-            let Some(socket) = socket else {
-                return;
-            };
-            let Some((packet_bytes, from)) = socket::receive_packet(socket, &mut packet_data)
-            else {
-                return;
-            };
-            self.process_packet(from, &mut packet_data[..packet_bytes], current_timestamp);
+        // drain both sockets on every update, so packets that arrive while the client is
+        // not connecting or connected, or on the other address family, are discarded
+        // rather than left queued. the socket borrow is scoped to the receive call so
+        // packet processing can borrow self mutably.
+        for ipv4 in [true, false] {
+            loop {
+                let socket =
+                    if ipv4 { self.socket_ipv4.as_ref() } else { self.socket_ipv6.as_ref() };
+                let Some(socket) = socket else {
+                    break;
+                };
+                let Some((packet_bytes, from)) = socket::receive_packet(socket, &mut packet_data)
+                else {
+                    break;
+                };
+                if self.state.is_connecting() || self.state == ClientState::Connected {
+                    self.process_packet(from, &mut packet_data[..packet_bytes], current_timestamp);
+                }
+            }
         }
     }
 
@@ -691,6 +721,18 @@ impl Client {
     }
 }
 
+fn reachable_server_index(
+    server_addresses: &[SocketAddr],
+    start: usize,
+    has_ipv4: bool,
+    has_ipv6: bool,
+) -> Option<usize> {
+    (start..server_addresses.len()).find(|&index| match server_addresses[index] {
+        SocketAddr::V4(_) => has_ipv4,
+        SocketAddr::V6(_) => has_ipv6,
+    })
+}
+
 impl Drop for Client {
     fn drop(&mut self) {
         self.disconnect();
@@ -750,6 +792,105 @@ mod tests {
         let connect_token = [0u8; CONNECT_TOKEN_BYTES];
         assert!(client.connect(&connect_token).is_err());
         assert_eq!(client.state(), ClientState::InvalidConnectToken);
+    }
+
+    #[test]
+    fn ipv6_only_client_rejects_a_token_with_only_an_ipv4_address() {
+        let network = socket::MemoryNetwork::new();
+        let private_key = crypto::generate_key();
+        let ipv4_server: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+
+        let token = generate_connect_token_at(
+            &[ipv4_server],
+            &[ipv4_server],
+            TEST_TIMESTAMP,
+            30,
+            5,
+            1,
+            TEST_PROTOCOL_ID,
+            &private_key,
+            &[0; USER_DATA_BYTES],
+        )
+        .unwrap();
+
+        let mut client = Client::new_in_memory(&network, "[::1]:0".parse().unwrap(), 0.0);
+        assert!(client.connect(&token).is_err());
+        assert_eq!(client.state(), ClientState::InvalidConnectToken);
+        assert_eq!(client.server_address(), None);
+    }
+
+    #[test]
+    fn connect_token_with_only_an_unreachable_address_family_is_invalid() {
+        let network = socket::MemoryNetwork::new();
+        let private_key = crypto::generate_key();
+        let ipv6_server: SocketAddr = "[::1]:40000".parse().unwrap();
+
+        let token = generate_connect_token_at(
+            &[ipv6_server],
+            &[ipv6_server],
+            TEST_TIMESTAMP,
+            30,
+            5,
+            1,
+            TEST_PROTOCOL_ID,
+            &private_key,
+            &[0; USER_DATA_BYTES],
+        )
+        .unwrap();
+
+        let mut client = Client::new_in_memory(&network, "127.0.0.1:0".parse().unwrap(), 0.0);
+        assert!(client.connect(&token).is_err());
+        assert_eq!(client.state(), ClientState::InvalidConnectToken);
+        assert_eq!(client.server_address(), None);
+    }
+
+    #[test]
+    fn connect_skips_an_unreachable_address_family_to_a_reachable_one() {
+        let network = socket::MemoryNetwork::new();
+        let private_key = crypto::generate_key();
+        let ipv6_server: SocketAddr = "[::1]:40000".parse().unwrap();
+        let ipv4_server: SocketAddr = "127.0.0.1:40001".parse().unwrap();
+
+        let token = generate_connect_token_at(
+            &[ipv6_server, ipv4_server],
+            &[ipv6_server, ipv4_server],
+            TEST_TIMESTAMP,
+            30,
+            5,
+            1,
+            TEST_PROTOCOL_ID,
+            &private_key,
+            &[0; USER_DATA_BYTES],
+        )
+        .unwrap();
+
+        let mut client = Client::new_in_memory(&network, "127.0.0.1:0".parse().unwrap(), 0.0);
+        client.connect(&token).unwrap();
+        assert_eq!(client.server_address_index, 1);
+        assert_eq!(client.server_address(), Some(ipv4_server));
+        assert_eq!(client.state(), ClientState::SendingConnectionRequest);
+    }
+
+    #[test]
+    fn reachable_server_index_skips_unbound_address_families() {
+        let ipv4_a: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        let ipv6: SocketAddr = "[::1]:40001".parse().unwrap();
+        let ipv4_b: SocketAddr = "127.0.0.1:40002".parse().unwrap();
+
+        // ipv4-only client
+        assert_eq!(reachable_server_index(&[ipv6], 0, true, false), None);
+        assert_eq!(reachable_server_index(&[ipv6, ipv4_a], 0, true, false), Some(1));
+        assert_eq!(reachable_server_index(&[ipv4_a, ipv6, ipv4_b], 1, true, false), Some(2));
+        assert_eq!(reachable_server_index(&[ipv4_a, ipv6], 1, true, false), None);
+
+        // ipv6-only client
+        assert_eq!(reachable_server_index(&[ipv4_a], 0, false, true), None);
+        assert_eq!(reachable_server_index(&[ipv4_a, ipv6], 0, false, true), Some(1));
+
+        // dual-stack client takes addresses in order
+        assert_eq!(reachable_server_index(&[ipv6, ipv4_a], 0, true, true), Some(0));
+        assert_eq!(reachable_server_index(&[ipv6, ipv4_a], 1, true, true), Some(1));
+        assert_eq!(reachable_server_index(&[ipv6, ipv4_a], 2, true, true), None);
     }
 
     #[test]
@@ -1124,8 +1265,12 @@ mod tests {
         )
         .unwrap();
 
+        // a client with no sockets cannot connect, so set up the connection directly
         let mut client = Client::create(None, None, true, 1000.0).unwrap();
-        client.connect(&connect_token).unwrap();
+        let token = ConnectToken::read(&connect_token).unwrap();
+        client.read_packet_key = token.server_to_client_key;
+        client.server_address = Some(server_address);
+        client.connect_token = Some(token);
         client.state = ClientState::SendingConnectionResponse;
         client.client_index = CLIENT_INDEX;
         client.max_clients = 7;
@@ -1148,5 +1293,61 @@ mod tests {
             assert_eq!(client.max_clients(), 7);
             assert_eq!(client.state(), ClientState::SendingConnectionResponse);
         }
+    }
+
+    fn has_pending_packet(transport: &Option<socket::Transport>) -> bool {
+        match transport {
+            Some(socket::Transport::Memory(socket)) => socket.recv_from(&mut [0u8; 8]).is_some(),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn update_drains_both_transports_while_disconnected_and_connecting() {
+        let network = socket::MemoryNetwork::new();
+        let private_key = crypto::generate_key();
+        let server_address: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        let sender = network.bind("127.0.0.1:41000".parse().unwrap());
+        let sender_ipv6 = network.bind("[::1]:41000".parse().unwrap());
+
+        let mut client = Client::new_dual_in_memory(
+            &network,
+            "127.0.0.1:0".parse().unwrap(),
+            "[::1]:0".parse().unwrap(),
+            0.0,
+        )
+        .unwrap();
+        let client_ipv4 = client.socket_ipv4.as_ref().unwrap().local_addr().unwrap();
+        let client_ipv6 = client.socket_ipv6.as_ref().unwrap().local_addr().unwrap();
+
+        // packets that arrive while disconnected are read and discarded by update
+        for _ in 0..3 {
+            sender.send_to(&[0u8; 32], client_ipv4);
+            sender_ipv6.send_to(&[0u8; 32], client_ipv6);
+        }
+        client.update_at(1.0, TEST_TIMESTAMP);
+        assert_eq!(client.state(), ClientState::Disconnected);
+        assert!(!has_pending_packet(&client.socket_ipv4));
+        assert!(!has_pending_packet(&client.socket_ipv6));
+
+        let token = generate_connect_token_at(
+            &[server_address],
+            &[server_address],
+            TEST_TIMESTAMP,
+            30,
+            5,
+            1,
+            TEST_PROTOCOL_ID,
+            &private_key,
+            &[0; USER_DATA_BYTES],
+        )
+        .unwrap();
+        client.connect(&token).unwrap();
+
+        // while connecting to an IPv4 server, the IPv6 transport is drained too
+        sender_ipv6.send_to(&[0u8; 32], client_ipv6);
+        client.update_at(2.0, TEST_TIMESTAMP);
+        assert_eq!(client.state(), ClientState::SendingConnectionRequest);
+        assert!(!has_pending_packet(&client.socket_ipv6));
     }
 }

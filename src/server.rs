@@ -80,7 +80,7 @@ struct EncryptionEntry {
     expire_time: f64,
     last_access_time: f64,
     client_index: Option<usize>,
-    connect_token_entry_index: Option<usize>,
+    connect_token_entry: Option<(usize, [u8; MAC_BYTES])>,
     send_key: Key,
     receive_key: Key,
 }
@@ -93,7 +93,7 @@ impl EncryptionEntry {
             expire_time: -1.0,
             last_access_time: -1000.0,
             client_index: None,
-            connect_token_entry_index: None,
+            connect_token_entry: None,
             send_key: [0; KEY_BYTES],
             receive_key: [0; KEY_BYTES],
         }
@@ -142,7 +142,7 @@ impl EncryptionManager {
         time: f64,
         expire_time: f64,
         timeout_seconds: i32,
-        connect_token_entry_index: usize,
+        connect_token_entry: (usize, [u8; MAC_BYTES]),
     ) -> bool {
         for index in 0..self.num_entries {
             let entry = &mut self.entries[index];
@@ -152,7 +152,7 @@ impl EncryptionManager {
                 entry.last_access_time = time;
                 entry.send_key = *send_key;
                 entry.receive_key = *receive_key;
-                entry.connect_token_entry_index = Some(connect_token_entry_index);
+                entry.connect_token_entry = Some(connect_token_entry);
                 return true;
             }
         }
@@ -166,7 +166,7 @@ impl EncryptionManager {
                     expire_time,
                     last_access_time: time,
                     client_index: None,
-                    connect_token_entry_index: Some(connect_token_entry_index),
+                    connect_token_entry: Some(connect_token_entry),
                     send_key: *send_key,
                     receive_key: *receive_key,
                 };
@@ -245,8 +245,8 @@ impl EncryptionManager {
         self.entries[index].client_index = client_index;
     }
 
-    fn connect_token_entry_index(&self, index: usize) -> Option<usize> {
-        self.entries[index].connect_token_entry_index
+    fn connect_token_entry(&self, index: usize) -> Option<(usize, [u8; MAC_BYTES])> {
+        self.entries[index].connect_token_entry
     }
 
     fn send_key(&self, index: usize) -> &Key {
@@ -382,8 +382,16 @@ fn find_or_add_connect_token_entry(
     }
 }
 
-fn consume_connect_token_entry(entries: &mut [ConnectTokenEntry], index: usize) {
-    entries[index].state = ConnectTokenEntryState::Consumed;
+/// Consumes the history entry only while it still holds this token: an entry whose
+/// token expired may since have been reused by another token.
+fn consume_connect_token_entry(
+    entries: &mut [ConnectTokenEntry],
+    index: usize,
+    mac: &[u8; MAC_BYTES],
+) {
+    if &entries[index].mac == mac {
+        entries[index].state = ConnectTokenEntryState::Consumed;
+    }
 }
 
 // ----------------------------------------------------------------
@@ -1023,7 +1031,7 @@ impl Server {
             self.time,
             expire_time,
             private_token.timeout_seconds,
-            connect_token_entry_index,
+            (connect_token_entry_index, mac),
         ) {
             debug!("server ignored connection request. failed to add encryption mapping");
             return;
@@ -1132,10 +1140,14 @@ impl Server {
         // expires on its own, only when the client disconnects
         self.encryption_manager.set_expire_time(encryption_index, -1.0);
         self.encryption_manager.set_client_index(encryption_index, Some(client_index));
-        if let Some(connect_token_entry_index) =
-            self.encryption_manager.connect_token_entry_index(encryption_index)
+        if let Some((connect_token_entry_index, mac)) =
+            self.encryption_manager.connect_token_entry(encryption_index)
         {
-            consume_connect_token_entry(&mut self.connect_token_entries, connect_token_entry_index);
+            consume_connect_token_entry(
+                &mut self.connect_token_entries,
+                connect_token_entry_index,
+                &mac,
+            );
         }
 
         let client = &mut self.clients[client_index];
@@ -1418,7 +1430,7 @@ mod tests {
                 time,
                 expire_time,
                 -1,
-                0,
+                (0, [0; MAC_BYTES]),
             ));
         }
         assert!(manager.find_encryption_mapping(test_address(10000), time).is_some());
@@ -1429,7 +1441,7 @@ mod tests {
             time,
             expire_time,
             -1,
-            0,
+            (0, [0; MAC_BYTES]),
         ));
 
         // the handshakes are never completed, so the mappings go with the connect token
@@ -1444,7 +1456,7 @@ mod tests {
             after_token_expires,
             after_token_expires + 5.0,
             5,
-            0,
+            (0, [0; MAC_BYTES]),
         ));
 
         assert_eq!(expire_time, time + 2.0);
@@ -1476,7 +1488,7 @@ mod tests {
                 time,
                 time + 5.0,
                 5,
-                0,
+                (0, [0; MAC_BYTES]),
             ));
         }
 
@@ -1509,7 +1521,7 @@ mod tests {
             100.0,
             105.0,
             -1,
-            0,
+            (0, [0; MAC_BYTES]),
         ));
         assert!(manager.find_encryption_mapping(test_address(40000), 104.0).is_some());
         assert!(manager.find_encryption_mapping(test_address(40000), 106.0).is_none());
@@ -1537,7 +1549,7 @@ mod tests {
             1000.0,
             -1.0,
             5,
-            0,
+            (0, [0; MAC_BYTES]),
         ));
         assert!(manager.add_encryption_mapping(
             test_address(40001),
@@ -1546,7 +1558,7 @@ mod tests {
             1000.0,
             -1.0,
             100,
-            1,
+            (1, [0; MAC_BYTES]),
         ));
 
         // removing the last entry frees the expired entry before it as well
@@ -1571,7 +1583,7 @@ mod tests {
             1000.0,
             1005.0,
             5,
-            0,
+            (0, [0; MAC_BYTES]),
         ));
 
         manager.remove_expired_mappings(1004.0);
@@ -1597,7 +1609,7 @@ mod tests {
             1000.0,
             1005.0,
             5,
-            0,
+            (0, [0; MAC_BYTES]),
         ));
         manager.set_client_index(0, Some(0));
 
@@ -1660,7 +1672,7 @@ mod tests {
 
         // once the client is installed, the token is consumed and cannot be
         // presented again, including from the address that used it
-        consume_connect_token_entry(&mut entries, index);
+        consume_connect_token_entry(&mut entries, index, &mac);
         assert_eq!(
             find_or_add_connect_token_entry(&mut entries, test_address(40000), &mac, 30, 3, 3.0,),
             ConnectTokenEntryResult::Refused
@@ -2262,6 +2274,88 @@ mod tests {
         }
         assert_eq!(client.state(), ClientState::Connected);
         assert_eq!(server.num_connected_clients(), 1);
+    }
+
+    /// A pending handshake that completes after its history entry was reused by a
+    /// newer token consumes only its own token, so the newer token can still retry.
+    #[test]
+    fn in_memory_completed_handshake_consumes_only_its_own_token() {
+        let network = socket::MemoryNetwork::new();
+        let private_key = crypto::generate_key();
+        let mut server = Server::new_in_memory_with_config(
+            &network,
+            test_address(40000),
+            TEST_PROTOCOL_ID,
+            &private_key,
+            ServerConfig { max_connect_token_lifetime: 30 },
+            0.0,
+        )
+        .unwrap();
+        server.start_at(2, TEST_TIMESTAMP).unwrap();
+
+        let first_expiry = TEST_TIMESTAMP + 31;
+        let mut reply = [0u8; MAX_PACKET_BYTES];
+
+        // the first token takes a history entry and gets a challenge
+        let first_token = generate_connect_token_at(
+            &[server.address()],
+            &[server.address()],
+            TEST_TIMESTAMP,
+            31,
+            TEST_TOKEN_TIMEOUT,
+            1,
+            TEST_PROTOCOL_ID,
+            &private_key,
+            &[0; USER_DATA_BYTES],
+        )
+        .unwrap();
+        let mut first_client = Client::new_in_memory(&network, test_address(0), 0.0);
+        first_client.connect(&first_token).unwrap();
+        first_client.update_at(0.1, TEST_TIMESTAMP);
+        server.update_at(0.1, TEST_TIMESTAMP);
+
+        // once the first token has expired, a second token reuses its history entry
+        let second_token = generate_connect_token_at(
+            &[server.address()],
+            &[server.address()],
+            first_expiry,
+            31,
+            TEST_TOKEN_TIMEOUT,
+            2,
+            TEST_PROTOCOL_ID,
+            &private_key,
+            &[0; USER_DATA_BYTES],
+        )
+        .unwrap();
+        let parsed = ConnectToken::read(&second_token).unwrap();
+        let mut req_buf = [0u8; MAX_PACKET_BYTES];
+        let req_len = write_packet(
+            &Packet::Request {
+                protocol_id: parsed.protocol_id,
+                expire_timestamp: parsed.expire_timestamp,
+                nonce: parsed.nonce,
+                private_data: parsed.private_data.clone(),
+            },
+            &mut req_buf,
+            0,
+            &[0; KEY_BYTES],
+            parsed.protocol_id,
+        )
+        .unwrap();
+        let second_socket = network.bind(test_address(0));
+        second_socket.send_to(&req_buf[..req_len], server.address());
+        server.update_at(0.2, first_expiry);
+        assert!(second_socket.recv_from(&mut reply).is_some());
+
+        // the first handshake completes
+        first_client.update_at(0.3, first_expiry);
+        server.update_at(0.3, first_expiry);
+        assert_eq!(server.num_connected_clients(), 1);
+
+        // the second token's retried request still gets a challenge
+        second_socket.send_to(&req_buf[..req_len], server.address());
+        server.update_at(0.4, first_expiry);
+        assert!(second_socket.recv_from(&mut reply).is_some());
     }
 
     #[test]

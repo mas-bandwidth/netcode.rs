@@ -2025,13 +2025,13 @@ mod tests {
         let mut reply = [0u8; MAX_PACKET_BYTES];
         assert!(probe_socket.recv_from(&mut reply).is_none());
 
-        // 2. Token at the floor (expire_timestamp == TEST_TIMESTAMP + 30) presented after it has expired
-        // (at current_timestamp == TEST_TIMESTAMP + 31) is rejected.
+        // 2. Token just above the floor (expire_timestamp == TEST_TIMESTAMP + 31) presented after it
+        // has expired (at current_timestamp == TEST_TIMESTAMP + 32) is rejected.
         let boundary_token = generate_connect_token_at(
             &[server.address()],
             &[server.address()],
             TEST_TIMESTAMP,
-            30,
+            TEST_TOKEN_EXPIRY,
             TEST_TOKEN_TIMEOUT,
             2,
             TEST_PROTOCOL_ID,
@@ -2054,7 +2054,7 @@ mod tests {
         )
         .unwrap();
         probe_socket.send_to(&req_buf[..req_len], server.address());
-        server.update_at(0.2, TEST_TIMESTAMP + 31);
+        server.update_at(0.2, TEST_TIMESTAMP + 32);
         assert!(probe_socket.recv_from(&mut reply).is_none());
 
         // 3. The same token presented while valid (at TEST_TIMESTAMP + 10) receives a challenge.

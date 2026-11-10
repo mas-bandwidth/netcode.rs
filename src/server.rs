@@ -1,7 +1,7 @@
 //! The netcode server.
 
 use std::collections::VecDeque;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use log::{debug, error, info};
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -402,7 +402,7 @@ pub struct Server {
     protocol_id: u64,
     private_key: Key,
     max_connect_token_lifetime: u64,
-    socket: UdpSocket,
+    socket: socket::Transport,
     public_address: SocketAddr,
     time: f64,
     running: bool,
@@ -455,8 +455,49 @@ impl Server {
             SocketAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, public_address.port()).into(),
         };
         let socket = socket::create_socket(bind_address)?;
+        Self::with_transport(socket, public_address, protocol_id, private_key, config, time)
+    }
 
-        let mut public_address = public_address;
+    #[cfg(test)]
+    pub(crate) fn new_in_memory(
+        network: &socket::MemoryNetwork,
+        public_address: SocketAddr,
+        protocol_id: u64,
+        private_key: &Key,
+        time: f64,
+    ) -> Result<Self, Error> {
+        Self::new_in_memory_with_config(
+            network,
+            public_address,
+            protocol_id,
+            private_key,
+            ServerConfig::default(),
+            time,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_in_memory_with_config(
+        network: &socket::MemoryNetwork,
+        public_address: SocketAddr,
+        protocol_id: u64,
+        private_key: &Key,
+        config: ServerConfig,
+        time: f64,
+    ) -> Result<Self, Error> {
+        let socket = socket::Transport::Memory(network.bind(public_address));
+        let bound_address = socket.local_addr()?;
+        Self::with_transport(socket, bound_address, protocol_id, private_key, config, time)
+    }
+
+    fn with_transport(
+        socket: socket::Transport,
+        mut public_address: SocketAddr,
+        protocol_id: u64,
+        private_key: &Key,
+        config: ServerConfig,
+        time: f64,
+    ) -> Result<Self, Error> {
         if public_address.port() == 0 {
             public_address.set_port(socket.local_addr()?.port());
         }
@@ -494,6 +535,14 @@ impl Server {
     /// Starts the server with `max_clients` client slots, in `[1, MAX_CLIENTS]`.
     /// If the server is already running it is stopped first, disconnecting everyone.
     pub fn start(&mut self, max_clients: usize) -> Result<(), Error> {
+        self.start_at(max_clients, token::unix_timestamp())
+    }
+
+    pub(crate) fn start_at(
+        &mut self,
+        max_clients: usize,
+        current_timestamp: u64,
+    ) -> Result<(), Error> {
         if max_clients == 0 || max_clients > MAX_CLIENTS {
             return Err(Error::InvalidMaxClients(max_clients));
         }
@@ -510,7 +559,7 @@ impl Server {
         self.challenge_sequence = 0;
         self.challenge_key = crypto::generate_key();
         self.min_connect_token_expire_timestamp =
-            token::unix_timestamp().saturating_add(self.max_connect_token_lifetime);
+            current_timestamp.saturating_add(self.max_connect_token_lifetime);
         // global packets (challenge, denied) encrypt with the same per-token
         // server-to-client keys as per-client packets, whose sequences start at zero,
         // so the global sequence takes the top half of the space to keep AEAD nonces
@@ -547,8 +596,12 @@ impl Server {
     /// Advances the server to the current time: receives and processes packets, sends
     /// keep-alives, and times out unresponsive clients.
     pub fn update(&mut self, time: f64) {
+        self.update_at(time, token::unix_timestamp());
+    }
+
+    pub(crate) fn update_at(&mut self, time: f64, current_timestamp: u64) {
         self.time = time;
-        self.receive_packets();
+        self.receive_packets(current_timestamp);
         self.send_packets();
         self.check_for_timeouts();
     }
@@ -705,8 +758,10 @@ impl Server {
         self.clients[..self.max_clients].iter().position(|client| !client.connected)
     }
 
-    fn receive_packets(&mut self) {
-        self.receive_packets_with(|server, buffer| socket::receive_packet(&server.socket, buffer));
+    fn receive_packets(&mut self, current_timestamp: u64) {
+        self.receive_packets_with(current_timestamp, |server, buffer| {
+            socket::receive_packet(&server.socket, buffer)
+        });
     }
 
     /// One receive drain: reads and processes packets until `receive` reports the
@@ -714,9 +769,9 @@ impl Server {
     /// exercised without a live socket.
     fn receive_packets_with(
         &mut self,
+        current_timestamp: u64,
         mut receive: impl FnMut(&Self, &mut [u8]) -> Option<(usize, SocketAddr)>,
     ) {
-        let current_timestamp = token::unix_timestamp();
         let mut packet_data = [0u8; MAX_PACKET_BYTES];
         while let Some((packet_bytes, from)) = receive(self, &mut packet_data) {
             self.read_and_process_packet(from, &mut packet_data[..packet_bytes], current_timestamp);
@@ -1198,18 +1253,81 @@ impl Drop for Server {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::io;
-    use std::time::Duration;
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_connect_token_at(
+    public_server_addresses: &[SocketAddr],
+    internal_server_addresses: &[SocketAddr],
+    create_timestamp: u64,
+    expire_seconds: i32,
+    timeout_seconds: i32,
+    client_id: u64,
+    protocol_id: u64,
+    private_key: &Key,
+    user_data: &UserData,
+) -> Result<[u8; crate::CONNECT_TOKEN_BYTES], Error> {
+    if public_server_addresses.is_empty()
+        || public_server_addresses.len() > crate::MAX_SERVERS_PER_CONNECT
+        || public_server_addresses.len() != internal_server_addresses.len()
+    {
+        return Err(Error::InvalidServerAddresses);
+    }
 
+    let expire_timestamp = if expire_seconds >= 0 {
+        create_timestamp.saturating_add(expire_seconds as u64)
+    } else {
+        u64::MAX
+    };
+
+    let mut nonce = [0u8; token::CONNECT_TOKEN_NONCE_BYTES];
+    crypto::random_bytes(&mut nonce);
+
+    let private_token = PrivateConnectToken::generate(
+        client_id,
+        timeout_seconds,
+        internal_server_addresses,
+        user_data,
+    );
+
+    let mut private_data = Box::new([0u8; CONNECT_TOKEN_PRIVATE_BYTES]);
+    private_token.write(&mut private_data);
+    token::encrypt_connect_token_private(
+        &mut private_data,
+        protocol_id,
+        expire_timestamp,
+        &nonce,
+        private_key,
+    )?;
+
+    let token = token::ConnectToken {
+        protocol_id,
+        create_timestamp,
+        expire_timestamp,
+        nonce,
+        private_data,
+        timeout_seconds,
+        server_addresses: public_server_addresses.to_vec(),
+        client_to_server_key: private_token.client_to_server_key,
+        server_to_client_key: private_token.server_to_client_key,
+    };
+
+    let mut buffer = [0u8; crate::CONNECT_TOKEN_BYTES];
+    token.write(&mut buffer);
+    Ok(buffer)
+}
+
+#[cfg(test)]
+mod tests {
     use super::*;
+    use std::io;
+
     use crate::packet::{read_packet, write_packet};
     use crate::token::ConnectToken;
-    use crate::{CONNECT_TOKEN_BYTES, generate_connect_token};
+    use crate::{CONNECT_TOKEN_BYTES, Client, ClientState};
 
     const TEST_PROTOCOL_ID: u64 = 0x1122334455667788;
     const TEST_TOKEN_EXPIRY: i32 = 30;
     const TEST_TOKEN_TIMEOUT: i32 = 5;
+    const TEST_TIMESTAMP: u64 = 1_000_000;
 
     /// The server stamps its global packets (challenge and denied) with sequence
     /// numbers from the top half of the sequence space. Those packets are encrypted
@@ -1374,8 +1492,10 @@ mod tests {
 
     #[test]
     fn server_start_sets_configured_connect_token_restart_guard() {
+        let network = socket::MemoryNetwork::new();
         let private_key = crypto::generate_key();
-        let mut server = Server::new_with_config(
+        let mut server = Server::new_in_memory_with_config(
+            &network,
             test_address(0),
             TEST_PROTOCOL_ID,
             &private_key,
@@ -1385,11 +1505,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(server.min_connect_token_expire_timestamp, 0);
-        server.start(1).unwrap();
-
-        let current_timestamp = token::unix_timestamp();
-        assert!(server.min_connect_token_expire_timestamp >= current_timestamp + 59);
-        assert!(server.min_connect_token_expire_timestamp <= current_timestamp + 60);
+        server.start_at(1, TEST_TIMESTAMP).unwrap();
+        assert_eq!(server.min_connect_token_expire_timestamp, TEST_TIMESTAMP + 60);
     }
 
     #[test]
@@ -1482,9 +1599,10 @@ mod tests {
     /// back — that is, the AEAD nonce it used under this token's server-to-client key.
     fn challenge_sequence_on_the_wire(
         server: &mut Server,
-        socket: &UdpSocket,
+        socket: &socket::MemorySocket,
         connect_token: &[u8; CONNECT_TOKEN_BYTES],
         time: &mut f64,
+        timestamp: u64,
     ) -> u64 {
         let token = ConnectToken::read(connect_token).unwrap();
         let request = Packet::Request {
@@ -1499,31 +1617,27 @@ mod tests {
         let request_bytes =
             write_packet(&request, &mut request_data, 0, &[0; KEY_BYTES], token.protocol_id)
                 .unwrap();
-        socket.send_to(&request_data[..request_bytes], server.address()).unwrap();
+        socket.send_to(&request_data[..request_bytes], server.address());
 
         let mut reply = [0u8; MAX_PACKET_BYTES];
-        for _ in 0..100 {
-            *time += 0.01;
-            server.update(*time);
+        *time += 0.01;
+        server.update_at(*time, timestamp);
 
-            let Ok((reply_bytes, _)) = socket.recv_from(&mut reply) else {
-                continue;
-            };
-            let (packet, sequence) = read_packet(
-                &mut reply[..reply_bytes],
-                Some(&token.server_to_client_key),
-                token.protocol_id,
-                token::unix_timestamp(),
-                None,
-                AllowedPackets::CLIENT,
-                None,
-            )
-            .expect("the server reply did not decrypt under the connect token key");
-            assert!(matches!(packet, Packet::Challenge { .. }));
-            return sequence;
-        }
-
-        panic!("the server never replied to the connection request");
+        let (reply_bytes, _) = socket
+            .recv_from(&mut reply)
+            .expect("the server never replied to the connection request");
+        let (packet, sequence) = read_packet(
+            &mut reply[..reply_bytes],
+            Some(&token.server_to_client_key),
+            token.protocol_id,
+            timestamp,
+            None,
+            AllowedPackets::CLIENT,
+            None,
+        )
+        .expect("the server reply did not decrypt under the connect token key");
+        assert!(matches!(packet, Packet::Challenge { .. }));
+        sequence
     }
 
     /// Zero-length datagrams are valid UDP. One receive drain must read past any number
@@ -1533,13 +1647,17 @@ mod tests {
     fn one_receive_drain_processes_a_request_behind_empty_datagrams() {
         const EMPTY_DATAGRAMS: usize = 64;
 
+        let network = socket::MemoryNetwork::new();
         let private_key = crypto::generate_key();
-        let mut server = Server::new(test_address(0), TEST_PROTOCOL_ID, &private_key, 0.0).unwrap();
-        server.start(1).unwrap();
+        let mut server =
+            Server::new_in_memory(&network, test_address(0), TEST_PROTOCOL_ID, &private_key, 0.0)
+                .unwrap();
+        server.start_at(1, TEST_TIMESTAMP).unwrap();
 
-        let connect_token = generate_connect_token(
+        let connect_token = generate_connect_token_at(
             &[server.address()],
             &[server.address()],
+            TEST_TIMESTAMP,
             TEST_TOKEN_EXPIRY,
             TEST_TOKEN_TIMEOUT,
             0x1234,
@@ -1567,7 +1685,7 @@ mod tests {
         queue.push(None);
         let mut queue = queue.into_iter();
 
-        server.receive_packets_with(|_, buffer| {
+        server.receive_packets_with(TEST_TIMESTAMP, |_, buffer| {
             socket::receive_packet_with(buffer, |buffer| match queue.next() {
                 Some(Some(bytes)) => {
                     buffer[..bytes].copy_from_slice(&request_data[..bytes]);
@@ -1588,15 +1706,15 @@ mod tests {
 
     /// A server that is stopped and started again must not go back to stamping its
     /// global packets with sequence numbers a connected client's packets also use.
-    /// This drives a real connection request over UDP before and after a restart and
-    /// reads the nonce off the challenge packets the server actually sends.
     #[test]
     fn restarted_server_keeps_global_packets_out_of_the_client_sequence_range() {
+        let network = socket::MemoryNetwork::new();
         let private_key = crypto::generate_key();
         // the start floor is the start time plus this lifetime, one second under the
         // lifetime of the tokens minted below, so a token from the same second expires
         // strictly above the floor
-        let mut server = Server::new_with_config(
+        let mut server = Server::new_in_memory_with_config(
+            &network,
             test_address(0),
             TEST_PROTOCOL_ID,
             &private_key,
@@ -1604,11 +1722,12 @@ mod tests {
             0.0,
         )
         .unwrap();
-        server.start(1).unwrap();
+        server.start_at(1, TEST_TIMESTAMP).unwrap();
 
-        let connect_token = generate_connect_token(
+        let connect_token = generate_connect_token_at(
             &[server.address()],
             &[server.address()],
+            TEST_TIMESTAMP,
             TEST_TOKEN_EXPIRY,
             TEST_TOKEN_TIMEOUT,
             0x1234,
@@ -1623,20 +1742,25 @@ mod tests {
             "connect token expiry is above the server start floor"
         );
 
-        let socket = UdpSocket::bind(test_address(0)).unwrap();
-        socket.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
+        let socket = network.bind(test_address(0));
 
         let mut time = 0.0;
-        let before_restart =
-            challenge_sequence_on_the_wire(&mut server, &socket, &connect_token, &mut time);
+        let before_restart = challenge_sequence_on_the_wire(
+            &mut server,
+            &socket,
+            &connect_token,
+            &mut time,
+            TEST_TIMESTAMP,
+        );
         assert!(before_restart > GLOBAL_SEQUENCE_FLOOR, "global sequence {before_restart}");
 
         server.stop();
-        server.start(1).unwrap();
+        server.start_at(1, TEST_TIMESTAMP).unwrap();
 
-        let restarted_connect_token = generate_connect_token(
+        let restarted_connect_token = generate_connect_token_at(
             &[server.address()],
             &[server.address()],
+            TEST_TIMESTAMP,
             TEST_TOKEN_EXPIRY,
             TEST_TOKEN_TIMEOUT,
             0x1234,
@@ -1656,12 +1780,11 @@ mod tests {
             &socket,
             &restarted_connect_token,
             &mut time,
+            TEST_TIMESTAMP,
         );
         assert!(
             after_restart > GLOBAL_SEQUENCE_FLOOR,
-            "a restarted server sent a global packet with sequence {after_restart}, which is in \
-             the range used by packets to connected clients (client slot sequences restart at \
-             {}), so the two share an AEAD nonce under the connect token key",
+            "a restarted server sent a global packet with sequence {after_restart}, which is in              the range used by packets to connected clients (client slot sequences restart at              {}), so the two share an AEAD nonce under the connect token key",
             server.clients[0].sequence,
         );
         assert_eq!(server.clients[0].sequence, 0, "client sequences start at zero after a start");
@@ -1672,8 +1795,11 @@ mod tests {
     /// is the whole of the upstream fix, since creation alone used to seed it.
     #[test]
     fn create_start_and_stop_each_reseed_the_global_sequence() {
+        let network = socket::MemoryNetwork::new();
         let private_key = crypto::generate_key();
-        let mut server = Server::new(test_address(0), TEST_PROTOCOL_ID, &private_key, 0.0).unwrap();
+        let mut server =
+            Server::new_in_memory(&network, test_address(0), TEST_PROTOCOL_ID, &private_key, 0.0)
+                .unwrap();
         assert!(
             server.global_sequence > GLOBAL_SEQUENCE_FLOOR,
             "a new server starts below the global sequence floor: {}",
@@ -1682,7 +1808,7 @@ mod tests {
 
         // starting a stopped server whose sequence was left down in the client range
         server.global_sequence = 0;
-        server.start(1).unwrap();
+        server.start_at(1, TEST_TIMESTAMP).unwrap();
         assert!(
             server.global_sequence > GLOBAL_SEQUENCE_FLOOR,
             "start did not reseed the global sequence: {}",
@@ -1697,5 +1823,303 @@ mod tests {
             "stop did not reseed the global sequence: {}",
             server.global_sequence
         );
+    }
+
+    #[test]
+    fn in_memory_server_times_out_silent_client() {
+        let network = socket::MemoryNetwork::new();
+        let private_key = crypto::generate_key();
+        let mut server = Server::new_in_memory(
+            &network,
+            test_address(40000),
+            TEST_PROTOCOL_ID,
+            &private_key,
+            0.0,
+        )
+        .unwrap();
+        server.start_at(1, TEST_TIMESTAMP).unwrap();
+
+        let token = generate_connect_token_at(
+            &[server.address()],
+            &[server.address()],
+            TEST_TIMESTAMP,
+            TEST_TOKEN_EXPIRY,
+            TEST_TOKEN_TIMEOUT,
+            1,
+            TEST_PROTOCOL_ID,
+            &private_key,
+            &[0x11; USER_DATA_BYTES],
+        )
+        .unwrap();
+
+        let mut client = Client::new_in_memory(&network, test_address(0), 0.0);
+        client.connect(&token).unwrap();
+
+        let mut time = 0.0;
+        for _ in 0..10 {
+            client.update_at(time, TEST_TIMESTAMP);
+            server.update_at(time, TEST_TIMESTAMP);
+            time += 0.1;
+        }
+        assert_eq!(client.state(), ClientState::Connected);
+        assert_eq!(server.num_connected_clients(), 1);
+        assert_eq!(server.next_event(), Some(ServerEvent::ClientConnected { client_index: 0 }));
+
+        // Client stops updating; advance server past TEST_TOKEN_TIMEOUT (5s).
+        for _ in 0..60 {
+            time += 0.1;
+            server.update_at(time, TEST_TIMESTAMP + 6);
+        }
+        assert_eq!(server.num_connected_clients(), 0);
+        assert_eq!(
+            server.next_event(),
+            Some(ServerEvent::ClientDisconnected {
+                client_index: 0,
+                reason: DisconnectReason::TimedOut,
+            })
+        );
+    }
+
+    #[test]
+    fn in_memory_start_floor_and_token_expiry_boundaries() {
+        let network = socket::MemoryNetwork::new();
+        let private_key = crypto::generate_key();
+        let mut server = Server::new_in_memory_with_config(
+            &network,
+            test_address(40000),
+            TEST_PROTOCOL_ID,
+            &private_key,
+            ServerConfig { max_connect_token_lifetime: 30 },
+            0.0,
+        )
+        .unwrap();
+        server.start_at(2, TEST_TIMESTAMP).unwrap();
+        assert_eq!(server.min_connect_token_expire_timestamp, TEST_TIMESTAMP + 30);
+
+        // 1. Token whose expire_timestamp is 1 second below the floor (TEST_TIMESTAMP + 29) is rejected.
+        let below_floor_token = generate_connect_token_at(
+            &[server.address()],
+            &[server.address()],
+            TEST_TIMESTAMP - 1,
+            30,
+            TEST_TOKEN_TIMEOUT,
+            1,
+            TEST_PROTOCOL_ID,
+            &private_key,
+            &[0; USER_DATA_BYTES],
+        )
+        .unwrap();
+        let probe_socket = network.bind(test_address(0));
+        let parsed = ConnectToken::read(&below_floor_token).unwrap();
+        assert_eq!(parsed.expire_timestamp, TEST_TIMESTAMP + 29);
+        let mut req_buf = [0u8; MAX_PACKET_BYTES];
+        let req_len = write_packet(
+            &Packet::Request {
+                protocol_id: parsed.protocol_id,
+                expire_timestamp: parsed.expire_timestamp,
+                nonce: parsed.nonce,
+                private_data: parsed.private_data.clone(),
+            },
+            &mut req_buf,
+            0,
+            &[0; KEY_BYTES],
+            parsed.protocol_id,
+        )
+        .unwrap();
+        probe_socket.send_to(&req_buf[..req_len], server.address());
+        server.update_at(0.1, TEST_TIMESTAMP);
+        let mut reply = [0u8; MAX_PACKET_BYTES];
+        assert!(probe_socket.recv_from(&mut reply).is_none());
+
+        // 2. Token at the floor (expire_timestamp == TEST_TIMESTAMP + 30) presented after it has expired
+        // (at current_timestamp == TEST_TIMESTAMP + 31) is rejected.
+        let boundary_token = generate_connect_token_at(
+            &[server.address()],
+            &[server.address()],
+            TEST_TIMESTAMP,
+            30,
+            TEST_TOKEN_TIMEOUT,
+            2,
+            TEST_PROTOCOL_ID,
+            &private_key,
+            &[0; USER_DATA_BYTES],
+        )
+        .unwrap();
+        let parsed_boundary = ConnectToken::read(&boundary_token).unwrap();
+        let req_len = write_packet(
+            &Packet::Request {
+                protocol_id: parsed_boundary.protocol_id,
+                expire_timestamp: parsed_boundary.expire_timestamp,
+                nonce: parsed_boundary.nonce,
+                private_data: parsed_boundary.private_data.clone(),
+            },
+            &mut req_buf,
+            0,
+            &[0; KEY_BYTES],
+            parsed_boundary.protocol_id,
+        )
+        .unwrap();
+        probe_socket.send_to(&req_buf[..req_len], server.address());
+        server.update_at(0.2, TEST_TIMESTAMP + 31);
+        assert!(probe_socket.recv_from(&mut reply).is_none());
+
+        // 3. The same token presented while valid (at TEST_TIMESTAMP + 10) receives a challenge.
+        probe_socket.send_to(&req_buf[..req_len], server.address());
+        server.update_at(0.3, TEST_TIMESTAMP + 10);
+        assert!(probe_socket.recv_from(&mut reply).is_some());
+    }
+
+    #[test]
+    fn in_memory_full_history_end_to_end_and_expiry_reuse() {
+        let network = socket::MemoryNetwork::new();
+        let private_key = crypto::generate_key();
+        let mut server = Server::new_in_memory(
+            &network,
+            test_address(40000),
+            TEST_PROTOCOL_ID,
+            &private_key,
+            0.0,
+        )
+        .unwrap();
+        server.start_at(4, TEST_TIMESTAMP).unwrap();
+
+        let mut time = 0.0;
+        let mut reply = [0u8; MAX_PACKET_BYTES];
+
+        // Fill all 2048 connect token history entries via real request packets.
+        for i in 0..MAX_CONNECT_TOKEN_ENTRIES {
+            let token_bytes = generate_connect_token_at(
+                &[server.address()],
+                &[server.address()],
+                TEST_TIMESTAMP,
+                TEST_TOKEN_EXPIRY,
+                TEST_TOKEN_TIMEOUT,
+                (i + 1) as u64,
+                TEST_PROTOCOL_ID,
+                &private_key,
+                &[0; USER_DATA_BYTES],
+            )
+            .unwrap();
+            let parsed = ConnectToken::read(&token_bytes).unwrap();
+            let sock = network.bind(test_address(0));
+            let mut req_buf = [0u8; MAX_PACKET_BYTES];
+            let req_len = write_packet(
+                &Packet::Request {
+                    protocol_id: parsed.protocol_id,
+                    expire_timestamp: parsed.expire_timestamp,
+                    nonce: parsed.nonce,
+                    private_data: parsed.private_data.clone(),
+                },
+                &mut req_buf,
+                0,
+                &[0; KEY_BYTES],
+                parsed.protocol_id,
+            )
+            .unwrap();
+            sock.send_to(&req_buf[..req_len], server.address());
+            time += 0.01;
+            server.update_at(time, TEST_TIMESTAMP);
+            assert!(sock.recv_from(&mut reply).is_some(), "entry {i} should receive a challenge");
+        }
+
+        // The 2049th token before expiry is refused because all 2048 entries are live.
+        let extra_token = generate_connect_token_at(
+            &[server.address()],
+            &[server.address()],
+            TEST_TIMESTAMP + 10,
+            TEST_TOKEN_EXPIRY,
+            TEST_TOKEN_TIMEOUT,
+            999_999,
+            TEST_PROTOCOL_ID,
+            &private_key,
+            &[0; USER_DATA_BYTES],
+        )
+        .unwrap();
+        let mut client = Client::new_in_memory(&network, test_address(0), time);
+        client.connect(&extra_token).unwrap();
+        for _ in 0..5 {
+            time += 0.1;
+            client.update_at(time, TEST_TIMESTAMP + 10);
+            server.update_at(time, TEST_TIMESTAMP + 10);
+        }
+        assert_eq!(client.state(), ClientState::SendingConnectionRequest);
+        assert_eq!(server.num_connected_clients(), 0);
+
+        // Once the wall clock advances to TEST_TIMESTAMP + 30, the first batch expires and
+        // the client completes its connection.
+        for _ in 0..10 {
+            time += 0.1;
+            client.update_at(time, TEST_TIMESTAMP + 30);
+            server.update_at(time, TEST_TIMESTAMP + 30);
+        }
+        assert_eq!(client.state(), ClientState::Connected);
+        assert_eq!(server.num_connected_clients(), 1);
+    }
+
+    #[test]
+    fn in_memory_256_clients_connect_and_257th_is_denied() {
+        let network = socket::MemoryNetwork::new();
+        let private_key = crypto::generate_key();
+        let mut server = Server::new_in_memory(
+            &network,
+            test_address(40000),
+            TEST_PROTOCOL_ID,
+            &private_key,
+            0.0,
+        )
+        .unwrap();
+        server.start_at(MAX_CLIENTS, TEST_TIMESTAMP).unwrap();
+
+        let mut time = 0.0;
+        let mut clients = Vec::with_capacity(MAX_CLIENTS);
+        for id in 0..MAX_CLIENTS {
+            let token = generate_connect_token_at(
+                &[server.address()],
+                &[server.address()],
+                TEST_TIMESTAMP,
+                TEST_TOKEN_EXPIRY,
+                TEST_TOKEN_TIMEOUT,
+                id as u64 + 1,
+                TEST_PROTOCOL_ID,
+                &private_key,
+                &[0; USER_DATA_BYTES],
+            )
+            .unwrap();
+            let mut client = Client::new_in_memory(&network, test_address(0), time);
+            client.connect(&token).unwrap();
+            clients.push(client);
+        }
+
+        for _ in 0..6 {
+            time += 0.1;
+            for client in &mut clients {
+                client.update_at(time, TEST_TIMESTAMP);
+            }
+            server.update_at(time, TEST_TIMESTAMP);
+        }
+        assert_eq!(server.num_connected_clients(), MAX_CLIENTS);
+        assert!(clients.iter().all(|c| c.state() == ClientState::Connected));
+
+        // 257th client is denied.
+        let extra_token = generate_connect_token_at(
+            &[server.address()],
+            &[server.address()],
+            TEST_TIMESTAMP,
+            TEST_TOKEN_EXPIRY,
+            TEST_TOKEN_TIMEOUT,
+            9999,
+            TEST_PROTOCOL_ID,
+            &private_key,
+            &[0; USER_DATA_BYTES],
+        )
+        .unwrap();
+        let mut extra_client = Client::new_in_memory(&network, test_address(0), time);
+        extra_client.connect(&extra_token).unwrap();
+        for _ in 0..5 {
+            time += 0.1;
+            extra_client.update_at(time, TEST_TIMESTAMP);
+            server.update_at(time, TEST_TIMESTAMP);
+        }
+        assert_eq!(extra_client.state(), ClientState::ConnectionDenied);
     }
 }

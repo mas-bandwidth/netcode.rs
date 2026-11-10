@@ -58,7 +58,7 @@
 //! let connect_token = netcode::generate_connect_token(
 //!     &[server_address],
 //!     &[server_address],
-//!     30,
+//!     netcode::DEFAULT_MAX_CONNECT_TOKEN_LIFETIME + 1,
 //!     5,
 //!     client_id,
 //!     protocol_id,

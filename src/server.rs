@@ -58,7 +58,7 @@ const MAX_SERVER_EVENTS: usize = MAX_CLIENTS * 4;
 #[derive(Debug, Clone, Copy)]
 pub struct ServerConfig {
     /// The longest lifetime, in seconds, of connect tokens issued by the backend.
-    /// A token whose expiry is earlier than the server start time plus this lifetime
+    /// A token whose expiry is at or before the server start time plus this lifetime
     /// is rejected. Values at or below zero use
     /// [`crate::DEFAULT_MAX_CONNECT_TOKEN_LIFETIME`].
     pub max_connect_token_lifetime: i32,
@@ -309,6 +309,9 @@ struct ConnectTokenEntry {
     state: ConnectTokenEntryState,
     #[allow(dead_code)]
     time: f64,
+    /// A token minted with negative `expire_seconds` stores `u64::MAX`, so this entry
+    /// never expires and its slot is never reused during the server run (development
+    /// and testing only).
     expire_timestamp: u64,
     mac: [u8; MAC_BYTES],
     address: Option<SocketAddr>,
@@ -1367,7 +1370,9 @@ mod tests {
     use crate::{CONNECT_TOKEN_BYTES, Client, ClientState};
 
     const TEST_PROTOCOL_ID: u64 = 0x1122334455667788;
-    const TEST_TOKEN_EXPIRY: i32 = 30;
+    // one second above the default maximum token lifetime, so a token generated just
+    // after a server start expires strictly after the start floor rather than at it
+    const TEST_TOKEN_EXPIRY: i32 = crate::DEFAULT_MAX_CONNECT_TOKEN_LIFETIME + 1;
     const TEST_TOKEN_TIMEOUT: i32 = 5;
     const TEST_TIMESTAMP: u64 = 1_000_000;
 
@@ -2130,13 +2135,13 @@ mod tests {
         let mut reply = [0u8; MAX_PACKET_BYTES];
         assert!(probe_socket.recv_from(&mut reply).is_none());
 
-        // 2. Token at the floor (expire_timestamp == TEST_TIMESTAMP + 30) presented after it has expired
-        // (at current_timestamp == TEST_TIMESTAMP + 31) is rejected.
+        // 2. Token just above the floor (expire_timestamp == TEST_TIMESTAMP + 31) presented after it
+        // has expired (at current_timestamp == TEST_TIMESTAMP + 32) is rejected.
         let boundary_token = generate_connect_token_at(
             &[server.address()],
             &[server.address()],
             TEST_TIMESTAMP,
-            30,
+            TEST_TOKEN_EXPIRY,
             TEST_TOKEN_TIMEOUT,
             2,
             TEST_PROTOCOL_ID,
@@ -2159,7 +2164,7 @@ mod tests {
         )
         .unwrap();
         probe_socket.send_to(&req_buf[..req_len], server.address());
-        server.update_at(0.2, TEST_TIMESTAMP + 31);
+        server.update_at(0.2, TEST_TIMESTAMP + 32);
         assert!(probe_socket.recv_from(&mut reply).is_none());
 
         // 3. The same token presented while valid (at TEST_TIMESTAMP + 10) receives a challenge.
@@ -2244,12 +2249,13 @@ mod tests {
         assert_eq!(client.state(), ClientState::SendingConnectionRequest);
         assert_eq!(server.num_connected_clients(), 0);
 
-        // Once the wall clock advances to TEST_TIMESTAMP + 30, the first batch expires and
+        // Once the wall clock advances to the first batch's expiry, those entries expire and
         // the client completes its connection.
+        let first_batch_expiry = TEST_TIMESTAMP + TEST_TOKEN_EXPIRY as u64;
         for _ in 0..10 {
             time += 0.1;
-            client.update_at(time, TEST_TIMESTAMP + 30);
-            server.update_at(time, TEST_TIMESTAMP + 30);
+            client.update_at(time, first_batch_expiry);
+            server.update_at(time, first_batch_expiry);
         }
         assert_eq!(client.state(), ClientState::Connected);
         assert_eq!(server.num_connected_clients(), 1);

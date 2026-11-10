@@ -9,7 +9,7 @@ use zeroize::Zeroize;
 
 use crate::packet::{AllowedPackets, Packet};
 use crate::replay::ReplayProtection;
-use crate::token::{self, CHALLENGE_TOKEN_BYTES, ConnectToken};
+use crate::token::{CHALLENGE_TOKEN_BYTES, ConnectToken};
 use crate::{
     CONNECT_TOKEN_BYTES, Error, KEY_BYTES, Key, MAX_CLIENTS, MAX_PACKET_BYTES, MAX_PAYLOAD_BYTES,
     NUM_DISCONNECT_PACKETS, PACKET_QUEUE_SIZE, PACKET_SEND_RATE, socket,
@@ -104,6 +104,7 @@ pub struct Client {
     connect_start_time: f64,
     last_packet_send_time: f64,
     last_packet_receive_time: f64,
+    initial_timestamps_set: bool,
     should_disconnect: Option<ClientState>,
     sequence: u64,
     client_index: usize,
@@ -218,6 +219,7 @@ impl Client {
             connect_start_time: 0.0,
             last_packet_send_time: -1000.0,
             last_packet_receive_time: -1000.0,
+            initial_timestamps_set: true,
             should_disconnect: None,
             sequence: 0,
             client_index: 0,
@@ -276,6 +278,9 @@ impl Client {
         self.connect_token = Some(connect_token);
 
         self.reset_before_next_connect();
+        // connect may be called before the first update, so the connection timestamps are
+        // taken from the time of the next update.
+        self.initial_timestamps_set = false;
         self.set_state(ClientState::SendingConnectionRequest);
 
         Ok(())
@@ -284,11 +289,17 @@ impl Client {
     /// Advances the client to the current time: receives and processes packets, sends
     /// queued packets and keep-alives, and applies timeouts.
     pub fn update(&mut self, time: f64) {
-        self.update_at(time, token::unix_timestamp());
+        self.update_at(time, 0);
     }
 
     pub(crate) fn update_at(&mut self, time: f64, current_timestamp: u64) {
         self.time = time;
+
+        if !self.initial_timestamps_set {
+            self.connect_start_time = time;
+            self.last_packet_receive_time = time;
+            self.initial_timestamps_set = true;
+        }
 
         self.receive_packets(current_timestamp);
         self.send_packets();
@@ -582,7 +593,12 @@ impl Client {
         }
     }
 
-    fn process_packet(&mut self, from: SocketAddr, packet_data: &mut [u8], current_timestamp: u64) {
+    fn process_packet(
+        &mut self,
+        from: SocketAddr,
+        packet_data: &mut [u8],
+        _current_timestamp: u64,
+    ) {
         if Some(from) != self.server_address {
             return;
         }
@@ -595,7 +611,7 @@ impl Client {
             packet_data,
             Some(&self.read_packet_key),
             connect_token.protocol_id,
-            current_timestamp,
+            0,
             None,
             AllowedPackets::CLIENT,
             Some(&mut self.replay_protection),
@@ -688,6 +704,9 @@ mod tests {
 
     const TEST_PROTOCOL_ID: u64 = 0x1122334455667788;
     const TEST_TIMESTAMP: u64 = 1_000_000;
+    // one second above the default maximum token lifetime, so a token generated in the
+    // server's start second expires strictly after the start floor
+    const TEST_TOKEN_EXPIRY: i32 = crate::DEFAULT_MAX_CONNECT_TOKEN_LIFETIME + 1;
 
     #[test]
     fn state_predicates() {
@@ -728,6 +747,32 @@ mod tests {
         let connect_token = [0u8; CONNECT_TOKEN_BYTES];
         assert!(client.connect(&connect_token).is_err());
         assert_eq!(client.state(), ClientState::InvalidConnectToken);
+    }
+
+    #[test]
+    fn connect_before_first_update_does_not_expire_the_token() {
+        let network = socket::MemoryNetwork::new();
+        let private_key = crypto::generate_key();
+        let dead_server: SocketAddr = "127.0.0.1:40001".parse().unwrap();
+
+        let token = generate_connect_token_at(
+            &[dead_server],
+            &[dead_server],
+            TEST_TIMESTAMP,
+            30,
+            5,
+            1,
+            TEST_PROTOCOL_ID,
+            &private_key,
+            &[0; USER_DATA_BYTES],
+        )
+        .unwrap();
+
+        let mut client = Client::new_in_memory(&network, "127.0.0.1:0".parse().unwrap(), 0.0);
+        client.connect(&token).unwrap();
+        client.update_at(100.0, TEST_TIMESTAMP);
+
+        assert_eq!(client.state(), ClientState::SendingConnectionRequest);
     }
 
     #[test]
@@ -781,7 +826,7 @@ mod tests {
             &[server.address()],
             &[server.address()],
             TEST_TIMESTAMP,
-            30,
+            TEST_TOKEN_EXPIRY,
             5,
             1,
             TEST_PROTOCOL_ID,
@@ -830,7 +875,7 @@ mod tests {
             &[server.address()],
             &[server.address()],
             TEST_TIMESTAMP,
-            30,
+            TEST_TOKEN_EXPIRY,
             5,
             1,
             TEST_PROTOCOL_ID,
@@ -880,6 +925,7 @@ mod tests {
 
         let mut client = Client::new_in_memory(&network, "127.0.0.1:0".parse().unwrap(), 0.0);
         client.connect(&token).unwrap();
+        client.update_at(0.0, TEST_TIMESTAMP);
 
         client.update_at(2.9, TEST_TIMESTAMP + 2);
         assert_eq!(client.state(), ClientState::SendingConnectionRequest);
@@ -903,7 +949,7 @@ mod tests {
             &[dead_v4, server.address()],
             &[dead_v4, server.address()],
             TEST_TIMESTAMP,
-            30,
+            TEST_TOKEN_EXPIRY,
             2,
             42,
             TEST_PROTOCOL_ID,

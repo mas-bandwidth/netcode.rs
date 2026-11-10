@@ -625,7 +625,6 @@ impl Server {
         self.challenge_key = [0; KEY_BYTES];
         self.min_connect_token_expire_timestamp = 0;
         self.clients.clear();
-        self.events.clear();
 
         reset_connect_token_entries(&mut self.connect_token_entries);
         self.encryption_manager.reset();
@@ -650,8 +649,8 @@ impl Server {
     }
 
     /// Pops the next connect or disconnect event. Drain these every update: at most
-    /// `MAX_CLIENTS * 4` events are kept, the oldest dropped first, and
-    /// [`Server::stop`] clears them.
+    /// `MAX_CLIENTS * 4` events are kept, the oldest dropped first. Events queued
+    /// before and by [`Server::stop`] stay available until drained.
     pub fn next_event(&mut self) -> Option<ServerEvent> {
         self.events.pop_front()
     }
@@ -1986,7 +1985,7 @@ mod tests {
     }
 
     #[test]
-    fn stop_clears_pending_events() {
+    fn stop_keeps_events_for_draining() {
         let network = socket::MemoryNetwork::new();
         let private_key = crypto::generate_key();
         let mut server = Server::new_in_memory(
@@ -2003,8 +2002,17 @@ mod tests {
         let _client = connect_in_memory_client(&network, &mut server, &private_key, 1, &mut time);
         assert_eq!(server.num_connected_clients(), 1);
 
+        // the connect event is left undrained; stop queues the disconnect after it
         server.stop();
         server.start_at(1, TEST_TIMESTAMP).unwrap();
+        assert_eq!(server.next_event(), Some(ServerEvent::ClientConnected { client_index: 0 }));
+        assert_eq!(
+            server.next_event(),
+            Some(ServerEvent::ClientDisconnected {
+                client_index: 0,
+                reason: DisconnectReason::ServerDisconnect,
+            })
+        );
         assert_eq!(server.next_event(), None);
     }
 

@@ -190,11 +190,19 @@ impl Client {
         Ok(client)
     }
 
-    fn has_socket_for(&self, server_address: SocketAddr) -> bool {
-        match server_address {
-            SocketAddr::V4(_) => self.socket_ipv4.is_some(),
-            SocketAddr::V6(_) => self.socket_ipv6.is_some(),
-        }
+    /// The index of the first server address at or after `start` that the client
+    /// has a socket for, skipping addresses of a family it did not bind.
+    fn next_reachable_server(
+        &self,
+        server_addresses: &[SocketAddr],
+        start: usize,
+    ) -> Option<usize> {
+        reachable_server_index(
+            server_addresses,
+            start,
+            self.socket_ipv4.is_some(),
+            self.socket_ipv6.is_some(),
+        )
     }
 
     /// Starts connecting to the servers listed in the connect token, trying each
@@ -215,20 +223,13 @@ impl Client {
         };
 
         let num_server_addresses = connect_token.server_addresses.len();
-        let mut server_address_index = 0;
-        while server_address_index < num_server_addresses {
-            let address = connect_token.server_addresses[server_address_index];
-            if self.has_socket_for(address) {
-                break;
-            }
-            debug!("client skipping server address with no matching socket family: {address}");
-            server_address_index += 1;
-        }
-        if server_address_index == num_server_addresses {
+        let Some(server_address_index) =
+            self.next_reachable_server(&connect_token.server_addresses, 0)
+        else {
             debug!("client has no server address with a matching socket family");
             self.set_state(ClientState::InvalidConnectToken);
             return Err(Error::InvalidConnectToken);
-        }
+        };
 
         self.server_address_index = server_address_index;
         let server_address = connect_token.server_addresses[server_address_index];
@@ -437,19 +438,12 @@ impl Client {
         };
         let num_server_addresses = connect_token.server_addresses.len();
 
-        let mut server_address_index = self.server_address_index + 1;
-        while server_address_index < num_server_addresses {
-            let address = connect_token.server_addresses[server_address_index];
-            if self.has_socket_for(address) {
-                break;
-            }
-            debug!("client skipping server address with no matching socket family: {address}");
-            server_address_index += 1;
-        }
-        if server_address_index >= num_server_addresses {
+        let Some(server_address_index) = self
+            .next_reachable_server(&connect_token.server_addresses, self.server_address_index + 1)
+        else {
             debug!("client has no more servers to connect to");
             return false;
-        }
+        };
 
         let server_address = connect_token.server_addresses[server_address_index];
         self.server_address_index = server_address_index;
@@ -651,6 +645,18 @@ impl Client {
     }
 }
 
+fn reachable_server_index(
+    server_addresses: &[SocketAddr],
+    start: usize,
+    has_ipv4: bool,
+    has_ipv6: bool,
+) -> Option<usize> {
+    (start..server_addresses.len()).find(|&index| match server_addresses[index] {
+        SocketAddr::V4(_) => has_ipv4,
+        SocketAddr::V6(_) => has_ipv6,
+    })
+}
+
 impl Drop for Client {
     fn drop(&mut self) {
         self.disconnect();
@@ -721,90 +727,33 @@ mod tests {
         )
         .unwrap();
 
-        let mut client = Client::new("127.0.0.1:0".parse().unwrap(), 0.0).unwrap();
+        // no sockets bound, so no server address family can be reached
+        let mut client = Client::create(None, None, true, 1000.0).unwrap();
         assert!(client.connect(&connect_token).is_err());
         assert_eq!(client.state(), ClientState::InvalidConnectToken);
+        assert_eq!(client.server_address(), None);
     }
 
     #[test]
-    fn connect_skips_server_addresses_without_a_matching_socket_family() {
-        const PROTOCOL_ID: u64 = 0x1122334455667788;
+    fn reachable_server_index_skips_unbound_address_families() {
+        let ipv4_a: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        let ipv6: SocketAddr = "[::1]:40001".parse().unwrap();
+        let ipv4_b: SocketAddr = "127.0.0.1:40002".parse().unwrap();
 
-        let ipv6_server: SocketAddr = "[::1]:40000".parse().unwrap();
-        let ipv4_server: SocketAddr = "127.0.0.1:40001".parse().unwrap();
-        let private_key = crate::generate_key();
-        let connect_token = crate::generate_connect_token(
-            &[ipv6_server, ipv4_server],
-            &[ipv6_server, ipv4_server],
-            30,
-            5,
-            0x1234,
-            PROTOCOL_ID,
-            &private_key,
-            &[0; crate::USER_DATA_BYTES],
-        )
-        .unwrap();
+        // ipv4-only client
+        assert_eq!(reachable_server_index(&[ipv6], 0, true, false), None);
+        assert_eq!(reachable_server_index(&[ipv6, ipv4_a], 0, true, false), Some(1));
+        assert_eq!(reachable_server_index(&[ipv4_a, ipv6, ipv4_b], 1, true, false), Some(2));
+        assert_eq!(reachable_server_index(&[ipv4_a, ipv6], 1, true, false), None);
 
-        let mut client = Client::new("127.0.0.1:0".parse().unwrap(), 0.0).unwrap();
-        client.connect(&connect_token).unwrap();
+        // ipv6-only client
+        assert_eq!(reachable_server_index(&[ipv4_a], 0, false, true), None);
+        assert_eq!(reachable_server_index(&[ipv4_a, ipv6], 0, false, true), Some(1));
 
-        assert_eq!(client.state(), ClientState::SendingConnectionRequest);
-        assert_eq!(client.server_address(), Some(ipv4_server));
-    }
-
-    #[test]
-    fn connect_to_next_server_skips_unsupported_address_families() {
-        const PROTOCOL_ID: u64 = 0x1122334455667788;
-
-        let first_ipv4_server: SocketAddr = "127.0.0.1:40000".parse().unwrap();
-        let ipv6_server: SocketAddr = "[::1]:40001".parse().unwrap();
-        let second_ipv4_server: SocketAddr = "127.0.0.1:40002".parse().unwrap();
-        let private_key = crate::generate_key();
-        let connect_token = crate::generate_connect_token(
-            &[first_ipv4_server, ipv6_server, second_ipv4_server],
-            &[first_ipv4_server, ipv6_server, second_ipv4_server],
-            30,
-            5,
-            0x1234,
-            PROTOCOL_ID,
-            &private_key,
-            &[0; crate::USER_DATA_BYTES],
-        )
-        .unwrap();
-
-        let mut client = Client::new("127.0.0.1:0".parse().unwrap(), 0.0).unwrap();
-        client.connect(&connect_token).unwrap();
-        assert_eq!(client.server_address(), Some(first_ipv4_server));
-
-        assert!(client.connect_to_next_server());
-        assert_eq!(client.state(), ClientState::SendingConnectionRequest);
-        assert_eq!(client.server_address(), Some(second_ipv4_server));
-    }
-
-    #[test]
-    fn connect_to_next_server_stops_when_no_remaining_address_family_matches() {
-        const PROTOCOL_ID: u64 = 0x1122334455667788;
-
-        let ipv4_server: SocketAddr = "127.0.0.1:40000".parse().unwrap();
-        let ipv6_server: SocketAddr = "[::1]:40001".parse().unwrap();
-        let private_key = crate::generate_key();
-        let connect_token = crate::generate_connect_token(
-            &[ipv4_server, ipv6_server],
-            &[ipv4_server, ipv6_server],
-            30,
-            5,
-            0x1234,
-            PROTOCOL_ID,
-            &private_key,
-            &[0; crate::USER_DATA_BYTES],
-        )
-        .unwrap();
-
-        let mut client = Client::new("127.0.0.1:0".parse().unwrap(), 0.0).unwrap();
-        client.connect(&connect_token).unwrap();
-        assert_eq!(client.server_address(), Some(ipv4_server));
-
-        assert!(!client.connect_to_next_server());
+        // dual-stack client takes addresses in order
+        assert_eq!(reachable_server_index(&[ipv6, ipv4_a], 0, true, true), Some(0));
+        assert_eq!(reachable_server_index(&[ipv6, ipv4_a], 1, true, true), Some(1));
+        assert_eq!(reachable_server_index(&[ipv6, ipv4_a], 2, true, true), None);
     }
 
     #[test]
@@ -882,8 +831,12 @@ mod tests {
         )
         .unwrap();
 
+        // a client with no sockets cannot connect, so set up the connection directly
         let mut client = Client::create(None, None, true, 1000.0).unwrap();
-        client.connect(&connect_token).unwrap();
+        let token = ConnectToken::read(&connect_token).unwrap();
+        client.read_packet_key = token.server_to_client_key;
+        client.server_address = Some(server_address);
+        client.connect_token = Some(token);
         client.state = ClientState::SendingConnectionResponse;
         client.client_index = CLIENT_INDEX;
         client.max_clients = 7;

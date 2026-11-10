@@ -10,7 +10,8 @@
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
-use crate::bytes::Reader;
+use crate::bytes::{Reader, Writer};
+use crate::crypto;
 use crate::packet::{self, AllowedPackets, Packet};
 use crate::replay::ReplayProtection;
 use crate::token::{
@@ -18,8 +19,8 @@ use crate::token::{
     ConnectToken, PrivateConnectToken,
 };
 use crate::{
-    CONNECT_TOKEN_BYTES, KEY_BYTES, Key, MAX_PACKET_BYTES, MAX_PAYLOAD_BYTES,
-    MAX_SERVERS_PER_CONNECT, USER_DATA_BYTES,
+    CONNECT_TOKEN_BYTES, KEY_BYTES, Key, MAC_BYTES, MAX_PACKET_BYTES, MAX_PAYLOAD_BYTES,
+    MAX_SERVERS_PER_CONNECT, USER_DATA_BYTES, VERSION_INFO,
 };
 
 const FUZZ_PROTOCOL_ID: u64 = 0x1122334455667788;
@@ -28,8 +29,9 @@ const FUZZ_PROTOCOL_ID: u64 = 0x1122334455667788;
 const FUZZ_KEY: Key = [0x5A; KEY_BYTES];
 const FUZZ_PRIVATE_KEY: Key = [0xA5; KEY_BYTES];
 
-/// Feeds raw bytes to the packet reader as both a server and a client. Malformed and
-/// unauthenticated packets must be ignored, never panic.
+/// Feeds raw bytes to the packet reader as both a server and a client. Also encrypts
+/// a prefix, sequence and plaintext taken from those bytes and feeds that packet to
+/// both readers. Malformed packets must be ignored, never panic.
 pub fn read_packet_raw(data: &[u8]) {
     let mut replay_protection = ReplayProtection::new();
 
@@ -52,6 +54,84 @@ pub fn read_packet_raw(data: &[u8]) {
         0,
         None,
         AllowedPackets::CLIENT,
+        Some(&mut replay_protection),
+    );
+
+    read_packet_authenticated(data);
+}
+
+/// Encrypts a prefix byte, sequence number and plaintext body taken from `data` under
+/// the fixed fuzz key, then passes that ciphertext to the packet reader for both
+/// server-allowed and client-allowed packet types.
+///
+/// `data` is `prefix || sequence (8 bytes, little-endian) || plaintext`. The high
+/// nibble of the prefix is how many low bytes of the sequence are on the wire.
+pub fn read_packet_authenticated(data: &[u8]) {
+    let Some(sealed) = seal_fuzz_packet(data) else {
+        return;
+    };
+    feed_sealed(&sealed, AllowedPackets::SERVER, Some(&FUZZ_PRIVATE_KEY));
+    feed_sealed(&sealed, AllowedPackets::CLIENT, None);
+}
+
+fn seal_fuzz_packet(data: &[u8]) -> Option<Vec<u8>> {
+    if data.len() < 1 + 8 {
+        return None;
+    }
+    let prefix_byte = data[0];
+    let sequence = u64::from_le_bytes(data[1..9].try_into().unwrap());
+    let body_end = data.len().min(9 + MAX_PACKET_BYTES);
+    seal_prefixed_packet(prefix_byte, sequence, &data[9..body_end], &FUZZ_KEY, FUZZ_PROTOCOL_ID)
+}
+
+fn seal_prefixed_packet(
+    prefix_byte: u8,
+    sequence: u64,
+    body: &[u8],
+    key: &Key,
+    protocol_id: u64,
+) -> Option<Vec<u8>> {
+    let sequence_bytes = (prefix_byte >> 4) as usize;
+    if !(1..=8).contains(&sequence_bytes) {
+        return None;
+    }
+
+    // the reader rebuilds the sequence from the low bytes carried on the wire
+    let mut sequence_le = sequence.to_le_bytes();
+    sequence_le[sequence_bytes..].fill(0);
+    let sequence = u64::from_le_bytes(sequence_le);
+
+    let mut sealed = Vec::with_capacity(1 + sequence_bytes + body.len() + MAC_BYTES);
+    sealed.push(prefix_byte);
+    sealed.extend_from_slice(&sequence_le[..sequence_bytes]);
+    sealed.extend_from_slice(body);
+    sealed.extend_from_slice(&[0u8; MAC_BYTES]);
+
+    let additional = fuzz_additional_data(protocol_id, prefix_byte);
+    let nonce = crypto::sequence_nonce(sequence);
+    crypto::encrypt_aead(&mut sealed[1 + sequence_bytes..], &additional, &nonce, key).ok()?;
+    Some(sealed)
+}
+
+fn fuzz_additional_data(protocol_id: u64, prefix_byte: u8) -> [u8; 13 + 8 + 1] {
+    let mut additional_data = [0u8; 13 + 8 + 1];
+    let mut writer = Writer::new(&mut additional_data);
+    writer.write_bytes(&VERSION_INFO);
+    writer.write_u64(protocol_id);
+    writer.write_u8(prefix_byte);
+    additional_data
+}
+
+fn feed_sealed(sealed: &[u8], allowed: AllowedPackets, private_key: Option<&Key>) {
+    let mut replay_protection = ReplayProtection::new();
+    let mut buffer = sealed.to_vec();
+    let _ = packet::read_packet(
+        &mut buffer,
+        Some(&FUZZ_KEY),
+        FUZZ_PROTOCOL_ID,
+        0,
+        private_key,
+        allowed,
         Some(&mut replay_protection),
     );
 }
@@ -110,6 +190,12 @@ pub fn packet_write_read_round_trip(data: &[u8]) {
     };
 
     let mut buffer = [0u8; MAX_PACKET_BYTES];
+    if sequence == u64::MAX {
+        let refused =
+            packet::write_packet(&packet, &mut buffer, sequence, &FUZZ_KEY, FUZZ_PROTOCOL_ID);
+        assert!(refused.is_err());
+        return;
+    }
     let written = packet::write_packet(&packet, &mut buffer, sequence, &FUZZ_KEY, FUZZ_PROTOCOL_ID)
         .expect("write_packet must succeed for a valid packet");
 
@@ -251,4 +337,80 @@ pub fn private_connect_token_round_trip(data: &[u8]) {
     let reread = PrivateConnectToken::read(&written[..])
         .expect("a written private connect token must re-read");
     assert_eq!(reread, token);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fuzz_input(packet_type: u8, body: &[u8]) -> Vec<u8> {
+        let mut data = Vec::with_capacity(1 + 8 + body.len());
+        data.push(packet_type | (1 << 4));
+        data.extend_from_slice(&1u64.to_le_bytes());
+        data.extend_from_slice(body);
+        data
+    }
+
+    fn read_fuzz_body(packet_type: u8, body: &[u8]) -> Option<(Packet, u64)> {
+        let sealed = seal_fuzz_packet(&fuzz_input(packet_type, body)).expect("seal");
+        let allowed = if packet_type == packet::CONNECTION_RESPONSE_PACKET {
+            AllowedPackets::SERVER
+        } else {
+            AllowedPackets::CLIENT
+        };
+        let mut buffer = sealed;
+        packet::read_packet(&mut buffer, Some(&FUZZ_KEY), FUZZ_PROTOCOL_ID, 0, None, allowed, None)
+    }
+
+    #[test]
+    fn authenticated_body_lengths() {
+        let rows = [
+            (packet::CONNECTION_DENIED_PACKET, 0usize, true),
+            (packet::CONNECTION_DENIED_PACKET, 1usize, false),
+            (packet::CONNECTION_CHALLENGE_PACKET, 8 + CHALLENGE_TOKEN_BYTES - 1, false),
+            (packet::CONNECTION_CHALLENGE_PACKET, 8 + CHALLENGE_TOKEN_BYTES, true),
+            (packet::CONNECTION_CHALLENGE_PACKET, 8 + CHALLENGE_TOKEN_BYTES + 1, false),
+            (packet::CONNECTION_RESPONSE_PACKET, 8 + CHALLENGE_TOKEN_BYTES - 1, false),
+            (packet::CONNECTION_RESPONSE_PACKET, 8 + CHALLENGE_TOKEN_BYTES, true),
+            (packet::CONNECTION_RESPONSE_PACKET, 8 + CHALLENGE_TOKEN_BYTES + 1, false),
+            (packet::CONNECTION_KEEP_ALIVE_PACKET, 7, false),
+            (packet::CONNECTION_KEEP_ALIVE_PACKET, 8, true),
+            (packet::CONNECTION_KEEP_ALIVE_PACKET, 9, false),
+            (packet::CONNECTION_PAYLOAD_PACKET, 0, false),
+            (packet::CONNECTION_PAYLOAD_PACKET, 1, true),
+            (packet::CONNECTION_PAYLOAD_PACKET, MAX_PAYLOAD_BYTES, true),
+            (packet::CONNECTION_PAYLOAD_PACKET, MAX_PAYLOAD_BYTES + 1, false),
+            (packet::CONNECTION_DISCONNECT_PACKET, 0, true),
+            (packet::CONNECTION_DISCONNECT_PACKET, 1, false),
+        ];
+
+        for (packet_type, body_len, accept) in rows {
+            let parsed = read_fuzz_body(packet_type, &vec![0u8; body_len]);
+            if accept {
+                let (packet, sequence) = parsed.expect("accepted body");
+                assert_eq!(sequence, 1);
+                assert_eq!(packet.packet_type(), packet_type);
+            } else {
+                assert!(parsed.is_none());
+            }
+        }
+
+        for packet_type in [packet::CONNECTION_DENIED_PACKET, packet::CONNECTION_DISCONNECT_PACKET]
+        {
+            let mut sealed = seal_fuzz_packet(&fuzz_input(packet_type, &[])).expect("seal");
+            sealed.pop();
+            assert!(
+                packet::read_packet(
+                    &mut sealed,
+                    Some(&FUZZ_KEY),
+                    FUZZ_PROTOCOL_ID,
+                    0,
+                    None,
+                    AllowedPackets::CLIENT,
+                    None,
+                )
+                .is_none()
+            );
+        }
+    }
 }

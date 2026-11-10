@@ -2,15 +2,16 @@
 
 use std::collections::VecDeque;
 use std::fmt;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::SocketAddr;
 
 use log::{debug, info};
+use zeroize::Zeroize;
 
 use crate::packet::{AllowedPackets, Packet};
 use crate::replay::ReplayProtection;
-use crate::token::{self, CHALLENGE_TOKEN_BYTES, ConnectToken};
+use crate::token::{CHALLENGE_TOKEN_BYTES, ConnectToken};
 use crate::{
-    CONNECT_TOKEN_BYTES, Error, KEY_BYTES, Key, MAX_PACKET_BYTES, MAX_PAYLOAD_BYTES,
+    CONNECT_TOKEN_BYTES, Error, KEY_BYTES, Key, MAX_CLIENTS, MAX_PACKET_BYTES, MAX_PAYLOAD_BYTES,
     NUM_DISCONNECT_PACKETS, PACKET_QUEUE_SIZE, PACKET_SEND_RATE, socket,
 };
 
@@ -103,6 +104,7 @@ pub struct Client {
     connect_start_time: f64,
     last_packet_send_time: f64,
     last_packet_receive_time: f64,
+    initial_timestamps_set: bool,
     should_disconnect: Option<ClientState>,
     sequence: u64,
     client_index: usize,
@@ -110,8 +112,8 @@ pub struct Client {
     server_address_index: usize,
     server_address: Option<SocketAddr>,
     connect_token: Option<ConnectToken>,
-    socket_ipv4: Option<UdpSocket>,
-    socket_ipv6: Option<UdpSocket>,
+    socket_ipv4: Option<socket::Transport>,
+    socket_ipv6: Option<socket::Transport>,
     primary_is_ipv4: bool,
     write_packet_key: Key,
     read_packet_key: Key,
@@ -151,6 +153,49 @@ impl Client {
         Self::create(Some(bind_address_ipv4), Some(bind_address_ipv6), true, time)
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_in_memory(
+        network: &socket::MemoryNetwork,
+        bind_address: SocketAddr,
+        time: f64,
+    ) -> Self {
+        match bind_address {
+            SocketAddr::V4(_) => Self::with_transports(
+                Some(socket::Transport::Memory(network.bind(bind_address))),
+                None,
+                true,
+                time,
+            ),
+            SocketAddr::V6(_) => Self::with_transports(
+                None,
+                Some(socket::Transport::Memory(network.bind(bind_address))),
+                false,
+                time,
+            ),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_dual_in_memory(
+        network: &socket::MemoryNetwork,
+        bind_address_ipv4: SocketAddr,
+        bind_address_ipv6: SocketAddr,
+        time: f64,
+    ) -> Result<Self, Error> {
+        if !bind_address_ipv4.is_ipv4() || !bind_address_ipv6.is_ipv6() {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "new_dual requires one IPv4 and one IPv6 bind address",
+            )));
+        }
+        Ok(Self::with_transports(
+            Some(socket::Transport::Memory(network.bind(bind_address_ipv4))),
+            Some(socket::Transport::Memory(network.bind(bind_address_ipv6))),
+            true,
+            time,
+        ))
+    }
+
     fn create(
         bind_address_ipv4: Option<SocketAddr>,
         bind_address_ipv6: Option<SocketAddr>,
@@ -159,13 +204,22 @@ impl Client {
     ) -> Result<Self, Error> {
         let socket_ipv4 = bind_address_ipv4.map(socket::create_socket).transpose()?;
         let socket_ipv6 = bind_address_ipv6.map(socket::create_socket).transpose()?;
+        Ok(Self::with_transports(socket_ipv4, socket_ipv6, primary_is_ipv4, time))
+    }
 
+    fn with_transports(
+        socket_ipv4: Option<socket::Transport>,
+        socket_ipv6: Option<socket::Transport>,
+        primary_is_ipv4: bool,
+        time: f64,
+    ) -> Self {
         let client = Self {
             state: ClientState::Disconnected,
             time,
             connect_start_time: 0.0,
             last_packet_send_time: -1000.0,
             last_packet_receive_time: -1000.0,
+            initial_timestamps_set: true,
             should_disconnect: None,
             sequence: 0,
             client_index: 0,
@@ -186,7 +240,22 @@ impl Client {
 
         info!("client started on port {}", client.port());
 
-        Ok(client)
+        client
+    }
+
+    /// The index of the first server address at or after `start` that the client
+    /// has a socket for, skipping addresses of a family it did not bind.
+    fn next_reachable_server(
+        &self,
+        server_addresses: &[SocketAddr],
+        start: usize,
+    ) -> Option<usize> {
+        reachable_server_index(
+            server_addresses,
+            start,
+            self.socket_ipv4.is_some(),
+            self.socket_ipv6.is_some(),
+        )
     }
 
     /// Starts connecting to the servers listed in the connect token, trying each
@@ -206,16 +275,27 @@ impl Client {
             }
         };
 
-        self.server_address_index = 0;
-        self.server_address = Some(connect_token.server_addresses[0]);
+        let num_server_addresses = connect_token.server_addresses.len();
+        let Some(server_address_index) =
+            self.next_reachable_server(&connect_token.server_addresses, 0)
+        else {
+            debug!("client has no server address with a matching socket family");
+            self.set_state(ClientState::InvalidConnectToken);
+            return Err(Error::InvalidConnectToken);
+        };
 
-        if connect_token.server_addresses.len() == 1 {
-            info!("client connecting to server {}", connect_token.server_addresses[0]);
+        self.server_address_index = server_address_index;
+        let server_address = connect_token.server_addresses[server_address_index];
+        self.server_address = Some(server_address);
+
+        if num_server_addresses == 1 {
+            info!("client connecting to server {}", server_address);
         } else {
             info!(
-                "client connecting to server {} [1/{}]",
-                connect_token.server_addresses[0],
-                connect_token.server_addresses.len()
+                "client connecting to server {} [{}/{}]",
+                server_address,
+                server_address_index + 1,
+                num_server_addresses
             );
         }
 
@@ -225,6 +305,9 @@ impl Client {
 
         self.connect_start_time = self.time;
         self.reset_before_next_connect();
+        // connect may be called before the first update, so the connection timestamps are
+        // taken from the time of the next update.
+        self.initial_timestamps_set = false;
         self.set_state(ClientState::SendingConnectionRequest);
 
         Ok(())
@@ -233,9 +316,19 @@ impl Client {
     /// Advances the client to the current time: receives and processes packets, sends
     /// queued packets and keep-alives, and applies timeouts.
     pub fn update(&mut self, time: f64) {
+        self.update_at(time, 0);
+    }
+
+    pub(crate) fn update_at(&mut self, time: f64, current_timestamp: u64) {
         self.time = time;
 
-        self.receive_packets();
+        if !self.initial_timestamps_set {
+            self.connect_start_time = time;
+            self.last_packet_receive_time = time;
+            self.initial_timestamps_set = true;
+        }
+
+        self.receive_packets(current_timestamp);
         self.send_packets();
 
         if self.state.is_connecting() {
@@ -250,7 +343,9 @@ impl Client {
 
         if let Some(disconnect_state) = self.should_disconnect {
             debug!("client should disconnect -> {disconnect_state}");
-            if self.connect_to_next_server() {
+            // only a client still connecting tries the next server address. a connected
+            // client that receives a disconnect transitions straight to disconnected.
+            if self.state.is_connecting() && self.connect_to_next_server() {
                 return;
             }
             self.disconnect_internal(disconnect_state, false);
@@ -409,13 +504,15 @@ impl Client {
         };
         let num_server_addresses = connect_token.server_addresses.len();
 
-        if self.server_address_index + 1 >= num_server_addresses {
+        let Some(server_address_index) = self
+            .next_reachable_server(&connect_token.server_addresses, self.server_address_index + 1)
+        else {
             debug!("client has no more servers to connect to");
             return false;
-        }
+        };
 
-        self.server_address_index += 1;
-        let server_address = connect_token.server_addresses[self.server_address_index];
+        let server_address = connect_token.server_addresses[server_address_index];
+        self.server_address_index = server_address_index;
         self.server_address = Some(server_address);
 
         self.reset_before_next_connect();
@@ -423,7 +520,7 @@ impl Client {
         info!(
             "client connecting to next server {} [{}/{}]",
             server_address,
-            self.server_address_index + 1,
+            server_address_index + 1,
             num_server_addresses
         );
 
@@ -502,29 +599,40 @@ impl Client {
         self.last_packet_send_time = self.time;
     }
 
-    fn receive_packets(&mut self) {
+    fn receive_packets(&mut self, current_timestamp: u64) {
         let mut packet_data = [0u8; MAX_PACKET_BYTES];
-        loop {
-            // the client only talks to one server, so receive on the socket matching
-            // the current server address family. the socket borrow is scoped to the
-            // receive call so packet processing can borrow self mutably.
-            let socket = match self.server_address {
-                Some(SocketAddr::V4(_)) => self.socket_ipv4.as_ref(),
-                Some(SocketAddr::V6(_)) => self.socket_ipv6.as_ref(),
-                None => None,
-            };
-            let Some(socket) = socket else {
-                return;
-            };
-            let Some((packet_bytes, from)) = socket::receive_packet(socket, &mut packet_data)
-            else {
-                return;
-            };
-            self.process_packet(from, &mut packet_data[..packet_bytes]);
+        // drain both sockets on every update, so packets that arrive while the client is
+        // not connecting or connected, or on the other address family, are discarded
+        // rather than left queued. the socket borrow is scoped to the receive call so
+        // packet processing can borrow self mutably.
+        for ipv4 in [true, false] {
+            loop {
+                let socket =
+                    if ipv4 { self.socket_ipv4.as_ref() } else { self.socket_ipv6.as_ref() };
+                let Some(socket) = socket else {
+                    break;
+                };
+                let Some((packet_bytes, from)) = socket::receive_packet(socket, &mut packet_data)
+                else {
+                    break;
+                };
+                if self.state.is_connecting() || self.state == ClientState::Connected {
+                    self.process_packet(from, &mut packet_data[..packet_bytes], current_timestamp);
+                }
+            }
         }
     }
 
-    fn process_packet(&mut self, from: SocketAddr, packet_data: &mut [u8]) {
+    fn process_packet(
+        &mut self,
+        from: SocketAddr,
+        packet_data: &mut [u8],
+        _current_timestamp: u64,
+    ) {
+        if Some(from) != self.server_address {
+            return;
+        }
+
         let Some(connect_token) = self.connect_token.as_ref() else {
             return;
         };
@@ -533,17 +641,13 @@ impl Client {
             packet_data,
             Some(&self.read_packet_key),
             connect_token.protocol_id,
-            token::unix_timestamp(),
+            0,
             None,
             AllowedPackets::CLIENT,
             Some(&mut self.replay_protection),
         ) else {
             return;
         };
-
-        if Some(from) != self.server_address {
-            return;
-        }
 
         match packet {
             Packet::Denied => {
@@ -563,6 +667,16 @@ impl Client {
                     self.last_packet_receive_time = self.time;
                     self.set_state(ClientState::SendingConnectionResponse);
                 }
+            }
+
+            Packet::KeepAlive { client_index, max_clients }
+                if max_clients == 0
+                    || max_clients as usize > MAX_CLIENTS
+                    || client_index >= max_clients =>
+            {
+                debug!(
+                    "ignored connection keep alive packet. client index or max clients is out of range"
+                );
             }
 
             Packet::KeepAlive { client_index, max_clients } => match self.state {
@@ -604,15 +718,37 @@ impl Client {
     }
 }
 
+fn reachable_server_index(
+    server_addresses: &[SocketAddr],
+    start: usize,
+    has_ipv4: bool,
+    has_ipv6: bool,
+) -> Option<usize> {
+    (start..server_addresses.len()).find(|&index| match server_addresses[index] {
+        SocketAddr::V4(_) => has_ipv4,
+        SocketAddr::V6(_) => has_ipv6,
+    })
+}
+
 impl Drop for Client {
     fn drop(&mut self) {
         self.disconnect();
+        self.write_packet_key.zeroize();
+        self.read_packet_key.zeroize();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::generate_connect_token_at;
+    use crate::{Server, USER_DATA_BYTES, crypto};
+
+    const TEST_PROTOCOL_ID: u64 = 0x1122334455667788;
+    const TEST_TIMESTAMP: u64 = 1_000_000;
+    // one second above the default maximum token lifetime, so a token generated in the
+    // server's start second expires strictly after the start floor
+    const TEST_TOKEN_EXPIRY: i32 = crate::DEFAULT_MAX_CONNECT_TOKEN_LIFETIME + 1;
 
     #[test]
     fn state_predicates() {
@@ -686,9 +822,567 @@ mod tests {
 
     #[test]
     fn invalid_connect_token() {
-        let mut client = Client::new("127.0.0.1:0".parse().unwrap(), 0.0).unwrap();
+        let network = socket::MemoryNetwork::new();
+        let mut client = Client::new_in_memory(&network, "127.0.0.1:0".parse().unwrap(), 0.0);
         let connect_token = [0u8; CONNECT_TOKEN_BYTES];
         assert!(client.connect(&connect_token).is_err());
         assert_eq!(client.state(), ClientState::InvalidConnectToken);
+    }
+
+    #[test]
+    fn ipv6_only_client_rejects_a_token_with_only_an_ipv4_address() {
+        let network = socket::MemoryNetwork::new();
+        let private_key = crypto::generate_key();
+        let ipv4_server: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+
+        let token = generate_connect_token_at(
+            &[ipv4_server],
+            &[ipv4_server],
+            TEST_TIMESTAMP,
+            30,
+            5,
+            1,
+            TEST_PROTOCOL_ID,
+            &private_key,
+            &[0; USER_DATA_BYTES],
+        )
+        .unwrap();
+
+        let mut client = Client::new_in_memory(&network, "[::1]:0".parse().unwrap(), 0.0);
+        assert!(client.connect(&token).is_err());
+        assert_eq!(client.state(), ClientState::InvalidConnectToken);
+        assert_eq!(client.server_address(), None);
+    }
+
+    #[test]
+    fn connect_token_with_only_an_unreachable_address_family_is_invalid() {
+        let network = socket::MemoryNetwork::new();
+        let private_key = crypto::generate_key();
+        let ipv6_server: SocketAddr = "[::1]:40000".parse().unwrap();
+
+        let token = generate_connect_token_at(
+            &[ipv6_server],
+            &[ipv6_server],
+            TEST_TIMESTAMP,
+            30,
+            5,
+            1,
+            TEST_PROTOCOL_ID,
+            &private_key,
+            &[0; USER_DATA_BYTES],
+        )
+        .unwrap();
+
+        let mut client = Client::new_in_memory(&network, "127.0.0.1:0".parse().unwrap(), 0.0);
+        assert!(client.connect(&token).is_err());
+        assert_eq!(client.state(), ClientState::InvalidConnectToken);
+        assert_eq!(client.server_address(), None);
+    }
+
+    #[test]
+    fn connect_skips_an_unreachable_address_family_to_a_reachable_one() {
+        let network = socket::MemoryNetwork::new();
+        let private_key = crypto::generate_key();
+        let ipv6_server: SocketAddr = "[::1]:40000".parse().unwrap();
+        let ipv4_server: SocketAddr = "127.0.0.1:40001".parse().unwrap();
+
+        let token = generate_connect_token_at(
+            &[ipv6_server, ipv4_server],
+            &[ipv6_server, ipv4_server],
+            TEST_TIMESTAMP,
+            30,
+            5,
+            1,
+            TEST_PROTOCOL_ID,
+            &private_key,
+            &[0; USER_DATA_BYTES],
+        )
+        .unwrap();
+
+        let mut client = Client::new_in_memory(&network, "127.0.0.1:0".parse().unwrap(), 0.0);
+        client.connect(&token).unwrap();
+        assert_eq!(client.server_address_index, 1);
+        assert_eq!(client.server_address(), Some(ipv4_server));
+        assert_eq!(client.state(), ClientState::SendingConnectionRequest);
+    }
+
+    #[test]
+    fn reachable_server_index_skips_unbound_address_families() {
+        let ipv4_a: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        let ipv6: SocketAddr = "[::1]:40001".parse().unwrap();
+        let ipv4_b: SocketAddr = "127.0.0.1:40002".parse().unwrap();
+
+        // ipv4-only client
+        assert_eq!(reachable_server_index(&[ipv6], 0, true, false), None);
+        assert_eq!(reachable_server_index(&[ipv6, ipv4_a], 0, true, false), Some(1));
+        assert_eq!(reachable_server_index(&[ipv4_a, ipv6, ipv4_b], 1, true, false), Some(2));
+        assert_eq!(reachable_server_index(&[ipv4_a, ipv6], 1, true, false), None);
+
+        // ipv6-only client
+        assert_eq!(reachable_server_index(&[ipv4_a], 0, false, true), None);
+        assert_eq!(reachable_server_index(&[ipv4_a, ipv6], 0, false, true), Some(1));
+
+        // dual-stack client takes addresses in order
+        assert_eq!(reachable_server_index(&[ipv6, ipv4_a], 0, true, true), Some(0));
+        assert_eq!(reachable_server_index(&[ipv6, ipv4_a], 1, true, true), Some(1));
+        assert_eq!(reachable_server_index(&[ipv6, ipv4_a], 2, true, true), None);
+    }
+
+    #[test]
+    fn connect_before_first_update_does_not_expire_the_token() {
+        let network = socket::MemoryNetwork::new();
+        let private_key = crypto::generate_key();
+        let dead_server: SocketAddr = "127.0.0.1:40001".parse().unwrap();
+
+        let token = generate_connect_token_at(
+            &[dead_server],
+            &[dead_server],
+            TEST_TIMESTAMP,
+            30,
+            5,
+            1,
+            TEST_PROTOCOL_ID,
+            &private_key,
+            &[0; USER_DATA_BYTES],
+        )
+        .unwrap();
+
+        let mut client = Client::new_in_memory(&network, "127.0.0.1:0".parse().unwrap(), 0.0);
+        client.connect(&token).unwrap();
+        client.update_at(100.0, TEST_TIMESTAMP);
+
+        assert_eq!(client.state(), ClientState::SendingConnectionRequest);
+    }
+
+    #[test]
+    fn in_memory_connection_request_times_out() {
+        let network = socket::MemoryNetwork::new();
+        let private_key = crypto::generate_key();
+        let dead_server: SocketAddr = "127.0.0.1:40001".parse().unwrap();
+
+        let token = generate_connect_token_at(
+            &[dead_server],
+            &[dead_server],
+            TEST_TIMESTAMP,
+            30,
+            5,
+            1,
+            TEST_PROTOCOL_ID,
+            &private_key,
+            &[0; USER_DATA_BYTES],
+        )
+        .unwrap();
+
+        let mut client = Client::new_in_memory(&network, "127.0.0.1:0".parse().unwrap(), 0.0);
+        client.connect(&token).unwrap();
+        assert_eq!(client.state(), ClientState::SendingConnectionRequest);
+
+        let mut time = 0.0;
+        while time <= 5.0 {
+            client.update_at(time, TEST_TIMESTAMP);
+            assert_eq!(client.state(), ClientState::SendingConnectionRequest);
+            time += 0.5;
+        }
+        client.update_at(time, TEST_TIMESTAMP + 6);
+        assert_eq!(client.state(), ClientState::ConnectionRequestTimedOut);
+    }
+
+    #[test]
+    fn in_memory_connection_response_times_out() {
+        let network = socket::MemoryNetwork::new();
+        let private_key = crypto::generate_key();
+        let mut server = Server::new_in_memory(
+            &network,
+            "127.0.0.1:40000".parse().unwrap(),
+            TEST_PROTOCOL_ID,
+            &private_key,
+            0.0,
+        )
+        .unwrap();
+        server.start_at(1, TEST_TIMESTAMP).unwrap();
+
+        let token = generate_connect_token_at(
+            &[server.address()],
+            &[server.address()],
+            TEST_TIMESTAMP,
+            TEST_TOKEN_EXPIRY,
+            5,
+            1,
+            TEST_PROTOCOL_ID,
+            &private_key,
+            &[0; USER_DATA_BYTES],
+        )
+        .unwrap();
+
+        let mut client = Client::new_in_memory(&network, "127.0.0.1:0".parse().unwrap(), 0.0);
+        client.connect(&token).unwrap();
+
+        // First exchange delivers the request to the server and the challenge back to the client.
+        client.update_at(0.0, TEST_TIMESTAMP);
+        server.update_at(0.0, TEST_TIMESTAMP);
+        client.update_at(0.1, TEST_TIMESTAMP);
+        assert_eq!(client.state(), ClientState::SendingConnectionResponse);
+
+        // Stop the server so the client's connection response never receives a keep-alive.
+        server.stop();
+
+        let mut time = 0.2;
+        while time <= 5.1 {
+            client.update_at(time, TEST_TIMESTAMP);
+            assert_eq!(client.state(), ClientState::SendingConnectionResponse);
+            time += 0.5;
+        }
+        client.update_at(time, TEST_TIMESTAMP + 6);
+        assert_eq!(client.state(), ClientState::ConnectionResponseTimedOut);
+    }
+
+    #[test]
+    fn in_memory_established_connection_times_out() {
+        let network = socket::MemoryNetwork::new();
+        let private_key = crypto::generate_key();
+        let mut server = Server::new_in_memory(
+            &network,
+            "127.0.0.1:40000".parse().unwrap(),
+            TEST_PROTOCOL_ID,
+            &private_key,
+            0.0,
+        )
+        .unwrap();
+        server.start_at(1, TEST_TIMESTAMP).unwrap();
+
+        let token = generate_connect_token_at(
+            &[server.address()],
+            &[server.address()],
+            TEST_TIMESTAMP,
+            TEST_TOKEN_EXPIRY,
+            5,
+            1,
+            TEST_PROTOCOL_ID,
+            &private_key,
+            &[0; USER_DATA_BYTES],
+        )
+        .unwrap();
+
+        let mut client = Client::new_in_memory(&network, "127.0.0.1:0".parse().unwrap(), 0.0);
+        client.connect(&token).unwrap();
+
+        let mut time = 0.0;
+        for _ in 0..5 {
+            client.update_at(time, TEST_TIMESTAMP);
+            server.update_at(time, TEST_TIMESTAMP);
+            time += 0.1;
+        }
+        assert_eq!(client.state(), ClientState::Connected);
+
+        // Server stops sending packets; client times out after 5 seconds.
+        for _ in 0..60 {
+            time += 0.1;
+            client.update_at(time, TEST_TIMESTAMP + 6);
+        }
+        assert_eq!(client.state(), ClientState::ConnectionTimedOut);
+    }
+
+    #[test]
+    fn in_memory_connect_token_expires_while_connecting() {
+        let network = socket::MemoryNetwork::new();
+        let private_key = crypto::generate_key();
+        let dead_server: SocketAddr = "127.0.0.1:40001".parse().unwrap();
+
+        // expire_seconds = 3, timeout_seconds = 10 -> token expires before request timeout.
+        let token = generate_connect_token_at(
+            &[dead_server],
+            &[dead_server],
+            TEST_TIMESTAMP,
+            3,
+            10,
+            1,
+            TEST_PROTOCOL_ID,
+            &private_key,
+            &[0; USER_DATA_BYTES],
+        )
+        .unwrap();
+
+        let mut client = Client::new_in_memory(&network, "127.0.0.1:0".parse().unwrap(), 0.0);
+        client.connect(&token).unwrap();
+        client.update_at(0.0, TEST_TIMESTAMP);
+
+        client.update_at(2.9, TEST_TIMESTAMP + 2);
+        assert_eq!(client.state(), ClientState::SendingConnectionRequest);
+
+        client.update_at(3.0, TEST_TIMESTAMP + 3);
+        assert_eq!(client.state(), ClientState::ConnectTokenExpired);
+    }
+
+    #[test]
+    fn in_memory_multi_address_failover_and_dual_stack_ipv6() {
+        let network = socket::MemoryNetwork::new();
+        let private_key = crypto::generate_key();
+        let dead_v4: SocketAddr = "127.0.0.1:40001".parse().unwrap();
+        let live_v6: SocketAddr = "[::1]:40002".parse().unwrap();
+
+        let mut server =
+            Server::new_in_memory(&network, live_v6, TEST_PROTOCOL_ID, &private_key, 0.0).unwrap();
+        server.start_at(2, TEST_TIMESTAMP).unwrap();
+
+        let token = generate_connect_token_at(
+            &[dead_v4, server.address()],
+            &[dead_v4, server.address()],
+            TEST_TIMESTAMP,
+            TEST_TOKEN_EXPIRY,
+            2,
+            42,
+            TEST_PROTOCOL_ID,
+            &private_key,
+            &[0x77; USER_DATA_BYTES],
+        )
+        .unwrap();
+
+        let mut client = Client::new_dual_in_memory(
+            &network,
+            "127.0.0.1:0".parse().unwrap(),
+            "[::1]:0".parse().unwrap(),
+            0.0,
+        )
+        .unwrap();
+        client.connect(&token).unwrap();
+        assert_eq!(client.server_address(), Some(dead_v4));
+
+        // Advance past the 2s timeout on dead_v4 so the client fails over to live_v6.
+        let mut time = 0.0;
+        while client.server_address() == Some(dead_v4) {
+            time += 0.25;
+            client.update_at(time, TEST_TIMESTAMP + 2);
+            server.update_at(time, TEST_TIMESTAMP + 2);
+        }
+        assert_eq!(client.server_address(), Some(server.address()));
+        assert_eq!(client.state(), ClientState::SendingConnectionRequest);
+
+        // Complete handshake and exchange payload over IPv6.
+        for _ in 0..10 {
+            time += 0.1;
+            client.update_at(time, TEST_TIMESTAMP + 3);
+            server.update_at(time, TEST_TIMESTAMP + 3);
+        }
+        assert_eq!(client.state(), ClientState::Connected);
+        assert_eq!(server.num_connected_clients(), 1);
+
+        client.send_packet(b"hello ipv6").unwrap();
+        server.send_packet(0, b"world ipv6").unwrap();
+        time += 0.1;
+        server.update_at(time, TEST_TIMESTAMP + 3);
+        client.update_at(time, TEST_TIMESTAMP + 3);
+
+        assert_eq!(server.receive_packet(0).unwrap().0, b"hello ipv6");
+        assert_eq!(client.receive_packet().unwrap().0, b"world ipv6");
+    }
+
+    #[test]
+    fn in_memory_negative_timeout_and_never_expiring_token() {
+        let network = socket::MemoryNetwork::new();
+        let private_key = crypto::generate_key();
+        let mut server = Server::new_in_memory(
+            &network,
+            "127.0.0.1:40000".parse().unwrap(),
+            TEST_PROTOCOL_ID,
+            &private_key,
+            0.0,
+        )
+        .unwrap();
+        server.start_at(1, TEST_TIMESTAMP).unwrap();
+
+        let token = generate_connect_token_at(
+            &[server.address()],
+            &[server.address()],
+            TEST_TIMESTAMP,
+            -1,
+            -1,
+            99,
+            TEST_PROTOCOL_ID,
+            &private_key,
+            &[0; USER_DATA_BYTES],
+        )
+        .unwrap();
+
+        let mut client = Client::new_in_memory(&network, "127.0.0.1:0".parse().unwrap(), 0.0);
+        client.connect(&token).unwrap();
+
+        let mut time = 0.0;
+        for _ in 0..5 {
+            client.update_at(time, TEST_TIMESTAMP);
+            server.update_at(time, TEST_TIMESTAMP);
+            time += 0.1;
+        }
+        assert_eq!(client.state(), ClientState::Connected);
+
+        // Jump 1000 seconds without exchanging packets: negative timeout disables timeouts.
+        time += 1000.0;
+        client.update_at(time, TEST_TIMESTAMP + 1000);
+        server.update_at(time, TEST_TIMESTAMP + 1000);
+        assert_eq!(client.state(), ClientState::Connected);
+        assert_eq!(server.num_connected_clients(), 1);
+    }
+
+    #[test]
+    fn packets_from_an_unexpected_address_are_ignored() {
+        const PROTOCOL_ID: u64 = 0x1122334455667788;
+        const OTHER_SEQUENCE: u64 = 1000;
+        const SERVER_SEQUENCE: u64 = 1;
+
+        let network = socket::MemoryNetwork::new();
+        let server_address: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        let other_address: SocketAddr = "127.0.0.1:40001".parse().unwrap();
+        let private_key = crypto::generate_key();
+        let connect_token = generate_connect_token_at(
+            &[server_address],
+            &[server_address],
+            TEST_TIMESTAMP,
+            30,
+            5,
+            0x1234,
+            PROTOCOL_ID,
+            &private_key,
+            &[0; USER_DATA_BYTES],
+        )
+        .unwrap();
+
+        let mut client = Client::new_in_memory(&network, "127.0.0.1:0".parse().unwrap(), 0.0);
+        client.connect(&connect_token).unwrap();
+        client.state = ClientState::Connected;
+
+        let key = ConnectToken::read(&connect_token).unwrap().server_to_client_key;
+        let mut packet_data = [0u8; MAX_PACKET_BYTES];
+
+        let packet_bytes = crate::packet::write_packet(
+            &Packet::Payload(vec![1, 2, 3]),
+            &mut packet_data,
+            OTHER_SEQUENCE,
+            &key,
+            PROTOCOL_ID,
+        )
+        .unwrap();
+        client.process_packet(other_address, &mut packet_data[..packet_bytes], TEST_TIMESTAMP);
+        assert!(
+            !client.replay_protection.already_received(OTHER_SEQUENCE),
+            "a packet from an address other than the server address advanced replay protection"
+        );
+        assert!(client.receive_packet().is_none());
+
+        let packet_bytes = crate::packet::write_packet(
+            &Packet::Payload(vec![4, 5, 6]),
+            &mut packet_data,
+            SERVER_SEQUENCE,
+            &key,
+            PROTOCOL_ID,
+        )
+        .unwrap();
+        client.process_packet(server_address, &mut packet_data[..packet_bytes], TEST_TIMESTAMP);
+        assert_eq!(client.receive_packet(), Some((vec![4, 5, 6], SERVER_SEQUENCE)));
+    }
+
+    #[test]
+    fn keep_alive_with_client_slot_out_of_range_is_ignored() {
+        const PROTOCOL_ID: u64 = 0x1122334455667788;
+        const CLIENT_INDEX: usize = 3;
+        const MAX_SLOTS: u32 = MAX_CLIENTS as u32;
+
+        let server_address: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        let private_key = crate::generate_key();
+        let connect_token = generate_connect_token_at(
+            &[server_address],
+            &[server_address],
+            TEST_TIMESTAMP,
+            30,
+            5,
+            0x1234,
+            PROTOCOL_ID,
+            &private_key,
+            &[0; crate::USER_DATA_BYTES],
+        )
+        .unwrap();
+
+        // a client with no sockets cannot connect, so set up the connection directly
+        let mut client = Client::create(None, None, true, 1000.0).unwrap();
+        let token = ConnectToken::read(&connect_token).unwrap();
+        client.read_packet_key = token.server_to_client_key;
+        client.server_address = Some(server_address);
+        client.connect_token = Some(token);
+        client.state = ClientState::SendingConnectionResponse;
+        client.client_index = CLIENT_INDEX;
+        client.max_clients = 7;
+
+        let key = ConnectToken::read(&connect_token).unwrap().server_to_client_key;
+        let mut packet_data = [0u8; MAX_PACKET_BYTES];
+
+        let cases = [(u32::MAX, MAX_SLOTS), (0, 0), (0, MAX_SLOTS + 1), (5, 5), (6, 5)];
+        for (sequence, (client_index, max_clients)) in (1u64..).zip(cases) {
+            let packet_bytes = crate::packet::write_packet(
+                &Packet::KeepAlive { client_index, max_clients },
+                &mut packet_data,
+                sequence,
+                &key,
+                PROTOCOL_ID,
+            )
+            .unwrap();
+            client.process_packet(server_address, &mut packet_data[..packet_bytes], TEST_TIMESTAMP);
+            assert_eq!(client.client_index(), CLIENT_INDEX);
+            assert_eq!(client.max_clients(), 7);
+            assert_eq!(client.state(), ClientState::SendingConnectionResponse);
+        }
+    }
+
+    fn has_pending_packet(transport: &Option<socket::Transport>) -> bool {
+        match transport {
+            Some(socket::Transport::Memory(socket)) => socket.recv_from(&mut [0u8; 8]).is_some(),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn update_drains_both_transports_while_disconnected_and_connecting() {
+        let network = socket::MemoryNetwork::new();
+        let private_key = crypto::generate_key();
+        let server_address: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        let sender = network.bind("127.0.0.1:41000".parse().unwrap());
+        let sender_ipv6 = network.bind("[::1]:41000".parse().unwrap());
+
+        let mut client = Client::new_dual_in_memory(
+            &network,
+            "127.0.0.1:0".parse().unwrap(),
+            "[::1]:0".parse().unwrap(),
+            0.0,
+        )
+        .unwrap();
+        let client_ipv4 = client.socket_ipv4.as_ref().unwrap().local_addr().unwrap();
+        let client_ipv6 = client.socket_ipv6.as_ref().unwrap().local_addr().unwrap();
+
+        // packets that arrive while disconnected are read and discarded by update
+        for _ in 0..3 {
+            sender.send_to(&[0u8; 32], client_ipv4);
+            sender_ipv6.send_to(&[0u8; 32], client_ipv6);
+        }
+        client.update_at(1.0, TEST_TIMESTAMP);
+        assert_eq!(client.state(), ClientState::Disconnected);
+        assert!(!has_pending_packet(&client.socket_ipv4));
+        assert!(!has_pending_packet(&client.socket_ipv6));
+
+        let token = generate_connect_token_at(
+            &[server_address],
+            &[server_address],
+            TEST_TIMESTAMP,
+            30,
+            5,
+            1,
+            TEST_PROTOCOL_ID,
+            &private_key,
+            &[0; USER_DATA_BYTES],
+        )
+        .unwrap();
+        client.connect(&token).unwrap();
+
+        // while connecting to an IPv4 server, the IPv6 transport is drained too
+        sender_ipv6.send_to(&[0u8; 32], client_ipv6);
+        client.update_at(2.0, TEST_TIMESTAMP);
+        assert_eq!(client.state(), ClientState::SendingConnectionRequest);
+        assert!(!has_pending_packet(&client.socket_ipv6));
     }
 }

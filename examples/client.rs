@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use netcode::{Client, ClientState};
 
-const CONNECT_TOKEN_EXPIRY: i32 = 30;
+// one second above the server's default maximum token lifetime, so a token generated in
+// the server's start second expires strictly after its start floor
+const CONNECT_TOKEN_EXPIRY: i32 = netcode::DEFAULT_MAX_CONNECT_TOKEN_LIFETIME + 1;
 const CONNECT_TOKEN_TIMEOUT: i32 = 5;
 const PROTOCOL_ID: u64 = 0x1122334455667788;
 

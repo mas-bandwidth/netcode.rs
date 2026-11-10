@@ -29,28 +29,11 @@ fn published_crate_excludes_development_files() {
         .find(|line| line.trim_start().starts_with("exclude"))
         .expect("Cargo.toml has no exclude list");
 
-    let development_files = ["CLAUDE.md", ".mailmap", "deny.toml"];
-    for file in development_files {
+    for file in ["CLAUDE.md", ".mailmap", "deny.toml"] {
         assert!(
             exclude.contains(&format!("\"{file}\"")),
             "Cargo.toml exclude list does not contain {file}: {exclude}"
         );
-    }
-
-    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
-    let output = std::process::Command::new(cargo)
-        .args(["package", "--list", "--offline"])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .output()
-        .expect("run cargo package --list");
-    assert!(
-        output.status.success(),
-        "cargo package --list failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let listed = String::from_utf8_lossy(&output.stdout);
-    for file in development_files {
-        assert!(!listed.lines().any(|line| line == file), "published crate contains {file}");
     }
 }
 

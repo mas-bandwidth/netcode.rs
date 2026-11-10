@@ -134,8 +134,11 @@ pub(crate) fn write_packet(
         return Ok(CONNECTION_REQUEST_PACKET_BYTES);
     }
 
-    // u64::MAX is not a packet sequence. Refuse it before any byte is written so this
-    // function never emits a frame that a later read would ignore.
+    // u64::MAX is not a packet sequence. Refuse it before any byte is written so
+    // ordinary packets never carry it. The fuzz round-trip harness writes the
+    // sequence it is given and reads it back, so it needs the writer and reader
+    // to agree on this value rather than stop at the writer.
+    #[cfg(not(fuzzing))]
     if sequence == u64::MAX {
         return Err(Error::EncryptFailed);
     }
@@ -293,6 +296,7 @@ pub(crate) fn read_packet_with_min_connect_token_expire_timestamp(
     sequence_le[..sequence_bytes].copy_from_slice(&buffer[1..1 + sequence_bytes]);
     let sequence = u64::from_le_bytes(sequence_le);
 
+    #[cfg(not(fuzzing))]
     if sequence == u64::MAX {
         debug!("ignored encrypted packet. sequence is u64::MAX");
         return None;

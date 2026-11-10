@@ -79,6 +79,7 @@ impl Harness {
 }
 
 #[test]
+#[ignore = "functional: binds a real UDP socket; run with --ignored"]
 fn client_connects_to_server() {
     let mut harness = Harness::new(1);
     harness.connect_client(0x1234);
@@ -98,6 +99,7 @@ fn client_connects_to_server() {
 }
 
 #[test]
+#[ignore = "functional: binds a real UDP socket; run with --ignored"]
 fn server_skips_empty_datagrams_before_connection_request() {
     // Zero-length datagrams are valid UDP, so a burst of them can arrive ahead of a
     // connection request. Each trial uses a fresh server whose receive queue holds
@@ -140,6 +142,7 @@ fn server_skips_empty_datagrams_before_connection_request() {
 }
 
 #[test]
+#[ignore = "functional: binds a real UDP socket; run with --ignored"]
 fn client_and_server_exchange_payload_packets() {
     let mut harness = Harness::new(1);
     harness.connect_client(0x1234);
@@ -167,6 +170,7 @@ fn client_and_server_exchange_payload_packets() {
 }
 
 #[test]
+#[ignore = "functional: binds a real UDP socket; run with --ignored"]
 fn client_side_disconnect() {
     let mut harness = Harness::new(1);
     harness.connect_client(0x1234);
@@ -187,6 +191,7 @@ fn client_side_disconnect() {
 }
 
 #[test]
+#[ignore = "functional: binds a real UDP socket; run with --ignored"]
 fn server_side_disconnect() {
     let mut harness = Harness::new(1);
     harness.connect_client(0x1234);
@@ -199,6 +204,7 @@ fn server_side_disconnect() {
 }
 
 #[test]
+#[ignore = "functional: binds a real UDP socket; run with --ignored"]
 fn server_disconnect_does_not_advance_to_next_server() {
     let mut harness = Harness::new(1);
     let private_key = harness.private_key;
@@ -252,6 +258,7 @@ fn server_disconnect_does_not_advance_to_next_server() {
 }
 
 #[test]
+#[ignore = "functional: binds a real UDP socket; run with --ignored"]
 fn server_full_denies_next_client() {
     let mut harness = Harness::new(1);
     harness.connect_client(1);
@@ -264,6 +271,7 @@ fn server_full_denies_next_client() {
 }
 
 #[test]
+#[ignore = "functional: binds a real UDP socket; run with --ignored"]
 fn connect_token_cannot_be_reused_from_another_address() {
     let mut harness = Harness::new(2);
     let connect_token = harness.generate_connect_token(1);
@@ -293,6 +301,7 @@ fn connect_token_cannot_be_reused_from_another_address() {
 }
 
 #[test]
+#[ignore = "functional: binds a real UDP socket; run with --ignored"]
 fn connect_token_cannot_be_reused_after_disconnect() {
     let mut harness = Harness::new(1);
     let connect_token = harness.generate_connect_token(1);
@@ -316,6 +325,7 @@ fn connect_token_cannot_be_reused_after_disconnect() {
 }
 
 #[test]
+#[ignore = "functional: binds a real UDP socket; run with --ignored"]
 fn wrong_protocol_id_cannot_connect() {
     let mut harness = Harness::new(1);
 
@@ -343,6 +353,7 @@ fn wrong_protocol_id_cannot_connect() {
 }
 
 #[test]
+#[ignore = "functional: binds a real UDP socket; run with --ignored"]
 fn wrong_private_key_cannot_connect() {
     let mut harness = Harness::new(1);
 
@@ -371,6 +382,7 @@ fn wrong_private_key_cannot_connect() {
 }
 
 #[test]
+#[ignore = "functional: binds a real UDP socket; run with --ignored"]
 fn multiple_clients_connect_and_exchange_packets() {
     const NUM_CLIENTS: usize = 4;
 
@@ -401,6 +413,7 @@ fn multiple_clients_connect_and_exchange_packets() {
 }
 
 #[test]
+#[ignore = "functional: binds a real UDP socket; run with --ignored"]
 fn restarted_server_accepts_new_client_over_udp() {
     let mut harness = Harness::new(1);
     harness.connect_client(0x1111);

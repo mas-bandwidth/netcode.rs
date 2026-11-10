@@ -27,6 +27,19 @@ jobs:
       - run: cargo build --all-targets
       - run: cargo test
 
+  # client/server over real localhost UDP sockets; ignored by a plain `cargo test`
+  functional:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup update stable && rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --test client_server -- --ignored
+
   lint:
     runs-on: ubuntu-latest
     steps:

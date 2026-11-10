@@ -9,7 +9,7 @@ use zeroize::Zeroize;
 
 use crate::packet::{AllowedPackets, Packet};
 use crate::replay::ReplayProtection;
-use crate::token::{self, CHALLENGE_TOKEN_BYTES, ConnectToken};
+use crate::token::{CHALLENGE_TOKEN_BYTES, ConnectToken};
 use crate::{
     CONNECT_TOKEN_BYTES, Error, KEY_BYTES, Key, MAX_PACKET_BYTES, MAX_PAYLOAD_BYTES,
     NUM_DISCONNECT_PACKETS, PACKET_QUEUE_SIZE, PACKET_SEND_RATE, socket,
@@ -540,7 +540,7 @@ impl Client {
             packet_data,
             Some(&self.read_packet_key),
             connect_token.protocol_id,
-            token::unix_timestamp(),
+            0,
             None,
             AllowedPackets::CLIENT,
             Some(&mut self.replay_protection),

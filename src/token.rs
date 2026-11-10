@@ -279,8 +279,12 @@ impl Drop for ConnectToken {
 
 impl ZeroizeOnDrop for ConnectToken {}
 
+pub(crate) fn unix_timestamp_from(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
 pub(crate) fn unix_timestamp() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock is before 1970").as_secs()
+    unix_timestamp_from(SystemTime::now())
 }
 
 /// Generates a connect token.
@@ -523,6 +527,12 @@ mod tests {
         // processed, and the client drops its connect token on disconnect
         assert_zeroize_on_drop::<PrivateConnectToken>();
         assert_zeroize_on_drop::<ConnectToken>();
+    }
+
+    #[test]
+    fn unix_timestamp_from_before_epoch_saturates_to_zero() {
+        let before_epoch = UNIX_EPOCH - std::time::Duration::from_secs(10);
+        assert_eq!(unix_timestamp_from(before_epoch), 0);
     }
 
     #[test]

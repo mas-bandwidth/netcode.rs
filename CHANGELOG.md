@@ -60,3 +60,6 @@ Changes on main since v1.1.3.
 - The README, crate example and examples drain `Server::next_event`, and issue connect
   tokens of at most the server's maximum lifetime after the server's start second.
 - The published crate no longer includes development files.
+- STANDARD.md is updated from the reference specification for netcode 1.4.10: a connect
+  token issued in the server's start second is refused, packet sequence 2^64-1 is
+  reserved, and the reference client's keep-alive client slot range is documented.

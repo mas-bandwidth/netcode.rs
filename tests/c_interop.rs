@@ -68,6 +68,38 @@ fn wait_for_next_second() {
     }
 }
 
+/// Whether a UDP socket is bound at `address`. Sends an empty datagram from a connected
+/// socket: when nothing is bound there the OS reports the connection refused, and a bound
+/// netcode server ignores the datagram, so the read times out.
+fn udp_socket_is_bound(address: SocketAddr) -> bool {
+    let local: SocketAddr =
+        if address.is_ipv4() { "0.0.0.0:0".parse().unwrap() } else { "[::]:0".parse().unwrap() };
+    let probe = UdpSocket::bind(local).expect("failed to bind the probe socket");
+    probe.connect(address).expect("failed to connect the probe socket");
+    probe.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+    if probe.send(&[]).is_err() {
+        return false;
+    }
+    match probe.recv(&mut [0u8; 1]) {
+        Err(error) => error.kind() != std::io::ErrorKind::ConnectionRefused,
+        Ok(_) => true,
+    }
+}
+
+/// Waits until the C server has bound its address. The C server example starts the
+/// server directly after binding, so the start second is at or before the second this
+/// returns in.
+fn wait_for_c_server(address: SocketAddr) {
+    let start = Instant::now();
+    while !udp_socket_is_bound(address) {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "timed out waiting for the C server to bind {address}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// Kills the C process when the test ends, pass or fail.
 struct ChildGuard(Child);
 
@@ -99,13 +131,21 @@ fn ephemeral_address_is_free_and_on_loopback() {
 }
 
 #[test]
+#[ignore = "binds a real loopback socket; run with --ignored"]
+fn bind_probe_tells_a_bound_address_from_a_free_one() {
+    let bound = UdpSocket::bind("127.0.0.1:0").unwrap();
+    assert!(udp_socket_is_bound(bound.local_addr().unwrap()));
+    assert!(!udp_socket_is_bound(ephemeral_address()));
+}
+
+#[test]
 #[ignore = "requires the C reference binaries; see the file docs"]
 fn rust_client_connects_to_c_server() {
     let _guard = INTEROP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let server_address = c_server_address();
     // the C server example takes the address to listen on
     let _c_server = spawn("NETCODE_C_SERVER", server_address.to_string());
-    std::thread::sleep(Duration::from_millis(500));
+    wait_for_c_server(server_address);
     wait_for_next_second();
 
     let mut client = Client::new("0.0.0.0:0".parse().unwrap(), 0.0).unwrap();

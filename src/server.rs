@@ -456,7 +456,7 @@ impl Server {
         };
         let socket = socket::create_socket(bind_address)?;
 
-        let mut public_address = public_address;
+        let mut public_address = socket::normalize_address(public_address);
         if public_address.port() == 0 {
             public_address.set_port(socket.local_addr()?.port());
         }
@@ -869,7 +869,8 @@ impl Server {
             return;
         };
 
-        if !private_token.server_addresses.contains(&self.public_address) {
+        if !private_token.server_addresses.contains(&socket::normalize_address(self.public_address))
+        {
             debug!(
                 "server ignored connection request. server address not in connect token whitelist"
             );
@@ -1200,6 +1201,7 @@ impl Drop for Server {
 #[cfg(test)]
 mod tests {
     use std::io;
+    use std::net::SocketAddrV6;
     use std::time::Duration;
 
     use super::*;
@@ -1696,6 +1698,68 @@ mod tests {
             server.global_sequence > GLOBAL_SEQUENCE_FLOOR,
             "stop did not reseed the global sequence: {}",
             server.global_sequence
+        );
+    }
+
+    /// Connect token server addresses travel as only an IPv6 address and port, so a
+    /// server configured with a scope id or flow label must still accept requests for
+    /// that address.
+    #[test]
+    fn connection_request_for_ipv6_address_with_scope_id_and_flow_label_is_accepted() {
+        let private_key = crypto::generate_key();
+        let configured_address =
+            SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 0, 0x1234, 3));
+        let mut server =
+            Server::new(configured_address, TEST_PROTOCOL_ID, &private_key, 0.0).unwrap();
+        assert_eq!(
+            server.address(),
+            SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, server.address().port(), 0, 0)),
+            "server public_address should have flowinfo and scope_id normalized to zero"
+        );
+        server.start(1).unwrap();
+
+        let connect_token = generate_connect_token(
+            &[server.address()],
+            &[server.address()],
+            TEST_TOKEN_EXPIRY,
+            TEST_TOKEN_TIMEOUT,
+            0x1234,
+            TEST_PROTOCOL_ID,
+            &private_key,
+            &[0; USER_DATA_BYTES],
+        )
+        .unwrap();
+        let token = ConnectToken::read(&connect_token).unwrap();
+        let request = Packet::Request {
+            protocol_id: token.protocol_id,
+            expire_timestamp: token.expire_timestamp,
+            nonce: token.nonce,
+            private_data: token.private_data.clone(),
+        };
+        let mut request_data = [0u8; MAX_PACKET_BYTES];
+        let request_bytes =
+            write_packet(&request, &mut request_data, 0, &[0; KEY_BYTES], token.protocol_id)
+                .unwrap();
+
+        let client_address = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 50000, 0, 0));
+        let mut queue = vec![Some(request_bytes), None].into_iter();
+        server.receive_packets_with(|_, buffer| {
+            socket::receive_packet_with(buffer, |buffer| match queue.next() {
+                Some(Some(bytes)) => {
+                    buffer[..bytes].copy_from_slice(&request_data[..bytes]);
+                    Ok((bytes, client_address))
+                }
+                Some(None) => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+                None => panic!("read past the end of the receive queue"),
+            })
+        });
+
+        assert!(
+            server
+                .encryption_manager
+                .find_encryption_mapping(client_address, server.time)
+                .is_some(),
+            "server did not accept a connection request for its configured IPv6 address"
         );
     }
 }

@@ -105,7 +105,7 @@ pub(crate) fn receive_packet_with(
 /// parsed ones. The reference implementation cannot represent either field, so
 /// carrying them here would make otherwise-identical addresses compare unequal and
 /// silently drop packets (e.g. from link-local sources, where the OS sets a scope id).
-fn normalize_address(address: SocketAddr) -> SocketAddr {
+pub(crate) fn normalize_address(address: SocketAddr) -> SocketAddr {
     match address {
         SocketAddr::V6(v6) => SocketAddr::V6(SocketAddrV6::new(*v6.ip(), v6.port(), 0, 0)),
         SocketAddr::V4(_) => address,

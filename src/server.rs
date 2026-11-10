@@ -624,7 +624,8 @@ impl Server {
     /// Advances the server to the current time: receives and processes packets, sends
     /// keep-alives, and times out unresponsive clients.
     ///
-    /// `time` must be monotonically non-decreasing across calls.
+    /// `time` must be monotonically non-decreasing across calls. Passing a value less
+    /// than a previous call is not supported.
     pub fn update(&mut self, time: f64) {
         self.update_at(time, token::unix_timestamp());
     }

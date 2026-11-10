@@ -117,6 +117,10 @@ Drive the client and server from your game loop, passing in the current time in 
 ```rust
 client.update(time);
 server.update(time);
+
+while let Some(event) = server.next_event() {
+    // handle netcode::ServerEvent::ClientConnected and ClientDisconnected
+}
 ```
 
 Once the client connects it is assigned a client index and can exchange encrypted and signed packets with the server:

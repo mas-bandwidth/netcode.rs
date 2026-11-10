@@ -58,7 +58,7 @@
 //! let connect_token = netcode::generate_connect_token(
 //!     &[server_address],
 //!     &[server_address],
-//!     30,
+//!     netcode::DEFAULT_MAX_CONNECT_TOKEN_LIFETIME + 1,
 //!     5,
 //!     client_id,
 //!     protocol_id,
@@ -75,6 +75,9 @@
 //!     server.update(time);
 //!     if client.state() == netcode::ClientState::Connected {
 //!         client.send_packet(&[1, 2, 3, 4]).unwrap();
+//!     }
+//!     while let Some(event) = server.next_event() {
+//!         println!("server event {event:?}");
 //!     }
 //!     while let Some((payload, _sequence)) = server.receive_packet(0) {
 //!         println!("server received {} byte packet", payload.len());

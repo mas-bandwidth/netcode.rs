@@ -573,23 +573,25 @@ impl Client {
 
     fn receive_packets(&mut self, current_timestamp: u64) {
         let mut packet_data = [0u8; MAX_PACKET_BYTES];
-        loop {
-            // the client only talks to one server, so receive on the socket matching
-            // the current server address family. the socket borrow is scoped to the
-            // receive call so packet processing can borrow self mutably.
-            let socket = match self.server_address {
-                Some(SocketAddr::V4(_)) => self.socket_ipv4.as_ref(),
-                Some(SocketAddr::V6(_)) => self.socket_ipv6.as_ref(),
-                None => None,
-            };
-            let Some(socket) = socket else {
-                return;
-            };
-            let Some((packet_bytes, from)) = socket::receive_packet(socket, &mut packet_data)
-            else {
-                return;
-            };
-            self.process_packet(from, &mut packet_data[..packet_bytes], current_timestamp);
+        // drain both sockets on every update, so packets that arrive while the client is
+        // not connecting or connected, or on the other address family, are discarded
+        // rather than left queued. the socket borrow is scoped to the receive call so
+        // packet processing can borrow self mutably.
+        for ipv4 in [true, false] {
+            loop {
+                let socket =
+                    if ipv4 { self.socket_ipv4.as_ref() } else { self.socket_ipv6.as_ref() };
+                let Some(socket) = socket else {
+                    break;
+                };
+                let Some((packet_bytes, from)) = socket::receive_packet(socket, &mut packet_data)
+                else {
+                    break;
+                };
+                if self.state.is_connecting() || self.state == ClientState::Connected {
+                    self.process_packet(from, &mut packet_data[..packet_bytes], current_timestamp);
+                }
+            }
         }
     }
 

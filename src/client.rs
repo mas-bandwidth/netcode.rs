@@ -278,6 +278,9 @@ impl Client {
         self.connect_token = Some(connect_token);
 
         self.reset_before_next_connect();
+        // connect may be called before the first update, so the connection timestamps are
+        // taken from the time of the next update.
+        self.initial_timestamps_set = false;
         self.set_state(ClientState::SendingConnectionRequest);
 
         Ok(())
@@ -425,7 +428,6 @@ impl Client {
         self.connect_start_time = self.time;
         self.last_packet_send_time = self.time - 1.0;
         self.last_packet_receive_time = self.time;
-        self.initial_timestamps_set = false;
         self.should_disconnect = None;
         self.challenge_token_sequence = 0;
         self.challenge_token_data = [0; CHALLENGE_TOKEN_BYTES];

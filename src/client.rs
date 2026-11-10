@@ -9,7 +9,7 @@ use zeroize::Zeroize;
 
 use crate::packet::{AllowedPackets, Packet};
 use crate::replay::ReplayProtection;
-use crate::token::{self, CHALLENGE_TOKEN_BYTES, ConnectToken};
+use crate::token::{CHALLENGE_TOKEN_BYTES, ConnectToken};
 use crate::{
     CONNECT_TOKEN_BYTES, Error, KEY_BYTES, Key, MAX_CLIENTS, MAX_PACKET_BYTES, MAX_PAYLOAD_BYTES,
     NUM_DISCONNECT_PACKETS, PACKET_QUEUE_SIZE, PACKET_SEND_RATE, socket,
@@ -289,7 +289,7 @@ impl Client {
     /// Advances the client to the current time: receives and processes packets, sends
     /// queued packets and keep-alives, and applies timeouts.
     pub fn update(&mut self, time: f64) {
-        self.update_at(time, token::unix_timestamp());
+        self.update_at(time, 0);
     }
 
     pub(crate) fn update_at(&mut self, time: f64, current_timestamp: u64) {
@@ -593,7 +593,12 @@ impl Client {
         }
     }
 
-    fn process_packet(&mut self, from: SocketAddr, packet_data: &mut [u8], current_timestamp: u64) {
+    fn process_packet(
+        &mut self,
+        from: SocketAddr,
+        packet_data: &mut [u8],
+        _current_timestamp: u64,
+    ) {
         if Some(from) != self.server_address {
             return;
         }
@@ -606,7 +611,7 @@ impl Client {
             packet_data,
             Some(&self.read_packet_key),
             connect_token.protocol_id,
-            current_timestamp,
+            0,
             None,
             AllowedPackets::CLIENT,
             Some(&mut self.replay_protection),

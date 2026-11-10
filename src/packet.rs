@@ -843,6 +843,25 @@ mod tests {
             .is_none()
         );
 
+        // ordinary builds also refuse the sequence before decryption, so a reader
+        // that is not tracking a replay window still drops it
+        #[cfg(not(fuzzing))]
+        {
+            let mut without_replay = crafted.clone();
+            assert!(
+                read_packet(
+                    &mut without_replay,
+                    Some(&key),
+                    TEST_PROTOCOL_ID,
+                    0,
+                    None,
+                    AllowedPackets::CLIENT,
+                    None,
+                )
+                .is_none()
+            );
+        }
+
         let mut buffer = [0u8; MAX_PACKET_BYTES];
         let written =
             write_packet(&Packet::Payload(vec![9]), &mut buffer, 7, &key, TEST_PROTOCOL_ID)
@@ -860,10 +879,28 @@ mod tests {
             .is_some()
         );
 
-        assert!(
-            write_packet(&Packet::Payload(vec![9]), &mut buffer, u64::MAX, &key, TEST_PROTOCOL_ID,)
-                .is_err()
-        );
+        let reserved =
+            write_packet(&Packet::Payload(vec![9]), &mut buffer, u64::MAX, &key, TEST_PROTOCOL_ID);
+        #[cfg(not(fuzzing))]
+        assert!(reserved.is_err());
+        #[cfg(fuzzing)]
+        {
+            // the round-trip harness writes and reads the sequence it is given, so
+            // fuzz builds keep the writer and reader in agreement on this value
+            let written = reserved.unwrap();
+            let (output, output_sequence) = read_packet(
+                &mut buffer[..written],
+                Some(&key),
+                TEST_PROTOCOL_ID,
+                0,
+                None,
+                AllowedPackets::CLIENT,
+                None,
+            )
+            .unwrap();
+            assert_eq!(output_sequence, u64::MAX);
+            assert_eq!(output, Packet::Payload(vec![9]));
+        }
     }
 
     fn seal_body(packet_type: u8, body: &[u8]) -> Vec<u8> {

@@ -2239,9 +2239,11 @@ mod tests {
         .unwrap();
         server.start_at(1, TEST_TIMESTAMP).unwrap();
 
+        // the connect token is minted for the address the operator configured, which
+        // still carries the scope id and flow label; only the wire form drops them
         let connect_token = generate_connect_token_at(
-            &[server.address()],
-            &[server.address()],
+            &[configured_address],
+            &[configured_address],
             TEST_TIMESTAMP,
             TEST_TOKEN_EXPIRY,
             TEST_TOKEN_TIMEOUT,

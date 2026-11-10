@@ -582,7 +582,12 @@ impl Client {
         }
     }
 
-    fn process_packet(&mut self, from: SocketAddr, packet_data: &mut [u8], current_timestamp: u64) {
+    fn process_packet(
+        &mut self,
+        from: SocketAddr,
+        packet_data: &mut [u8],
+        _current_timestamp: u64,
+    ) {
         if Some(from) != self.server_address {
             return;
         }
@@ -595,7 +600,7 @@ impl Client {
             packet_data,
             Some(&self.read_packet_key),
             connect_token.protocol_id,
-            current_timestamp,
+            0,
             None,
             AllowedPackets::CLIENT,
             Some(&mut self.replay_protection),

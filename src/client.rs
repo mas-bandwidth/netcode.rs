@@ -771,26 +771,26 @@ mod tests {
     }
 
     #[test]
-    fn connect_token_with_no_matching_socket_family_is_invalid() {
-        const PROTOCOL_ID: u64 = 0x1122334455667788;
+    fn ipv6_only_client_rejects_a_token_with_only_an_ipv4_address() {
+        let network = socket::MemoryNetwork::new();
+        let private_key = crypto::generate_key();
+        let ipv4_server: SocketAddr = "127.0.0.1:40000".parse().unwrap();
 
-        let server_address: SocketAddr = "[::1]:40000".parse().unwrap();
-        let private_key = crate::generate_key();
-        let connect_token = crate::generate_connect_token(
-            &[server_address],
-            &[server_address],
+        let token = generate_connect_token_at(
+            &[ipv4_server],
+            &[ipv4_server],
+            TEST_TIMESTAMP,
             30,
             5,
-            0x1234,
-            PROTOCOL_ID,
+            1,
+            TEST_PROTOCOL_ID,
             &private_key,
-            &[0; crate::USER_DATA_BYTES],
+            &[0; USER_DATA_BYTES],
         )
         .unwrap();
 
-        // no sockets bound, so no server address family can be reached
-        let mut client = Client::create(None, None, true, 1000.0).unwrap();
-        assert!(client.connect(&connect_token).is_err());
+        let mut client = Client::new_in_memory(&network, "[::1]:0".parse().unwrap(), 0.0);
+        assert!(client.connect(&token).is_err());
         assert_eq!(client.state(), ClientState::InvalidConnectToken);
         assert_eq!(client.server_address(), None);
     }

@@ -258,6 +258,29 @@ impl EncryptionManager {
     }
 }
 
+/// The expire time of the encryption mapping a connection request installs before
+/// the handshake completes. A negative token timeout bounds it by the connect token's
+/// remaining lifetime, with the server's maximum token lifetime as the ceiling for a
+/// token that does not expire; the mapping is switched to no expiry once the client
+/// connects.
+fn pending_mapping_expire_time(
+    time: f64,
+    timeout_seconds: i32,
+    expire_timestamp: u64,
+    current_timestamp: u64,
+    max_connect_token_lifetime: u64,
+) -> f64 {
+    if timeout_seconds >= 0 {
+        return time + timeout_seconds as f64;
+    }
+    let token_lifetime = if expire_timestamp == u64::MAX {
+        max_connect_token_lifetime
+    } else {
+        expire_timestamp.saturating_sub(current_timestamp)
+    };
+    time + token_lifetime as f64
+}
+
 // ----------------------------------------------------------------
 
 const MAX_CONNECT_TOKEN_ENTRIES: usize = MAX_CLIENTS * 8;
@@ -915,11 +938,13 @@ impl Server {
             return;
         }
 
-        let expire_time = if private_token.timeout_seconds >= 0 {
-            self.time + private_token.timeout_seconds as f64
-        } else {
-            -1.0
-        };
+        let expire_time = pending_mapping_expire_time(
+            self.time,
+            private_token.timeout_seconds,
+            expire_timestamp,
+            current_timestamp,
+            self.max_connect_token_lifetime,
+        );
 
         if !self.encryption_manager.add_encryption_mapping(
             from,
@@ -1223,6 +1248,73 @@ mod tests {
 
     fn test_address(port: u16) -> SocketAddr {
         format!("127.0.0.1:{port}").parse().unwrap()
+    }
+
+    /// Connection requests whose connect tokens have a negative timeout and which never
+    /// complete the handshake must not hold their encryption mappings past the connect
+    /// token's lifetime: once it has elapsed the mappings expire and the slots are reused.
+    #[test]
+    fn pending_mapping_expires_with_connect_token() {
+        let mut manager = EncryptionManager::new();
+        let time = 1000.0;
+        let send_key = crypto::generate_key();
+        let receive_key = crypto::generate_key();
+
+        // every request arrives with two seconds left on its connect token
+        let expire_timestamp = 1_700_000_030;
+        let current_timestamp = expire_timestamp - 2;
+        let expire_time =
+            pending_mapping_expire_time(time, -1, expire_timestamp, current_timestamp, 30);
+
+        for slot in 0..MAX_ENCRYPTION_MAPPINGS {
+            let port = 10000 + slot as u16;
+            assert!(manager.add_encryption_mapping(
+                test_address(port),
+                &send_key,
+                &receive_key,
+                time,
+                expire_time,
+                -1,
+                0,
+            ));
+        }
+        assert!(manager.find_encryption_mapping(test_address(10000), time).is_some());
+        assert!(!manager.add_encryption_mapping(
+            test_address(60000),
+            &send_key,
+            &receive_key,
+            time,
+            expire_time,
+            -1,
+            0,
+        ));
+
+        // the handshakes are never completed, so the mappings go with the connect token
+        let after_token_expires = time + 3.0;
+        assert!(
+            manager.find_encryption_mapping(test_address(10000), after_token_expires).is_none()
+        );
+        assert!(manager.add_encryption_mapping(
+            test_address(60000),
+            &send_key,
+            &receive_key,
+            after_token_expires,
+            after_token_expires + 5.0,
+            5,
+            0,
+        ));
+
+        assert_eq!(expire_time, time + 2.0);
+
+        // a connect token that never expires is bounded by the maximum token lifetime
+        assert_eq!(
+            pending_mapping_expire_time(time, -1, u64::MAX, current_timestamp, 30),
+            time + 30.0
+        );
+        assert_eq!(
+            pending_mapping_expire_time(time, 5, expire_timestamp, current_timestamp, 30),
+            time + 5.0
+        );
     }
 
     #[test]

@@ -573,23 +573,25 @@ impl Client {
 
     fn receive_packets(&mut self, current_timestamp: u64) {
         let mut packet_data = [0u8; MAX_PACKET_BYTES];
-        loop {
-            // the client only talks to one server, so receive on the socket matching
-            // the current server address family. the socket borrow is scoped to the
-            // receive call so packet processing can borrow self mutably.
-            let socket = match self.server_address {
-                Some(SocketAddr::V4(_)) => self.socket_ipv4.as_ref(),
-                Some(SocketAddr::V6(_)) => self.socket_ipv6.as_ref(),
-                None => None,
-            };
-            let Some(socket) = socket else {
-                return;
-            };
-            let Some((packet_bytes, from)) = socket::receive_packet(socket, &mut packet_data)
-            else {
-                return;
-            };
-            self.process_packet(from, &mut packet_data[..packet_bytes], current_timestamp);
+        // drain both sockets on every update, so packets that arrive while the client is
+        // not connecting or connected, or on the other address family, are discarded
+        // rather than left queued. the socket borrow is scoped to the receive call so
+        // packet processing can borrow self mutably.
+        for ipv4 in [true, false] {
+            loop {
+                let socket =
+                    if ipv4 { self.socket_ipv4.as_ref() } else { self.socket_ipv6.as_ref() };
+                let Some(socket) = socket else {
+                    break;
+                };
+                let Some((packet_bytes, from)) = socket::receive_packet(socket, &mut packet_data)
+                else {
+                    break;
+                };
+                if self.state.is_connecting() || self.state == ClientState::Connected {
+                    self.process_packet(from, &mut packet_data[..packet_bytes], current_timestamp);
+                }
+            }
         }
     }
 
@@ -1145,5 +1147,61 @@ mod tests {
             assert_eq!(client.max_clients(), 7);
             assert_eq!(client.state(), ClientState::SendingConnectionResponse);
         }
+    }
+
+    fn has_pending_packet(transport: &Option<socket::Transport>) -> bool {
+        match transport {
+            Some(socket::Transport::Memory(socket)) => socket.recv_from(&mut [0u8; 8]).is_some(),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn update_drains_both_transports_while_disconnected_and_connecting() {
+        let network = socket::MemoryNetwork::new();
+        let private_key = crypto::generate_key();
+        let server_address: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        let sender = network.bind("127.0.0.1:41000".parse().unwrap());
+        let sender_ipv6 = network.bind("[::1]:41000".parse().unwrap());
+
+        let mut client = Client::new_dual_in_memory(
+            &network,
+            "127.0.0.1:0".parse().unwrap(),
+            "[::1]:0".parse().unwrap(),
+            0.0,
+        )
+        .unwrap();
+        let client_ipv4 = client.socket_ipv4.as_ref().unwrap().local_addr().unwrap();
+        let client_ipv6 = client.socket_ipv6.as_ref().unwrap().local_addr().unwrap();
+
+        // packets that arrive while disconnected are read and discarded by update
+        for _ in 0..3 {
+            sender.send_to(&[0u8; 32], client_ipv4);
+            sender_ipv6.send_to(&[0u8; 32], client_ipv6);
+        }
+        client.update_at(1.0, TEST_TIMESTAMP);
+        assert_eq!(client.state(), ClientState::Disconnected);
+        assert!(!has_pending_packet(&client.socket_ipv4));
+        assert!(!has_pending_packet(&client.socket_ipv6));
+
+        let token = generate_connect_token_at(
+            &[server_address],
+            &[server_address],
+            TEST_TIMESTAMP,
+            30,
+            5,
+            1,
+            TEST_PROTOCOL_ID,
+            &private_key,
+            &[0; USER_DATA_BYTES],
+        )
+        .unwrap();
+        client.connect(&token).unwrap();
+
+        // while connecting to an IPv4 server, the IPv6 transport is drained too
+        sender_ipv6.send_to(&[0u8; 32], client_ipv6);
+        client.update_at(2.0, TEST_TIMESTAMP);
+        assert_eq!(client.state(), ClientState::SendingConnectionRequest);
+        assert!(!has_pending_packet(&client.socket_ipv6));
     }
 }

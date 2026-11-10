@@ -688,6 +688,9 @@ mod tests {
 
     const TEST_PROTOCOL_ID: u64 = 0x1122334455667788;
     const TEST_TIMESTAMP: u64 = 1_000_000;
+    // one second above the default maximum token lifetime, so a token generated in the
+    // server's start second expires strictly after the start floor
+    const TEST_TOKEN_EXPIRY: i32 = crate::DEFAULT_MAX_CONNECT_TOKEN_LIFETIME + 1;
 
     #[test]
     fn state_predicates() {
@@ -781,7 +784,7 @@ mod tests {
             &[server.address()],
             &[server.address()],
             TEST_TIMESTAMP,
-            30,
+            TEST_TOKEN_EXPIRY,
             5,
             1,
             TEST_PROTOCOL_ID,
@@ -830,7 +833,7 @@ mod tests {
             &[server.address()],
             &[server.address()],
             TEST_TIMESTAMP,
-            30,
+            TEST_TOKEN_EXPIRY,
             5,
             1,
             TEST_PROTOCOL_ID,
@@ -903,7 +906,7 @@ mod tests {
             &[dead_v4, server.address()],
             &[dead_v4, server.address()],
             TEST_TIMESTAMP,
-            30,
+            TEST_TOKEN_EXPIRY,
             2,
             42,
             TEST_PROTOCOL_ID,

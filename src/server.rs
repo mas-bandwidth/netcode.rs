@@ -2139,12 +2139,13 @@ mod tests {
         assert_eq!(client.state(), ClientState::SendingConnectionRequest);
         assert_eq!(server.num_connected_clients(), 0);
 
-        // Once the wall clock advances to TEST_TIMESTAMP + 30, the first batch expires and
+        // Once the wall clock advances to the first batch's expiry, those entries expire and
         // the client completes its connection.
+        let first_batch_expiry = TEST_TIMESTAMP + TEST_TOKEN_EXPIRY as u64;
         for _ in 0..10 {
             time += 0.1;
-            client.update_at(time, TEST_TIMESTAMP + 30);
-            server.update_at(time, TEST_TIMESTAMP + 30);
+            client.update_at(time, first_batch_expiry);
+            server.update_at(time, first_batch_expiry);
         }
         assert_eq!(client.state(), ClientState::Connected);
         assert_eq!(server.num_connected_clients(), 1);

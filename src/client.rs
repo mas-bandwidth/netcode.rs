@@ -798,7 +798,8 @@ mod tests {
         )
         .unwrap();
 
-        let mut client = Client::create(None, None, true, 0.0).unwrap();
+        let network = socket::MemoryNetwork::new();
+        let mut client = Client::new_in_memory(&network, "127.0.0.1:0".parse().unwrap(), 0.0);
         client.connect(&connect_token).unwrap();
         assert_eq!(client.server_address(), Some(dead_server_1));
 

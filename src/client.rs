@@ -1062,9 +1062,10 @@ mod tests {
 
         let server_address: SocketAddr = "127.0.0.1:40000".parse().unwrap();
         let private_key = crate::generate_key();
-        let connect_token = crate::generate_connect_token(
+        let connect_token = generate_connect_token_at(
             &[server_address],
             &[server_address],
+            TEST_TIMESTAMP,
             30,
             5,
             0x1234,
@@ -1093,7 +1094,7 @@ mod tests {
                 PROTOCOL_ID,
             )
             .unwrap();
-            client.process_packet(server_address, &mut packet_data[..packet_bytes]);
+            client.process_packet(server_address, &mut packet_data[..packet_bytes], TEST_TIMESTAMP);
             assert_eq!(client.client_index(), CLIENT_INDEX);
             assert_eq!(client.max_clients(), 7);
             assert_eq!(client.state(), ClientState::SendingConnectionResponse);

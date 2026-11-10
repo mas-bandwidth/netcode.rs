@@ -397,3 +397,19 @@ fn multiple_clients_connect_and_exchange_packets() {
         received.iter().all(|&count| count >= 5)
     });
 }
+
+#[test]
+fn restarted_server_accepts_new_client_over_udp() {
+    let mut harness = Harness::new(1);
+    harness.connect_client(0x1111);
+    harness.run_until(1000, |h| h.clients[0].state() == ClientState::Connected);
+
+    harness.server.stop();
+    harness.server.start(1).unwrap();
+    harness.clients.clear();
+
+    harness.connect_client(0x2222);
+    harness.run_until(1000, |h| h.clients[0].state() == ClientState::Connected);
+    assert_eq!(harness.server.num_connected_clients(), 1);
+    assert_eq!(harness.server.client_id(0), 0x2222);
+}

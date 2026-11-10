@@ -120,6 +120,8 @@ pub struct Client {
     packet_receive_queue: VecDeque<(Vec<u8>, u64)>,
     challenge_token_sequence: u64,
     challenge_token_data: [u8; CHALLENGE_TOKEN_BYTES],
+    #[cfg(test)]
+    receive_packet_override: Option<VecDeque<(Vec<u8>, SocketAddr)>>,
 }
 
 impl Client {
@@ -234,6 +236,8 @@ impl Client {
             packet_receive_queue: VecDeque::new(),
             challenge_token_sequence: 0,
             challenge_token_data: [0; CHALLENGE_TOKEN_BYTES],
+            #[cfg(test)]
+            receive_packet_override: None,
         };
 
         info!("client started on port {}", client.port());
@@ -563,26 +567,78 @@ impl Client {
     fn receive_packets(&mut self, current_timestamp: u64) {
         let mut packet_data = [0u8; MAX_PACKET_BYTES];
         loop {
-            // the client only talks to one server, so receive on the socket matching
-            // the current server address family. the socket borrow is scoped to the
-            // receive call so packet processing can borrow self mutably.
-            let socket = match self.server_address {
-                Some(SocketAddr::V4(_)) => self.socket_ipv4.as_ref(),
-                Some(SocketAddr::V6(_)) => self.socket_ipv6.as_ref(),
-                None => None,
-            };
-            let Some(socket) = socket else {
+            let mut received = false;
+
+            if let Some((packet_bytes, from)) = self.receive_from_ipv4(&mut packet_data) {
+                received = true;
+                self.process_packet(from, &mut packet_data[..packet_bytes], current_timestamp);
+            }
+
+            if let Some((packet_bytes, from)) = self.receive_from_ipv6(&mut packet_data) {
+                received = true;
+                self.process_packet(from, &mut packet_data[..packet_bytes], current_timestamp);
+            }
+
+            if !received {
                 return;
-            };
-            let Some((packet_bytes, from)) = socket::receive_packet(socket, &mut packet_data)
-            else {
-                return;
-            };
-            self.process_packet(from, &mut packet_data[..packet_bytes], current_timestamp);
+            }
         }
     }
 
+    fn receive_from_ipv4(&mut self, buffer: &mut [u8]) -> Option<(usize, SocketAddr)> {
+        #[cfg(test)]
+        {
+            if self.receive_packet_override.is_some() {
+                return Self::receive_from_override(
+                    &mut self.receive_packet_override,
+                    true,
+                    buffer,
+                );
+            }
+        }
+        let socket = self.socket_ipv4.as_ref()?;
+        socket::receive_packet(socket, buffer)
+    }
+
+    fn receive_from_ipv6(&mut self, buffer: &mut [u8]) -> Option<(usize, SocketAddr)> {
+        #[cfg(test)]
+        {
+            if self.receive_packet_override.is_some() {
+                return Self::receive_from_override(
+                    &mut self.receive_packet_override,
+                    false,
+                    buffer,
+                );
+            }
+        }
+        let socket = self.socket_ipv6.as_ref()?;
+        socket::receive_packet(socket, buffer)
+    }
+
+    #[cfg(test)]
+    fn receive_from_override(
+        override_packets: &mut Option<VecDeque<(Vec<u8>, SocketAddr)>>,
+        ipv4: bool,
+        buffer: &mut [u8],
+    ) -> Option<(usize, SocketAddr)> {
+        let queue = override_packets.as_mut()?;
+        let index = queue.iter().position(|(_, from)| from.is_ipv4() == ipv4)?;
+        let (packet, from) = queue.remove(index)?;
+        let packet_bytes = packet.len().min(buffer.len());
+        buffer[..packet_bytes].copy_from_slice(&packet[..packet_bytes]);
+        Some((packet_bytes, from))
+    }
+
     fn process_packet(&mut self, from: SocketAddr, packet_data: &mut [u8], current_timestamp: u64) {
+        if !matches!(
+            self.state,
+            ClientState::SendingConnectionRequest
+                | ClientState::SendingConnectionResponse
+                | ClientState::Connected
+        ) {
+            return;
+        }
+
         if Some(from) != self.server_address {
             return;
         }
@@ -1099,5 +1155,111 @@ mod tests {
             assert_eq!(client.max_clients(), 7);
             assert_eq!(client.state(), ClientState::SendingConnectionResponse);
         }
+    }
+
+    #[test]
+    fn update_drains_pending_datagrams_while_disconnected() {
+        const PROTOCOL_ID: u64 = 0x1122334455667788;
+        const SERVER_SEQUENCE: u64 = 1;
+
+        let server_address: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        let other_family_address: SocketAddr = "[::1]:40000".parse().unwrap();
+        let private_key = crate::generate_key();
+        let connect_token = generate_connect_token_at(
+            &[server_address],
+            &[server_address],
+            TEST_TIMESTAMP,
+            30,
+            5,
+            0x1234,
+            PROTOCOL_ID,
+            &private_key,
+            &[0; crate::USER_DATA_BYTES],
+        )
+        .unwrap();
+
+        let mut client = Client::create(None, None, true, 0.0).unwrap();
+        assert_eq!(client.state(), ClientState::Disconnected);
+
+        let key = ConnectToken::read(&connect_token).unwrap().server_to_client_key;
+        let mut packet_data = [0u8; MAX_PACKET_BYTES];
+        let packet_bytes = crate::packet::write_packet(
+            &Packet::Payload(vec![1, 2, 3]),
+            &mut packet_data,
+            SERVER_SEQUENCE,
+            &key,
+            PROTOCOL_ID,
+        )
+        .unwrap();
+        let packet = packet_data[..packet_bytes].to_vec();
+
+        client.receive_packet_override = Some(VecDeque::from([
+            (packet.clone(), server_address),
+            (packet, other_family_address),
+        ]));
+
+        client.update(1.0);
+        assert!(
+            client.receive_packet_override.as_ref().unwrap().is_empty(),
+            "update while disconnected left datagrams queued"
+        );
+
+        client.connect(&connect_token).unwrap();
+        client.state = ClientState::Connected;
+        client.receive_packets(TEST_TIMESTAMP);
+        assert!(
+            client.receive_packet().is_none(),
+            "a datagram queued before connecting was processed after connecting"
+        );
+    }
+
+    #[test]
+    fn datagrams_received_outside_a_connection_are_ignored() {
+        const PROTOCOL_ID: u64 = 0x1122334455667788;
+        const SERVER_SEQUENCE: u64 = 1;
+
+        let server_address: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        let private_key = crate::generate_key();
+        let connect_token = generate_connect_token_at(
+            &[server_address],
+            &[server_address],
+            TEST_TIMESTAMP,
+            30,
+            5,
+            0x1234,
+            PROTOCOL_ID,
+            &private_key,
+            &[0; crate::USER_DATA_BYTES],
+        )
+        .unwrap();
+
+        let mut client = Client::create(None, None, true, 0.0).unwrap();
+        client.connect(&connect_token).unwrap();
+        client.state = ClientState::Disconnected;
+
+        let key = ConnectToken::read(&connect_token).unwrap().server_to_client_key;
+        let mut packet_data = [0u8; MAX_PACKET_BYTES];
+        let packet_bytes = crate::packet::write_packet(
+            &Packet::Payload(vec![7, 8, 9]),
+            &mut packet_data,
+            SERVER_SEQUENCE,
+            &key,
+            PROTOCOL_ID,
+        )
+        .unwrap();
+        client.receive_packet_override =
+            Some(VecDeque::from([(packet_data[..packet_bytes].to_vec(), server_address)]));
+
+        client.update(1.0);
+
+        assert!(
+            client.receive_packet_override.as_ref().unwrap().is_empty(),
+            "update outside a connection left datagrams queued"
+        );
+        assert!(
+            !client.replay_protection.already_received(SERVER_SEQUENCE),
+            "a datagram received outside a connection advanced replay protection"
+        );
+        assert!(client.receive_packet().is_none());
     }
 }

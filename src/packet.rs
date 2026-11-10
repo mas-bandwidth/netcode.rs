@@ -797,4 +797,166 @@ mod tests {
             .is_none()
         );
     }
+
+    fn seal_body(packet_type: u8, body: &[u8]) -> Vec<u8> {
+        let key = [0x11u8; crate::KEY_BYTES];
+        let sequence: u64 = 1;
+        let sequence_bytes = 1usize;
+        let prefix = packet_type | ((sequence_bytes as u8) << 4);
+        let mut buffer = Vec::with_capacity(1 + sequence_bytes + body.len() + MAC_BYTES);
+        buffer.push(prefix);
+        buffer.extend_from_slice(&sequence.to_le_bytes()[..sequence_bytes]);
+        buffer.extend_from_slice(body);
+        buffer.extend_from_slice(&[0u8; MAC_BYTES]);
+        let additional = packet_additional_data(TEST_PROTOCOL_ID, prefix);
+        let nonce = crypto::sequence_nonce(sequence);
+        crypto::encrypt_aead(&mut buffer[1 + sequence_bytes..], &additional, &nonce, &key).unwrap();
+        buffer
+    }
+
+    fn read_sealed(packet_type: u8, buffer: &mut [u8]) -> Option<(Packet, u64)> {
+        let key = [0x11u8; crate::KEY_BYTES];
+        let allowed = if packet_type == CONNECTION_RESPONSE_PACKET {
+            AllowedPackets::SERVER
+        } else {
+            AllowedPackets::CLIENT
+        };
+        read_packet(buffer, Some(&key), TEST_PROTOCOL_ID, 0, None, allowed, None)
+    }
+
+    fn assert_exact_body(packet_type: u8, packet: &Packet, body_len: usize) {
+        match packet_type {
+            CONNECTION_DENIED_PACKET => assert!(matches!(packet, Packet::Denied)),
+            CONNECTION_DISCONNECT_PACKET => assert!(matches!(packet, Packet::Disconnect)),
+            CONNECTION_KEEP_ALIVE_PACKET => {
+                assert!(matches!(packet, Packet::KeepAlive { client_index: 0, max_clients: 0 }));
+            }
+            CONNECTION_CHALLENGE_PACKET => match packet {
+                Packet::Challenge { challenge_token_sequence, challenge_token_data } => {
+                    assert_eq!(*challenge_token_sequence, 0);
+                    assert!(challenge_token_data.iter().all(|byte| *byte == 0));
+                    assert_eq!(8 + challenge_token_data.len(), body_len);
+                }
+                _ => panic!("challenge packet parsed as another type"),
+            },
+            CONNECTION_RESPONSE_PACKET => match packet {
+                Packet::Response { challenge_token_sequence, challenge_token_data } => {
+                    assert_eq!(*challenge_token_sequence, 0);
+                    assert!(challenge_token_data.iter().all(|byte| *byte == 0));
+                    assert_eq!(8 + challenge_token_data.len(), body_len);
+                }
+                _ => panic!("response packet parsed as another type"),
+            },
+            CONNECTION_PAYLOAD_PACKET => match packet {
+                Packet::Payload(data) => assert_eq!(data.len(), body_len),
+                _ => panic!("payload packet parsed as another type"),
+            },
+            _ => panic!("unexpected packet type {packet_type}"),
+        }
+    }
+
+    #[test]
+    fn body_lengths_match_packet_type() {
+        // plaintext length, and whether that length is the one the reader accepts.
+        // payload is a range, so its short and long rows are the ends of that range.
+        let rows = [
+            (CONNECTION_DENIED_PACKET, 0usize, true),
+            (CONNECTION_DENIED_PACKET, 1usize, false),
+            (CONNECTION_CHALLENGE_PACKET, 8 + CHALLENGE_TOKEN_BYTES - 1, false),
+            (CONNECTION_CHALLENGE_PACKET, 8 + CHALLENGE_TOKEN_BYTES, true),
+            (CONNECTION_CHALLENGE_PACKET, 8 + CHALLENGE_TOKEN_BYTES + 1, false),
+            (CONNECTION_RESPONSE_PACKET, 8 + CHALLENGE_TOKEN_BYTES - 1, false),
+            (CONNECTION_RESPONSE_PACKET, 8 + CHALLENGE_TOKEN_BYTES, true),
+            (CONNECTION_RESPONSE_PACKET, 8 + CHALLENGE_TOKEN_BYTES + 1, false),
+            (CONNECTION_KEEP_ALIVE_PACKET, 7, false),
+            (CONNECTION_KEEP_ALIVE_PACKET, 8, true),
+            (CONNECTION_KEEP_ALIVE_PACKET, 9, false),
+            (CONNECTION_PAYLOAD_PACKET, 0, false),
+            (CONNECTION_PAYLOAD_PACKET, 1, true),
+            (CONNECTION_PAYLOAD_PACKET, MAX_PAYLOAD_BYTES, true),
+            (CONNECTION_PAYLOAD_PACKET, MAX_PAYLOAD_BYTES + 1, false),
+            (CONNECTION_DISCONNECT_PACKET, 0, true),
+            (CONNECTION_DISCONNECT_PACKET, 1, false),
+        ];
+
+        for (packet_type, body_len, accept) in rows {
+            let mut buffer = seal_body(packet_type, &vec![0u8; body_len]);
+            let parsed = read_sealed(packet_type, &mut buffer);
+            if accept {
+                let (packet, sequence) =
+                    parsed.unwrap_or_else(|| panic!("type {packet_type} len {body_len}"));
+                assert_eq!(sequence, 1);
+                assert_exact_body(packet_type, &packet, body_len);
+            } else {
+                assert!(parsed.is_none(), "type {packet_type} len {body_len}");
+            }
+        }
+
+        // denied and disconnect have an empty body, so one byte short is a frame that
+        // does not hold a tag.
+        for packet_type in [CONNECTION_DENIED_PACKET, CONNECTION_DISCONNECT_PACKET] {
+            let mut buffer = seal_body(packet_type, &[]);
+            buffer.pop();
+            assert!(read_sealed(packet_type, &mut buffer).is_none());
+        }
+
+        for delta in [-1isize, 0, 1] {
+            let mut buffer = connection_request_packet();
+            if delta < 0 {
+                buffer.pop();
+            } else if delta > 0 {
+                buffer.push(0);
+            }
+            let parsed = read_packet(
+                &mut buffer,
+                None,
+                TEST_PROTOCOL_ID,
+                0,
+                Some(&[0x22u8; crate::KEY_BYTES]),
+                AllowedPackets::SERVER,
+                None,
+            );
+            if delta == 0 {
+                assert!(matches!(parsed, Some((Packet::Request { .. }, 0))));
+            } else {
+                assert!(parsed.is_none(), "connection request delta {delta}");
+            }
+        }
+    }
+
+    fn connection_request_packet() -> Vec<u8> {
+        let private_key = [0x22u8; crate::KEY_BYTES];
+        let expire_timestamp = 10u64;
+        let nonce = [0x33u8; CONNECT_TOKEN_NONCE_BYTES];
+        let private_token = crate::token::PrivateConnectToken {
+            client_id: 1,
+            timeout_seconds: 5,
+            server_addresses: vec!["127.0.0.1:1".parse().unwrap()],
+            client_to_server_key: [0x44u8; crate::KEY_BYTES],
+            server_to_client_key: [0x55u8; crate::KEY_BYTES],
+            user_data: [0u8; crate::USER_DATA_BYTES],
+        };
+        let mut private_data = Box::new([0u8; CONNECT_TOKEN_PRIVATE_BYTES]);
+        private_token.write(&mut private_data);
+        crate::token::encrypt_connect_token_private(
+            &mut private_data,
+            TEST_PROTOCOL_ID,
+            expire_timestamp,
+            &nonce,
+            &private_key,
+        )
+        .unwrap();
+        let packet = Packet::Request {
+            protocol_id: TEST_PROTOCOL_ID,
+            expire_timestamp,
+            nonce,
+            private_data,
+        };
+        let mut buffer = vec![0u8; crate::MAX_PACKET_BYTES];
+        let written =
+            write_packet(&packet, &mut buffer, 0, &[0u8; crate::KEY_BYTES], TEST_PROTOCOL_ID)
+                .unwrap();
+        buffer.truncate(written);
+        buffer
+    }
 }

@@ -44,7 +44,9 @@ fn c_server_address() -> SocketAddr {
     }
 }
 
-const CONNECT_TOKEN_EXPIRY: i32 = 30;
+// one second above the server's default maximum token lifetime, so a token generated in
+// the server's start second expires strictly after its start floor
+const CONNECT_TOKEN_EXPIRY: i32 = netcode::DEFAULT_MAX_CONNECT_TOKEN_LIFETIME + 1;
 const CONNECT_TOKEN_TIMEOUT: i32 = 5;
 const DELTA_TIME: f64 = 1.0 / 60.0;
 
@@ -161,7 +163,13 @@ fn rust_client_connects_to_c_server() {
 fn c_client_connects_to_rust_server() {
     let _guard = INTEROP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let server_address = ephemeral_address();
-    let mut server = Server::new(server_address, PROTOCOL_ID, &PRIVATE_KEY, 0.0).unwrap();
+    // the C client example issues tokens with the default maximum lifetime, so a token it
+    // generates in the server's start second must clear a start floor one second lower
+    let config = netcode::ServerConfig {
+        max_connect_token_lifetime: netcode::DEFAULT_MAX_CONNECT_TOKEN_LIFETIME - 1,
+    };
+    let mut server =
+        Server::new_with_config(server_address, PROTOCOL_ID, &PRIVATE_KEY, config, 0.0).unwrap();
     server.start(16).unwrap();
 
     // the C client example takes the server address to connect to

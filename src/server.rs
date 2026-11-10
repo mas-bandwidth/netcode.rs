@@ -528,6 +528,7 @@ impl Server {
         config: ServerConfig,
         time: f64,
     ) -> Result<Self, Error> {
+        public_address = socket::normalize_address(public_address);
         if public_address.port() == 0 {
             public_address.set_port(socket.local_addr()?.port());
         }
@@ -960,7 +961,8 @@ impl Server {
             return;
         };
 
-        if !private_token.server_addresses.contains(&self.public_address) {
+        if !private_token.server_addresses.contains(&socket::normalize_address(self.public_address))
+        {
             debug!(
                 "server ignored connection request. server address not in connect token whitelist"
             );
@@ -1364,6 +1366,7 @@ pub(crate) fn generate_connect_token_at(
 mod tests {
     use super::*;
     use std::io;
+    use std::net::SocketAddrV6;
 
     use crate::packet::{read_packet, write_packet};
     use crate::token::ConnectToken;
@@ -2326,5 +2329,59 @@ mod tests {
             server.update_at(time, TEST_TIMESTAMP);
         }
         assert_eq!(extra_client.state(), ClientState::ConnectionDenied);
+    }
+
+    /// Connect token server addresses encode only the IPv6 address and port, so a
+    /// server configured with a scope id or flow label must still accept clients for
+    /// that address.
+    #[test]
+    fn connection_request_for_ipv6_address_with_scope_id_and_flow_label_is_accepted() {
+        let network = socket::MemoryNetwork::new();
+        let private_key = crypto::generate_key();
+        let configured_address =
+            SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 40000, 0x1234, 3));
+        let socket = socket::Transport::Memory(network.bind(configured_address));
+        let mut server = Server::with_transport(
+            socket,
+            configured_address,
+            TEST_PROTOCOL_ID,
+            &private_key,
+            ServerConfig::default(),
+            0.0,
+        )
+        .unwrap();
+        server.start_at(1, TEST_TIMESTAMP).unwrap();
+
+        // the connect token is minted for the address the operator configured, which
+        // still carries the scope id and flow label; only the wire form drops them
+        let connect_token = generate_connect_token_at(
+            &[configured_address],
+            &[configured_address],
+            TEST_TIMESTAMP,
+            TEST_TOKEN_EXPIRY,
+            TEST_TOKEN_TIMEOUT,
+            0x1234,
+            TEST_PROTOCOL_ID,
+            &private_key,
+            &[0; USER_DATA_BYTES],
+        )
+        .unwrap();
+        let client_address = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 0, 0, 0));
+        let mut client = Client::new_in_memory(&network, client_address, 0.0);
+        client.connect(&connect_token).unwrap();
+
+        let mut time = 0.0;
+        for _ in 0..10 {
+            time += 0.1;
+            client.update_at(time, TEST_TIMESTAMP);
+            server.update_at(time, TEST_TIMESTAMP);
+        }
+        assert_eq!(client.state(), ClientState::Connected);
+        assert_eq!(server.num_connected_clients(), 1);
+        assert_eq!(
+            server.address(),
+            SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 40000, 0, 0)),
+            "server public_address should have flowinfo and scope_id normalized to zero"
+        );
     }
 }

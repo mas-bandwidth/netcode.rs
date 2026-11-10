@@ -11,7 +11,7 @@ documentation = "https://docs.rs/netcode-official"
 readme = "README.md"
 keywords = ["gamedev", "networking", "udp", "protocol", "netcode"]
 categories = ["game-development", "network-programming"]
-exclude = [".github/", "fuzz/"]
+exclude = [".github/", "fuzz/", "CLAUDE.md", ".mailmap", "deny.toml"]
 
 [lib]
 # the library target keeps the name `netcode` (code says `use netcode::...`), so if

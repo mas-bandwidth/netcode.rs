@@ -81,11 +81,37 @@ fn spawn(env_var: &str, argument: String) -> ChildGuard {
     ChildGuard(child)
 }
 
+/// The connect token the Rust client presents to the C server.
+fn interop_connect_token(server_address: SocketAddr) -> [u8; netcode::CONNECT_TOKEN_BYTES] {
+    netcode::generate_connect_token(
+        &[server_address],
+        &[server_address],
+        CONNECT_TOKEN_EXPIRY,
+        CONNECT_TOKEN_TIMEOUT,
+        0x1234,
+        PROTOCOL_ID,
+        &PRIVATE_KEY,
+        &[0u8; netcode::USER_DATA_BYTES],
+    )
+    .unwrap()
+}
+
 #[test]
 fn ephemeral_address_is_free_and_on_loopback() {
     let address = ephemeral_address();
     assert!(address.ip().is_loopback());
     assert_ne!(address.port(), 0);
+}
+
+#[test]
+fn interop_connect_token_expires_after_start_floor() {
+    let token = interop_connect_token("127.0.0.1:40000".parse().unwrap());
+    let create = u64::from_le_bytes(token[21..29].try_into().unwrap());
+    let expire = u64::from_le_bytes(token[29..37].try_into().unwrap());
+    assert!(
+        expire - create > netcode::DEFAULT_MAX_CONNECT_TOKEN_LIFETIME as u64,
+        "the interop token must expire strictly after the C server's start floor"
+    );
 }
 
 #[test]
@@ -99,17 +125,7 @@ fn rust_client_connects_to_c_server() {
 
     let mut client = Client::new("0.0.0.0:0".parse().unwrap(), 0.0).unwrap();
 
-    let connect_token = netcode::generate_connect_token(
-        &[server_address],
-        &[server_address],
-        CONNECT_TOKEN_EXPIRY,
-        CONNECT_TOKEN_TIMEOUT,
-        0x1234,
-        PROTOCOL_ID,
-        &PRIVATE_KEY,
-        &[0u8; netcode::USER_DATA_BYTES],
-    )
-    .unwrap();
+    let connect_token = interop_connect_token(server_address);
 
     client.connect(&connect_token).unwrap();
 

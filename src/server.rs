@@ -2150,7 +2150,40 @@ mod tests {
         let mut reply = [0u8; MAX_PACKET_BYTES];
         assert!(probe_socket.recv_from(&mut reply).is_none());
 
-        // 2. Token just above the floor (expire_timestamp == TEST_TIMESTAMP + 31) presented after it
+        // 2. Token issued in the server's start second, whose expire_timestamp is exactly the
+        // floor (TEST_TIMESTAMP + 30), is rejected while otherwise valid.
+        let at_floor_token = generate_connect_token_at(
+            &[server.address()],
+            &[server.address()],
+            TEST_TIMESTAMP,
+            TEST_TOKEN_EXPIRY,
+            TEST_TOKEN_TIMEOUT,
+            3,
+            TEST_PROTOCOL_ID,
+            &private_key,
+            &[0; USER_DATA_BYTES],
+        )
+        .unwrap();
+        let parsed_at_floor = ConnectToken::read(&at_floor_token).unwrap();
+        assert_eq!(parsed_at_floor.expire_timestamp, server.min_connect_token_expire_timestamp);
+        let req_len = write_packet(
+            &Packet::Request {
+                protocol_id: parsed_at_floor.protocol_id,
+                expire_timestamp: parsed_at_floor.expire_timestamp,
+                nonce: parsed_at_floor.nonce,
+                private_data: parsed_at_floor.private_data.clone(),
+            },
+            &mut req_buf,
+            0,
+            &[0; KEY_BYTES],
+            parsed_at_floor.protocol_id,
+        )
+        .unwrap();
+        probe_socket.send_to(&req_buf[..req_len], server.address());
+        server.update_at(0.15, TEST_TIMESTAMP);
+        assert!(probe_socket.recv_from(&mut reply).is_none());
+
+        // 3. Token just above the floor (expire_timestamp == TEST_TIMESTAMP + 31) presented after it
         // has expired (at current_timestamp == TEST_TIMESTAMP + 32) is rejected. It is issued
         // in the second after the server's start.
         let boundary_token = generate_connect_token_at(
@@ -2183,7 +2216,7 @@ mod tests {
         server.update_at(0.2, TEST_TIMESTAMP + 32);
         assert!(probe_socket.recv_from(&mut reply).is_none());
 
-        // 3. The same token presented while valid (at TEST_TIMESTAMP + 10) receives a challenge.
+        // 4. The same token presented while valid (at TEST_TIMESTAMP + 10) receives a challenge.
         probe_socket.send_to(&req_buf[..req_len], server.address());
         server.update_at(0.3, TEST_TIMESTAMP + 10);
         assert!(probe_socket.recv_from(&mut reply).is_some());

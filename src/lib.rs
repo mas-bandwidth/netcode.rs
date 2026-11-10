@@ -50,6 +50,9 @@
 //! let mut server = netcode::Server::new(server_address, protocol_id, &private_key, 0.0).unwrap();
 //! server.start(16).unwrap();
 //!
+//! // the server refuses connect tokens issued in its start second
+//! std::thread::sleep(std::time::Duration::from_secs(1));
+//!
 //! let client_address: SocketAddr = "0.0.0.0:0".parse().unwrap();
 //! let mut client = netcode::Client::new(client_address, 0.0).unwrap();
 //!
@@ -58,7 +61,7 @@
 //! let connect_token = netcode::generate_connect_token(
 //!     &[server_address],
 //!     &[server_address],
-//!     netcode::DEFAULT_MAX_CONNECT_TOKEN_LIFETIME + 1,
+//!     netcode::DEFAULT_MAX_CONNECT_TOKEN_LIFETIME,
 //!     5,
 //!     client_id,
 //!     protocol_id,

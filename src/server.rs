@@ -50,6 +50,10 @@ pub enum ServerEvent {
 
 const MAX_ENCRYPTION_MAPPINGS: usize = MAX_CLIENTS * 4;
 
+/// The most connect and disconnect events queued for [`Server::next_event`]. Once
+/// full, each new event drops the oldest one.
+const MAX_SERVER_EVENTS: usize = MAX_CLIENTS * 4;
+
 /// Configuration for a [`Server`].
 #[derive(Debug, Clone, Copy)]
 pub struct ServerConfig {
@@ -610,6 +614,7 @@ impl Server {
         self.challenge_key = [0; KEY_BYTES];
         self.min_connect_token_expire_timestamp = 0;
         self.clients.clear();
+        self.events.clear();
 
         reset_connect_token_entries(&mut self.connect_token_entries);
         self.encryption_manager.reset();
@@ -630,7 +635,9 @@ impl Server {
         self.check_for_timeouts();
     }
 
-    /// Pops the next connect or disconnect event.
+    /// Pops the next connect or disconnect event. Drain these every update: at most
+    /// `MAX_CLIENTS * 4` events are kept, the oldest dropped first, and
+    /// [`Server::stop`] clears them.
     pub fn next_event(&mut self) -> Option<ServerEvent> {
         self.events.pop_front()
     }
@@ -1146,7 +1153,14 @@ impl Server {
         };
         self.send_client_packet(&packet, client_index);
 
-        self.events.push_back(ServerEvent::ClientConnected { client_index });
+        self.push_event(ServerEvent::ClientConnected { client_index });
+    }
+
+    fn push_event(&mut self, event: ServerEvent) {
+        if self.events.len() >= MAX_SERVER_EVENTS {
+            self.events.pop_front();
+        }
+        self.events.push_back(event);
     }
 
     fn disconnect_client_internal(
@@ -1160,7 +1174,7 @@ impl Server {
 
         info!("server disconnected client {client_index}");
 
-        self.events.push_back(ServerEvent::ClientDisconnected { client_index, reason });
+        self.push_event(ServerEvent::ClientDisconnected { client_index, reason });
 
         if send_disconnect_packets {
             debug!("server sent disconnect packets to client {client_index}");
@@ -1918,6 +1932,96 @@ mod tests {
             "stop did not reseed the global sequence: {}",
             server.global_sequence
         );
+    }
+
+    /// Connects one in-memory client with `client_id` to `server`, advancing `time`.
+    fn connect_in_memory_client(
+        network: &socket::MemoryNetwork,
+        server: &mut Server,
+        private_key: &Key,
+        client_id: u64,
+        time: &mut f64,
+    ) -> Client {
+        let token = generate_connect_token_at(
+            &[server.address()],
+            &[server.address()],
+            TEST_TIMESTAMP,
+            TEST_TOKEN_EXPIRY,
+            TEST_TOKEN_TIMEOUT,
+            client_id,
+            TEST_PROTOCOL_ID,
+            private_key,
+            &[0x11; USER_DATA_BYTES],
+        )
+        .unwrap();
+        let mut client = Client::new_in_memory(network, test_address(0), *time);
+        client.connect(&token).unwrap();
+        for _ in 0..10 {
+            client.update_at(*time, TEST_TIMESTAMP);
+            server.update_at(*time, TEST_TIMESTAMP);
+            *time += 0.1;
+        }
+        assert_eq!(client.state(), ClientState::Connected);
+        client
+    }
+
+    #[test]
+    fn stop_clears_pending_events() {
+        let network = socket::MemoryNetwork::new();
+        let private_key = crypto::generate_key();
+        let mut server = Server::new_in_memory(
+            &network,
+            test_address(40000),
+            TEST_PROTOCOL_ID,
+            &private_key,
+            0.0,
+        )
+        .unwrap();
+        server.start_at(1, TEST_TIMESTAMP).unwrap();
+
+        let mut time = 0.0;
+        let _client = connect_in_memory_client(&network, &mut server, &private_key, 1, &mut time);
+        assert_eq!(server.num_connected_clients(), 1);
+
+        server.stop();
+        server.start_at(1, TEST_TIMESTAMP).unwrap();
+        assert_eq!(server.next_event(), None);
+    }
+
+    #[test]
+    fn events_are_bounded_when_not_drained() {
+        let network = socket::MemoryNetwork::new();
+        let private_key = crypto::generate_key();
+        let mut server = Server::new_in_memory(
+            &network,
+            test_address(40000),
+            TEST_PROTOCOL_ID,
+            &private_key,
+            0.0,
+        )
+        .unwrap();
+        server.start_at(1, TEST_TIMESTAMP).unwrap();
+
+        // each cycle queues a connect and a disconnect event
+        let mut time = 0.0;
+        let cycles = MAX_SERVER_EVENTS / 2 + 8;
+        for client_id in 0..cycles as u64 {
+            let _client =
+                connect_in_memory_client(&network, &mut server, &private_key, client_id, &mut time);
+            server.disconnect_client(0);
+            assert!(server.events.len() <= MAX_SERVER_EVENTS);
+        }
+        assert_eq!(server.events.len(), MAX_SERVER_EVENTS);
+
+        // the oldest events were dropped: the newest is the last disconnect
+        assert_eq!(
+            server.events.back(),
+            Some(&ServerEvent::ClientDisconnected {
+                client_index: 0,
+                reason: DisconnectReason::ServerDisconnect,
+            })
+        );
+        assert_eq!(server.next_event(), Some(ServerEvent::ClientConnected { client_index: 0 }));
     }
 
     #[test]

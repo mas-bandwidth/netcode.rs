@@ -76,6 +76,9 @@
 //!     if client.state() == netcode::ClientState::Connected {
 //!         client.send_packet(&[1, 2, 3, 4]).unwrap();
 //!     }
+//!     while let Some(event) = server.next_event() {
+//!         println!("server event {event:?}");
+//!     }
 //!     while let Some((payload, _sequence)) = server.receive_packet(0) {
 //!         println!("server received {} byte packet", payload.len());
 //!     }

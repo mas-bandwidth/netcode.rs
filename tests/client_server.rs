@@ -1,15 +1,24 @@
 //! Integration tests: a real client and server exchanging packets over localhost UDP.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use netcode::{Client, ClientState, DisconnectReason, Key, Server, ServerEvent};
 
 const PROTOCOL_ID: u64 = 0x1122334455667788;
-// one second above the server's default maximum token lifetime, so a token generated in
-// the server's start second expires strictly after its start floor
-const CONNECT_TOKEN_EXPIRY: i32 = netcode::DEFAULT_MAX_CONNECT_TOKEN_LIFETIME + 1;
+const CONNECT_TOKEN_EXPIRY: i32 = netcode::DEFAULT_MAX_CONNECT_TOKEN_LIFETIME;
 const CONNECT_TOKEN_TIMEOUT: i32 = 5;
 const DELTA_TIME: f64 = 1.0 / 100.0;
+
+/// Waits until the wall clock second has advanced past the one this is called in. A
+/// server refuses connect tokens issued in its start second, so tests call this after
+/// starting a server and before issuing tokens for it.
+fn wait_for_next_second() {
+    let unix_seconds = || SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let second = unix_seconds();
+    while unix_seconds() <= second {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
 
 struct Harness {
     private_key: Key,
@@ -25,6 +34,7 @@ impl Harness {
         let mut server =
             Server::new("127.0.0.1:0".parse().unwrap(), PROTOCOL_ID, &private_key, 0.0).unwrap();
         server.start(max_clients).unwrap();
+        wait_for_next_second();
         Self { private_key, server, clients: Vec::new(), time: 0.0 }
     }
 
@@ -212,6 +222,7 @@ fn server_disconnect_does_not_advance_to_next_server() {
     let mut next_server =
         Server::new("127.0.0.1:0".parse().unwrap(), PROTOCOL_ID, &private_key, 0.0).unwrap();
     next_server.start(1).unwrap();
+    wait_for_next_second();
 
     let connect_token = netcode::generate_connect_token(
         &[harness.server.address(), next_server.address()],
@@ -421,6 +432,7 @@ fn restarted_server_accepts_new_client_over_udp() {
 
     harness.server.stop();
     harness.server.start(1).unwrap();
+    wait_for_next_second();
     harness.clients.clear();
 
     harness.connect_client(0x2222);

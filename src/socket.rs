@@ -16,43 +16,36 @@ use socket2::{Domain, Protocol, Socket, Type};
 const SOCKET_SNDBUF_SIZE: usize = 4 * 1024 * 1024;
 const SOCKET_RCVBUF_SIZE: usize = 4 * 1024 * 1024;
 
-/// Smallest buffer worth having. Below this the socket is not useful for netcode's
-/// traffic, so failing is better than pretending. Matches the reference implementation.
-const SOCKET_BUFFER_MIN_SIZE: usize = 256 * 1024;
+/// Smallest buffer size requested. Matches the reference implementation.
+const SOCKET_BUFFER_MIN_SIZE: usize = 64 * 1024;
 
 /// Set a socket buffer size, halving until the OS accepts it.
 ///
 /// Linux and Windows CLAMP a request above the OS limit and return success. The BSDs
-/// REJECT it with ENOBUFS instead. OpenBSD's default `sb_max` is well under the 4 MB
-/// asked for here, so a straight `set_send_buffer_size(4MB)?` fails outright and nothing
-/// can start at all -- which is the entire reason the C implementation grew this backoff
-/// (netcode 71469837, shipped in v1.3.5).
+/// REJECT it instead (a stock NetBSD rejects anything over about 227 KiB), so a straight
+/// `set_send_buffer_size(4MB)?` fails outright and nothing can start at all.
 ///
-/// Semantics ported exactly: try the requested size, halve on failure, and give up only
-/// once the halved size would fall below the floor. So the smallest size ever attempted
-/// is at least the floor, and the error surfaced is the one from the last real attempt.
+/// Semantics ported from the reference implementation: try sizes from the requested one
+/// down to the minimum, halving each time. A larger buffer is an optimisation, never a
+/// requirement: if no size is accepted the socket keeps the OS default. Returns the size
+/// accepted, or `None` if the OS default was kept.
 fn set_buffer_with_backoff(
     requested: usize,
     label: &str,
     mut set: impl FnMut(usize) -> io::Result<()>,
-) -> io::Result<usize> {
+) -> Option<usize> {
     let mut size = requested;
-    loop {
-        match set(size) {
-            Ok(()) => break,
-            Err(error) => {
-                size /= 2;
-                if size < SOCKET_BUFFER_MIN_SIZE {
-                    error!("failed to set socket {label} buffer size");
-                    return Err(error);
-                }
+    while size >= SOCKET_BUFFER_MIN_SIZE {
+        if set(size).is_ok() {
+            if size != requested {
+                info!("socket {label} buffer size reduced from {requested} to {size}");
             }
+            return Some(size);
         }
+        size /= 2;
     }
-    if size != requested {
-        info!("socket {label} buffer size reduced from {requested} to {size}");
-    }
-    Ok(size)
+    info!("socket {label} buffer size kept at the OS default ({requested} was not accepted)");
+    None
 }
 
 pub(crate) enum Transport {
@@ -179,10 +172,10 @@ pub(crate) fn create_socket(address: SocketAddr) -> io::Result<Transport> {
     if address.is_ipv6() {
         socket.set_only_v6(true)?;
     }
-    set_buffer_with_backoff(SOCKET_SNDBUF_SIZE, "send", |size| socket.set_send_buffer_size(size))?;
+    set_buffer_with_backoff(SOCKET_SNDBUF_SIZE, "send", |size| socket.set_send_buffer_size(size));
     set_buffer_with_backoff(SOCKET_RCVBUF_SIZE, "receive", |size| {
         socket.set_recv_buffer_size(size)
-    })?;
+    });
     socket.set_nonblocking(true)?;
     socket.bind(&address.into())?;
     Ok(Transport::Udp(socket.into()))
@@ -263,9 +256,8 @@ mod tests {
         let got = set_buffer_with_backoff(SOCKET_SNDBUF_SIZE, "send", |size| {
             attempts.borrow_mut().push(size);
             Ok(())
-        })
-        .unwrap();
-        assert_eq!(got, SOCKET_SNDBUF_SIZE);
+        });
+        assert_eq!(got, Some(SOCKET_SNDBUF_SIZE));
         assert_eq!(*attempts.borrow(), vec![SOCKET_SNDBUF_SIZE]);
     }
 
@@ -280,34 +272,55 @@ mod tests {
         let got = set_buffer_with_backoff(SOCKET_SNDBUF_SIZE, "send", |size| {
             attempts.borrow_mut().push(size);
             if size > limit { Err(enobufs()) } else { Ok(()) }
-        })
-        .unwrap();
-        assert_eq!(got, limit);
+        });
+        assert_eq!(got, Some(limit));
         // 4M rejected, 2M rejected, 1M accepted -- halving, not jumping to the floor
         assert_eq!(*attempts.borrow(), vec![4 * 1024 * 1024, 2 * 1024 * 1024, 1024 * 1024]);
     }
 
-    /// Below the floor the socket is not useful for netcode's traffic, so failing is
-    /// better than pretending. The error surfaced is the one from the last real attempt.
+    /// A stock NetBSD accepts about 227 KiB: 4M, 2M, 1M, 512K and 256K are refused and
+    /// 128K is taken.
     #[test]
-    fn gives_up_below_the_floor_rather_than_shrinking_forever() {
+    fn backs_off_below_256k_when_the_os_limit_is_lower() {
         let attempts = RefCell::new(Vec::new());
-        let result = set_buffer_with_backoff(SOCKET_SNDBUF_SIZE, "send", |size| {
+        let got = set_buffer_with_backoff(SOCKET_SNDBUF_SIZE, "send", |size| {
+            attempts.borrow_mut().push(size);
+            if size > 227 * 1024 { Err(enobufs()) } else { Ok(()) }
+        });
+        assert_eq!(got, Some(128 * 1024));
+        assert_eq!(attempts.borrow().len(), 6);
+    }
+
+    /// An OS that refuses every size down to the minimum keeps its default buffer: not an
+    /// error, and no size below the minimum is ever requested.
+    #[test]
+    fn keeps_the_os_default_when_no_size_is_accepted() {
+        let attempts = RefCell::new(Vec::new());
+        let got = set_buffer_with_backoff(SOCKET_SNDBUF_SIZE, "send", |size| {
             attempts.borrow_mut().push(size);
             Err(enobufs())
         });
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().raw_os_error(), Some(55));
+        assert_eq!(got, None);
 
-        // THE INVARIANT WORTH PINNING: never attempt a size below the floor. A loop that
-        // halves before checking would try 128K, 64K, ... and eventually succeed with a
-        // uselessly small buffer on a machine that merely has a low limit.
         let attempts = attempts.borrow();
         assert!(
             attempts.iter().all(|&size| size >= SOCKET_BUFFER_MIN_SIZE),
-            "attempted a size below the floor: {attempts:?}"
+            "attempted a size below the minimum: {attempts:?}"
         );
         assert_eq!(*attempts.last().unwrap(), SOCKET_BUFFER_MIN_SIZE);
+        assert_eq!(attempts.len(), 7);
+    }
+
+    /// A request already below the minimum is not made at all.
+    #[test]
+    fn does_not_request_a_size_below_the_minimum() {
+        let attempts = RefCell::new(Vec::new());
+        let got = set_buffer_with_backoff(32 * 1024, "send", |size| {
+            attempts.borrow_mut().push(size);
+            Ok(())
+        });
+        assert_eq!(got, None);
+        assert!(attempts.borrow().is_empty());
     }
 
     #[test]

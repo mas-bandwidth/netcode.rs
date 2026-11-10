@@ -625,7 +625,6 @@ impl Server {
         self.challenge_key = [0; KEY_BYTES];
         self.min_connect_token_expire_timestamp = 0;
         self.clients.clear();
-        self.events.clear();
 
         reset_connect_token_entries(&mut self.connect_token_entries);
         self.encryption_manager.reset();
@@ -650,8 +649,8 @@ impl Server {
     }
 
     /// Pops the next connect or disconnect event. Drain these every update: at most
-    /// `MAX_CLIENTS * 4` events are kept, the oldest dropped first, and
-    /// [`Server::stop`] clears them.
+    /// `MAX_CLIENTS * 4` events are kept, the oldest dropped first. Events queued
+    /// before and by [`Server::stop`] stay available until drained.
     pub fn next_event(&mut self) -> Option<ServerEvent> {
         self.events.pop_front()
     }
@@ -1385,11 +1384,12 @@ mod tests {
     use crate::{CONNECT_TOKEN_BYTES, Client, ClientState};
 
     const TEST_PROTOCOL_ID: u64 = 0x1122334455667788;
-    // one second above the default maximum token lifetime, so a token generated just
-    // after a server start expires strictly after the start floor rather than at it
-    const TEST_TOKEN_EXPIRY: i32 = crate::DEFAULT_MAX_CONNECT_TOKEN_LIFETIME + 1;
+    const TEST_TOKEN_EXPIRY: i32 = crate::DEFAULT_MAX_CONNECT_TOKEN_LIFETIME;
     const TEST_TOKEN_TIMEOUT: i32 = 5;
     const TEST_TIMESTAMP: u64 = 1_000_000;
+    // a server refuses connect tokens issued in its start second, so test servers start
+    // one second before the tokens are issued
+    const TEST_START_TIMESTAMP: u64 = TEST_TIMESTAMP - 1;
 
     /// The server stamps its global packets (challenge and denied) with sequence
     /// numbers from the top half of the sequence space. Those packets are encrypted
@@ -1781,7 +1781,7 @@ mod tests {
         let mut server =
             Server::new_in_memory(&network, test_address(0), TEST_PROTOCOL_ID, &private_key, 0.0)
                 .unwrap();
-        server.start_at(1, TEST_TIMESTAMP).unwrap();
+        server.start_at(1, TEST_START_TIMESTAMP).unwrap();
 
         let connect_token = generate_connect_token_at(
             &[server.address()],
@@ -1839,19 +1839,10 @@ mod tests {
     fn restarted_server_keeps_global_packets_out_of_the_client_sequence_range() {
         let network = socket::MemoryNetwork::new();
         let private_key = crypto::generate_key();
-        // the start floor is the start time plus this lifetime, one second under the
-        // lifetime of the tokens minted below, so a token from the same second expires
-        // strictly above the floor
-        let mut server = Server::new_in_memory_with_config(
-            &network,
-            test_address(0),
-            TEST_PROTOCOL_ID,
-            &private_key,
-            ServerConfig { max_connect_token_lifetime: TEST_TOKEN_EXPIRY - 1 },
-            0.0,
-        )
-        .unwrap();
-        server.start_at(1, TEST_TIMESTAMP).unwrap();
+        let mut server =
+            Server::new_in_memory(&network, test_address(0), TEST_PROTOCOL_ID, &private_key, 0.0)
+                .unwrap();
+        server.start_at(1, TEST_START_TIMESTAMP).unwrap();
 
         let connect_token = generate_connect_token_at(
             &[server.address()],
@@ -1884,7 +1875,7 @@ mod tests {
         assert!(before_restart > GLOBAL_SEQUENCE_FLOOR, "global sequence {before_restart}");
 
         server.stop();
-        server.start_at(1, TEST_TIMESTAMP).unwrap();
+        server.start_at(1, TEST_START_TIMESTAMP).unwrap();
 
         let restarted_connect_token = generate_connect_token_at(
             &[server.address()],
@@ -1986,7 +1977,7 @@ mod tests {
     }
 
     #[test]
-    fn stop_clears_pending_events() {
+    fn stop_keeps_events_for_draining() {
         let network = socket::MemoryNetwork::new();
         let private_key = crypto::generate_key();
         let mut server = Server::new_in_memory(
@@ -1997,14 +1988,23 @@ mod tests {
             0.0,
         )
         .unwrap();
-        server.start_at(1, TEST_TIMESTAMP).unwrap();
+        server.start_at(1, TEST_START_TIMESTAMP).unwrap();
 
         let mut time = 0.0;
         let _client = connect_in_memory_client(&network, &mut server, &private_key, 1, &mut time);
         assert_eq!(server.num_connected_clients(), 1);
 
+        // the connect event is left undrained; stop queues the disconnect after it
         server.stop();
-        server.start_at(1, TEST_TIMESTAMP).unwrap();
+        server.start_at(1, TEST_START_TIMESTAMP).unwrap();
+        assert_eq!(server.next_event(), Some(ServerEvent::ClientConnected { client_index: 0 }));
+        assert_eq!(
+            server.next_event(),
+            Some(ServerEvent::ClientDisconnected {
+                client_index: 0,
+                reason: DisconnectReason::ServerDisconnect,
+            })
+        );
         assert_eq!(server.next_event(), None);
     }
 
@@ -2020,7 +2020,7 @@ mod tests {
             0.0,
         )
         .unwrap();
-        server.start_at(1, TEST_TIMESTAMP).unwrap();
+        server.start_at(1, TEST_START_TIMESTAMP).unwrap();
 
         // each cycle queues a connect and a disconnect event
         let mut time = 0.0;
@@ -2056,7 +2056,7 @@ mod tests {
             0.0,
         )
         .unwrap();
-        server.start_at(1, TEST_TIMESTAMP).unwrap();
+        server.start_at(1, TEST_START_TIMESTAMP).unwrap();
 
         let token = generate_connect_token_at(
             &[server.address()],
@@ -2151,11 +2151,12 @@ mod tests {
         assert!(probe_socket.recv_from(&mut reply).is_none());
 
         // 2. Token just above the floor (expire_timestamp == TEST_TIMESTAMP + 31) presented after it
-        // has expired (at current_timestamp == TEST_TIMESTAMP + 32) is rejected.
+        // has expired (at current_timestamp == TEST_TIMESTAMP + 32) is rejected. It is issued
+        // in the second after the server's start.
         let boundary_token = generate_connect_token_at(
             &[server.address()],
             &[server.address()],
-            TEST_TIMESTAMP,
+            TEST_TIMESTAMP + 1,
             TEST_TOKEN_EXPIRY,
             TEST_TOKEN_TIMEOUT,
             2,
@@ -2200,7 +2201,7 @@ mod tests {
             0.0,
         )
         .unwrap();
-        server.start_at(4, TEST_TIMESTAMP).unwrap();
+        server.start_at(4, TEST_START_TIMESTAMP).unwrap();
 
         let mut time = 0.0;
         let mut reply = [0u8; MAX_PACKET_BYTES];
@@ -2291,9 +2292,9 @@ mod tests {
             0.0,
         )
         .unwrap();
-        server.start_at(2, TEST_TIMESTAMP).unwrap();
+        server.start_at(2, TEST_START_TIMESTAMP).unwrap();
 
-        let first_expiry = TEST_TIMESTAMP + 31;
+        let first_expiry = TEST_TIMESTAMP + TEST_TOKEN_EXPIRY as u64;
         let mut reply = [0u8; MAX_PACKET_BYTES];
 
         // the first token takes a history entry and gets a challenge
@@ -2301,7 +2302,7 @@ mod tests {
             &[server.address()],
             &[server.address()],
             TEST_TIMESTAMP,
-            31,
+            TEST_TOKEN_EXPIRY,
             TEST_TOKEN_TIMEOUT,
             1,
             TEST_PROTOCOL_ID,
@@ -2319,7 +2320,7 @@ mod tests {
             &[server.address()],
             &[server.address()],
             first_expiry,
-            31,
+            TEST_TOKEN_EXPIRY,
             TEST_TOKEN_TIMEOUT,
             2,
             TEST_PROTOCOL_ID,
@@ -2370,7 +2371,7 @@ mod tests {
             0.0,
         )
         .unwrap();
-        server.start_at(MAX_CLIENTS, TEST_TIMESTAMP).unwrap();
+        server.start_at(MAX_CLIENTS, TEST_START_TIMESTAMP).unwrap();
 
         let mut time = 0.0;
         let mut clients = Vec::with_capacity(MAX_CLIENTS);
@@ -2444,7 +2445,7 @@ mod tests {
             0.0,
         )
         .unwrap();
-        server.start_at(1, TEST_TIMESTAMP).unwrap();
+        server.start_at(1, TEST_START_TIMESTAMP).unwrap();
 
         // the connect token is minted for the address the operator configured, which
         // still carries the scope id and flow label; only the wire form drops them

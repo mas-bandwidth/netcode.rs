@@ -19,7 +19,7 @@
 use std::net::{SocketAddr, UdpSocket};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use netcode::{Client, ClientState, Server, ServerEvent};
 
@@ -44,9 +44,7 @@ fn c_server_address() -> SocketAddr {
     }
 }
 
-// one second above the server's default maximum token lifetime, so a token generated in
-// the server's start second expires strictly after its start floor
-const CONNECT_TOKEN_EXPIRY: i32 = netcode::DEFAULT_MAX_CONNECT_TOKEN_LIFETIME + 1;
+const CONNECT_TOKEN_EXPIRY: i32 = netcode::DEFAULT_MAX_CONNECT_TOKEN_LIFETIME;
 const CONNECT_TOKEN_TIMEOUT: i32 = 5;
 const DELTA_TIME: f64 = 1.0 / 60.0;
 
@@ -58,6 +56,17 @@ const PRIVATE_KEY: netcode::Key = [
     0x60, 0x6a, 0xbe, 0x6e, 0xc9, 0x19, 0x10, 0xea, 0x9a, 0x65, 0x62, 0xf6, 0x6f, 0x2b, 0x30, 0xe4,
     0x43, 0x71, 0xd6, 0x2c, 0xd1, 0x99, 0x27, 0x26, 0x6b, 0x3c, 0x60, 0xf4, 0xb7, 0x15, 0xab, 0xa1,
 ];
+
+/// Waits until the wall clock second has advanced past the one this is called in. A
+/// server refuses connect tokens issued in its start second, so tests call this after
+/// starting a server and before a token is issued for it.
+fn wait_for_next_second() {
+    let unix_seconds = || SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let second = unix_seconds();
+    while unix_seconds() <= second {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
 
 /// Kills the C process when the test ends, pass or fail.
 struct ChildGuard(Child);
@@ -97,6 +106,7 @@ fn rust_client_connects_to_c_server() {
     // the C server example takes the address to listen on
     let _c_server = spawn("NETCODE_C_SERVER", server_address.to_string());
     std::thread::sleep(Duration::from_millis(500));
+    wait_for_next_second();
 
     let mut client = Client::new("0.0.0.0:0".parse().unwrap(), 0.0).unwrap();
 
@@ -164,14 +174,10 @@ fn rust_client_connects_to_c_server() {
 fn c_client_connects_to_rust_server() {
     let _guard = INTEROP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let server_address = ephemeral_address();
-    // the C client example issues tokens with the default maximum lifetime, so a token it
-    // generates in the server's start second must clear a start floor one second lower
-    let config = netcode::ServerConfig {
-        max_connect_token_lifetime: netcode::DEFAULT_MAX_CONNECT_TOKEN_LIFETIME - 1,
-    };
-    let mut server =
-        Server::new_with_config(server_address, PROTOCOL_ID, &PRIVATE_KEY, config, 0.0).unwrap();
+    let mut server = Server::new(server_address, PROTOCOL_ID, &PRIVATE_KEY, 0.0).unwrap();
     server.start(16).unwrap();
+    // the C client example issues its token as it starts
+    wait_for_next_second();
 
     // the C client example takes the server address to connect to
     let _c_client = spawn("NETCODE_C_CLIENT", server_address.to_string());

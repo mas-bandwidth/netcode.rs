@@ -90,6 +90,8 @@ Then start the server with the number of client slots you want:
 server.start(16).expect("failed to start server");
 ```
 
+A connect token issued in the same second the server started is refused, so a server accepts connections from the second after it starts.
+
 To connect a client, your client should hit a REST API to your backend that returns a _connect token_. Generate one with the same private key the server holds:
 
 ```rust

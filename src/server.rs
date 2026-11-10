@@ -2258,6 +2258,88 @@ mod tests {
         assert_eq!(server.num_connected_clients(), 1);
     }
 
+    /// A pending handshake that completes after its history entry was reused by a
+    /// newer token consumes only its own token, so the newer token can still retry.
+    #[test]
+    fn in_memory_completed_handshake_consumes_only_its_own_token() {
+        let network = socket::MemoryNetwork::new();
+        let private_key = crypto::generate_key();
+        let mut server = Server::new_in_memory_with_config(
+            &network,
+            test_address(40000),
+            TEST_PROTOCOL_ID,
+            &private_key,
+            ServerConfig { max_connect_token_lifetime: 30 },
+            0.0,
+        )
+        .unwrap();
+        server.start_at(2, TEST_TIMESTAMP).unwrap();
+
+        let first_expiry = TEST_TIMESTAMP + 31;
+        let mut reply = [0u8; MAX_PACKET_BYTES];
+
+        // the first token takes a history entry and gets a challenge
+        let first_token = generate_connect_token_at(
+            &[server.address()],
+            &[server.address()],
+            TEST_TIMESTAMP,
+            31,
+            TEST_TOKEN_TIMEOUT,
+            1,
+            TEST_PROTOCOL_ID,
+            &private_key,
+            &[0; USER_DATA_BYTES],
+        )
+        .unwrap();
+        let mut first_client = Client::new_in_memory(&network, test_address(0), 0.0);
+        first_client.connect(&first_token).unwrap();
+        first_client.update_at(0.1, TEST_TIMESTAMP);
+        server.update_at(0.1, TEST_TIMESTAMP);
+
+        // once the first token has expired, a second token reuses its history entry
+        let second_token = generate_connect_token_at(
+            &[server.address()],
+            &[server.address()],
+            first_expiry,
+            31,
+            TEST_TOKEN_TIMEOUT,
+            2,
+            TEST_PROTOCOL_ID,
+            &private_key,
+            &[0; USER_DATA_BYTES],
+        )
+        .unwrap();
+        let parsed = ConnectToken::read(&second_token).unwrap();
+        let mut req_buf = [0u8; MAX_PACKET_BYTES];
+        let req_len = write_packet(
+            &Packet::Request {
+                protocol_id: parsed.protocol_id,
+                expire_timestamp: parsed.expire_timestamp,
+                nonce: parsed.nonce,
+                private_data: parsed.private_data.clone(),
+            },
+            &mut req_buf,
+            0,
+            &[0; KEY_BYTES],
+            parsed.protocol_id,
+        )
+        .unwrap();
+        let second_socket = network.bind(test_address(0));
+        second_socket.send_to(&req_buf[..req_len], server.address());
+        server.update_at(0.2, first_expiry);
+        assert!(second_socket.recv_from(&mut reply).is_some());
+
+        // the first handshake completes
+        first_client.update_at(0.3, first_expiry);
+        server.update_at(0.3, first_expiry);
+        assert_eq!(server.num_connected_clients(), 1);
+
+        // the second token's retried request still gets a challenge
+        second_socket.send_to(&req_buf[..req_len], server.address());
+        server.update_at(0.4, first_expiry);
+        assert!(second_socket.recv_from(&mut reply).is_some());
+    }
+
     #[test]
     fn in_memory_256_clients_connect_and_257th_is_denied() {
         let network = socket::MemoryNetwork::new();

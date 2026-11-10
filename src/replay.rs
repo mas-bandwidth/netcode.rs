@@ -25,6 +25,10 @@ impl ReplayProtection {
     }
 
     pub fn already_received(&self, sequence: u64) -> bool {
+        if sequence == u64::MAX {
+            return true;
+        }
+
         // written subtraction-side so it cannot overflow: "sequence + BUFFER_SIZE <=
         // most_recent" wraps for sequence values near u64::MAX and falsely rejects
         // them as replays (and panics in debug builds)
@@ -42,6 +46,10 @@ impl ReplayProtection {
     /// Marks the sequence number as received. Call only after the packet decrypts
     /// successfully, otherwise an attacker could poison the window with forged headers.
     pub fn advance_sequence(&mut self, sequence: u64) {
+        if sequence == u64::MAX {
+            return;
+        }
+
         if sequence > self.most_recent_sequence {
             self.most_recent_sequence = sequence;
         }
@@ -90,6 +98,21 @@ mod tests {
         replay_protection.advance_sequence(99);
         assert!(replay_protection.already_received(99));
         assert!(replay_protection.already_received(100));
+    }
+
+    #[test]
+    fn maximum_sequence_is_rejected_and_does_not_move_the_window() {
+        let mut replay_protection = ReplayProtection::new();
+
+        assert!(!replay_protection.already_received(1000));
+        replay_protection.advance_sequence(1000);
+
+        assert!(replay_protection.already_received(u64::MAX));
+        replay_protection.advance_sequence(u64::MAX);
+
+        assert_eq!(replay_protection.most_recent_sequence, 1000);
+        assert!(replay_protection.already_received(u64::MAX));
+        assert!(!replay_protection.already_received(1001));
     }
 
     #[test]

@@ -309,6 +309,9 @@ struct ConnectTokenEntry {
     state: ConnectTokenEntryState,
     #[allow(dead_code)]
     time: f64,
+    /// A token minted with negative `expire_seconds` stores `u64::MAX`, so this entry
+    /// never expires and its slot is never reused during the server run (development
+    /// and testing only).
     expire_timestamp: u64,
     mac: [u8; MAC_BYTES],
     address: Option<SocketAddr>,

@@ -299,9 +299,21 @@ pub(crate) fn unix_timestamp() -> u64 {
 /// public addresses when servers sit behind NAT or a load balancer. Both slices must
 /// have the same length, in the range `[1, MAX_SERVERS_PER_CONNECT]`.
 ///
-/// The token expires `expire_seconds` after creation; negative means never expires
-/// (dev only). `timeout_seconds` is how long a connection can go without receiving
-/// packets before it is dropped; negative disables timeouts (dev only).
+/// The token expires `expire_seconds` after creation. A negative `expire_seconds`
+/// produces a token that never expires and is intended for development and testing
+/// only. In that mode the token's expire timestamp is `u64::MAX`, which has two
+/// operational consequences:
+///
+/// - It remains valid across server restarts (see
+///   [`Server::start`](crate::Server::start)) for as long as the server uses the same
+///   `private_key` and `protocol_id`, because the expire timestamp always passes the
+///   server's minimum connect token expire timestamp.
+/// - Its entry in the server's connect token history never expires and is never
+///   reusable during the server run, because the entry's expire timestamp never
+///   satisfies the history's expiry test.
+///
+/// `timeout_seconds` is how long a connection can go without receiving packets before
+/// it is dropped; negative disables timeouts (dev only).
 #[allow(clippy::too_many_arguments)]
 pub fn generate_connect_token(
     public_server_addresses: &[SocketAddr],
@@ -517,6 +529,31 @@ mod tests {
         assert_eq!(private_token.client_to_server_key, token.client_to_server_key);
         assert_eq!(private_token.server_to_client_key, token.server_to_client_key);
         assert_eq!(private_token.user_data, user_data);
+    }
+
+    #[test]
+    fn generate_connect_token_documents_negative_expire_behavior() {
+        let source = include_str!("token.rs");
+        let start = source.find("/// Generates a connect token.").unwrap();
+        let end = source[start..].find("#[allow(clippy::too_many_arguments)]").unwrap() + start;
+        let docs = source[start..end]
+            .lines()
+            .map(|line| line.trim_start_matches("///").trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        for phrase in [
+            "development and testing only",
+            "server restarts",
+            "private_key",
+            "protocol_id",
+            "never reusable",
+        ] {
+            assert!(
+                docs.contains(phrase),
+                "generate_connect_token docs are missing {phrase:?}"
+            );
+        }
     }
 
     fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}

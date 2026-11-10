@@ -426,6 +426,9 @@ fn read_connection_request_packet(
         return None;
     }
 
+    // A token minted with negative `expire_seconds` carries `u64::MAX` here, so it
+    // never expires and always passes the server-start guard below (development and
+    // testing only).
     let expire_timestamp = reader.read_u64()?;
     if expire_timestamp <= current_timestamp {
         debug!("ignored connection request packet. connect token expired");

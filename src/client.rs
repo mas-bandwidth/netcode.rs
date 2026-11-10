@@ -104,6 +104,7 @@ pub struct Client {
     connect_start_time: f64,
     last_packet_send_time: f64,
     last_packet_receive_time: f64,
+    initial_timestamps_set: bool,
     should_disconnect: Option<ClientState>,
     sequence: u64,
     client_index: usize,
@@ -218,6 +219,7 @@ impl Client {
             connect_start_time: 0.0,
             last_packet_send_time: -1000.0,
             last_packet_receive_time: -1000.0,
+            initial_timestamps_set: true,
             should_disconnect: None,
             sequence: 0,
             client_index: 0,
@@ -276,6 +278,9 @@ impl Client {
         self.connect_token = Some(connect_token);
 
         self.reset_before_next_connect();
+        // connect may be called before the first update, so the connection timestamps are
+        // taken from the time of the next update.
+        self.initial_timestamps_set = false;
         self.set_state(ClientState::SendingConnectionRequest);
 
         Ok(())
@@ -289,6 +294,12 @@ impl Client {
 
     pub(crate) fn update_at(&mut self, time: f64, current_timestamp: u64) {
         self.time = time;
+
+        if !self.initial_timestamps_set {
+            self.connect_start_time = time;
+            self.last_packet_receive_time = time;
+            self.initial_timestamps_set = true;
+        }
 
         self.receive_packets(current_timestamp);
         self.send_packets();
@@ -731,6 +742,32 @@ mod tests {
     }
 
     #[test]
+    fn connect_before_first_update_does_not_expire_the_token() {
+        let network = socket::MemoryNetwork::new();
+        let private_key = crypto::generate_key();
+        let dead_server: SocketAddr = "127.0.0.1:40001".parse().unwrap();
+
+        let token = generate_connect_token_at(
+            &[dead_server],
+            &[dead_server],
+            TEST_TIMESTAMP,
+            30,
+            5,
+            1,
+            TEST_PROTOCOL_ID,
+            &private_key,
+            &[0; USER_DATA_BYTES],
+        )
+        .unwrap();
+
+        let mut client = Client::new_in_memory(&network, "127.0.0.1:0".parse().unwrap(), 0.0);
+        client.connect(&token).unwrap();
+        client.update_at(100.0, TEST_TIMESTAMP);
+
+        assert_eq!(client.state(), ClientState::SendingConnectionRequest);
+    }
+
+    #[test]
     fn in_memory_connection_request_times_out() {
         let network = socket::MemoryNetwork::new();
         let private_key = crypto::generate_key();
@@ -880,6 +917,7 @@ mod tests {
 
         let mut client = Client::new_in_memory(&network, "127.0.0.1:0".parse().unwrap(), 0.0);
         client.connect(&token).unwrap();
+        client.update_at(0.0, TEST_TIMESTAMP);
 
         client.update_at(2.9, TEST_TIMESTAMP + 2);
         assert_eq!(client.state(), ClientState::SendingConnectionRequest);

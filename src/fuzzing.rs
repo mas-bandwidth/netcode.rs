@@ -190,6 +190,12 @@ pub fn packet_write_read_round_trip(data: &[u8]) {
     };
 
     let mut buffer = [0u8; MAX_PACKET_BYTES];
+    if sequence == u64::MAX {
+        let refused =
+            packet::write_packet(&packet, &mut buffer, sequence, &FUZZ_KEY, FUZZ_PROTOCOL_ID);
+        assert!(refused.is_err());
+        return;
+    }
     let written = packet::write_packet(&packet, &mut buffer, sequence, &FUZZ_KEY, FUZZ_PROTOCOL_ID)
         .expect("write_packet must succeed for a valid packet");
 

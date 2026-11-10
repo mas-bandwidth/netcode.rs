@@ -134,6 +134,11 @@ pub(crate) fn write_packet(
         return Ok(CONNECTION_REQUEST_PACKET_BYTES);
     }
 
+    // u64::MAX is not a packet sequence. Refuse it before any byte is written.
+    if sequence == u64::MAX {
+        return Err(Error::EncryptFailed);
+    }
+
     // *** encrypted packets ***
 
     // the prefix byte combines the packet type (low 4 bits) with the number of
@@ -287,6 +292,11 @@ pub(crate) fn read_packet_with_min_connect_token_expire_timestamp(
     sequence_le[..sequence_bytes].copy_from_slice(&buffer[1..1 + sequence_bytes]);
     let sequence = u64::from_le_bytes(sequence_le);
 
+    if sequence == u64::MAX {
+        debug!("ignored encrypted packet. sequence is u64::MAX");
+        return None;
+    }
+
     // ignore the packet if it has already been received
 
     let replay_protected = packet_type >= CONNECTION_KEEP_ALIVE_PACKET;
@@ -426,13 +436,16 @@ fn read_connection_request_packet(
         return None;
     }
 
+    // A token minted with negative `expire_seconds` carries `u64::MAX` here, so it
+    // never expires and always passes the server-start guard below (development and
+    // testing only).
     let expire_timestamp = reader.read_u64()?;
     if expire_timestamp <= current_timestamp {
         debug!("ignored connection request packet. connect token expired");
         return None;
     }
 
-    if expire_timestamp < min_connect_token_expire_timestamp {
+    if expire_timestamp <= min_connect_token_expire_timestamp {
         debug!("ignored connection request packet. connect token predates the server start");
         return None;
     }
@@ -685,6 +698,60 @@ mod tests {
     }
 
     #[test]
+    fn connection_request_rejects_token_expiring_at_server_start_floor() {
+        let private_key = generate_key();
+        let current_timestamp: u64 = 1000;
+        let expire_timestamp = current_timestamp + 30;
+
+        let mut nonce = [0u8; CONNECT_TOKEN_NONCE_BYTES];
+        crypto::random_bytes(&mut nonce);
+
+        let private_token = crate::token::PrivateConnectToken::generate(
+            0x1234,
+            10,
+            &["127.0.0.1:40000".parse().unwrap()],
+            &[0u8; crate::USER_DATA_BYTES],
+        );
+        let mut private_data = Box::new([0u8; CONNECT_TOKEN_PRIVATE_BYTES]);
+        private_token.write(&mut private_data);
+        crate::token::encrypt_connect_token_private(
+            &mut private_data,
+            TEST_PROTOCOL_ID,
+            expire_timestamp,
+            &nonce,
+            &private_key,
+        )
+        .unwrap();
+
+        let input = Packet::Request {
+            protocol_id: TEST_PROTOCOL_ID,
+            expire_timestamp,
+            nonce,
+            private_data,
+        };
+        let key = generate_key();
+        let mut buffer = [0u8; MAX_PACKET_BYTES];
+        let written = write_packet(&input, &mut buffer, 0, &key, TEST_PROTOCOL_ID).unwrap();
+
+        // the floor is the start time plus the maximum token lifetime: a token expiring
+        // exactly at the floor is refused, one expiring a second after it is accepted
+        for (floor, accepted) in [(expire_timestamp, false), (expire_timestamp - 1, true)] {
+            let mut copy = buffer;
+            let read = read_packet_with_min_connect_token_expire_timestamp(
+                &mut copy[..written],
+                None,
+                TEST_PROTOCOL_ID,
+                current_timestamp,
+                Some(&private_key),
+                AllowedPackets::SERVER,
+                None,
+                floor,
+            );
+            assert_eq!(read.is_some(), accepted, "floor {floor}, expire {expire_timestamp}");
+        }
+    }
+
+    #[test]
     fn client_rejects_request_and_response_packets() {
         let key = generate_key();
         let mut challenge_token_data = [0u8; CHALLENGE_TOKEN_BYTES];
@@ -796,6 +863,73 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn maximum_sequence_packet_is_rejected_and_does_not_move_the_window() {
+        let key = generate_key();
+        let sequence = u64::MAX;
+        let body = [1u8, 2, 3];
+        let sequence_bytes = 8usize;
+        let prefix = CONNECTION_PAYLOAD_PACKET | ((sequence_bytes as u8) << 4);
+        let mut crafted = vec![0u8; 1 + sequence_bytes + body.len() + MAC_BYTES];
+        crafted[0] = prefix;
+        crafted[1..1 + sequence_bytes].copy_from_slice(&sequence.to_le_bytes());
+        let body_at = 1 + sequence_bytes;
+        crafted[body_at..body_at + body.len()].copy_from_slice(&body);
+        let additional = packet_additional_data(TEST_PROTOCOL_ID, prefix);
+        let nonce = crypto::sequence_nonce(sequence);
+        crypto::encrypt_aead(&mut crafted[body_at..], &additional, &nonce, &key).unwrap();
+
+        let mut replay_protection = ReplayProtection::new();
+        assert!(
+            read_packet(
+                &mut crafted,
+                Some(&key),
+                TEST_PROTOCOL_ID,
+                0,
+                None,
+                AllowedPackets::CLIENT,
+                Some(&mut replay_protection),
+            )
+            .is_none()
+        );
+
+        // a reader that is not tracking a replay window still drops it
+        let mut without_replay = crafted.clone();
+        assert!(
+            read_packet(
+                &mut without_replay,
+                Some(&key),
+                TEST_PROTOCOL_ID,
+                0,
+                None,
+                AllowedPackets::CLIENT,
+                None,
+            )
+            .is_none()
+        );
+
+        let mut buffer = [0u8; MAX_PACKET_BYTES];
+        let written =
+            write_packet(&Packet::Payload(vec![9]), &mut buffer, 7, &key, TEST_PROTOCOL_ID)
+                .unwrap();
+        assert!(
+            read_packet(
+                &mut buffer[..written],
+                Some(&key),
+                TEST_PROTOCOL_ID,
+                0,
+                None,
+                AllowedPackets::CLIENT,
+                Some(&mut replay_protection),
+            )
+            .is_some()
+        );
+
+        let reserved =
+            write_packet(&Packet::Payload(vec![9]), &mut buffer, u64::MAX, &key, TEST_PROTOCOL_ID);
+        assert!(reserved.is_err());
     }
 
     fn seal_body(packet_type: u8, body: &[u8]) -> Vec<u8> {

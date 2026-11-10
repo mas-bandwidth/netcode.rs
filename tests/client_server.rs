@@ -113,13 +113,17 @@ fn connect_token_expires_while_advancing_through_servers() {
     assert_eq!(client.server_address(), Some(addresses[1]));
     assert_eq!(client.state(), ClientState::SendingConnectionRequest);
 
-    while time <= 4.1 {
+    while time < 4.0 {
         client.update(time);
         time += DELTA_TIME;
     }
 
-    // The lifetime runs from the original connect call, so expiry beats the second
-    // request timeout that would otherwise fire at 6s.
+    // The lifetime runs from the original connect call, so the client is still waiting
+    // on the second address just before the token expires.
+    assert_eq!(client.state(), ClientState::SendingConnectionRequest);
+
+    // Expiry beats the second request timeout that would otherwise fire at 6s.
+    client.update(4.0);
     assert_eq!(client.state(), ClientState::ConnectTokenExpired);
 
     drop(dead_server_1);

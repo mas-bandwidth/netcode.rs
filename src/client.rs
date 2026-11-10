@@ -303,6 +303,7 @@ impl Client {
         self.write_packet_key = connect_token.client_to_server_key;
         self.connect_token = Some(connect_token);
 
+        self.connect_start_time = self.time;
         self.reset_before_next_connect();
         // connect may be called before the first update, so the connection timestamps are
         // taken from the time of the next update.
@@ -451,7 +452,6 @@ impl Client {
     }
 
     fn reset_before_next_connect(&mut self) {
-        self.connect_start_time = self.time;
         self.last_packet_send_time = self.time - 1.0;
         self.last_packet_receive_time = self.time;
         self.should_disconnect = None;
@@ -780,6 +780,45 @@ mod tests {
         assert!(!ClientState::Connected.is_error());
         assert!(!ClientState::Connected.is_disconnected());
         assert!(!ClientState::Connected.is_connecting());
+    }
+
+    #[test]
+    fn connect_token_expires_across_server_failover() {
+        let dead_server_1: SocketAddr = "127.0.0.1:40001".parse().unwrap();
+        let dead_server_2: SocketAddr = "127.0.0.1:40002".parse().unwrap();
+        let connect_token = crate::generate_connect_token(
+            &[dead_server_1, dead_server_2],
+            &[dead_server_1, dead_server_2],
+            4,
+            3,
+            1,
+            0x1122334455667788,
+            &crate::generate_key(),
+            &[0u8; crate::USER_DATA_BYTES],
+        )
+        .unwrap();
+
+        let network = socket::MemoryNetwork::new();
+        let mut client = Client::new_in_memory(&network, "127.0.0.1:0".parse().unwrap(), 0.0);
+        client.connect(&connect_token).unwrap();
+        assert_eq!(client.server_address(), Some(dead_server_1));
+
+        let mut time = 0.0;
+        while time < 3.5 {
+            client.update(time);
+            time += 0.01;
+        }
+        assert_eq!(client.server_address(), Some(dead_server_2));
+        assert_eq!(client.state(), ClientState::SendingConnectionRequest);
+
+        while time < 4.0 {
+            client.update(time);
+            time += 0.01;
+        }
+        assert_eq!(client.state(), ClientState::SendingConnectionRequest);
+
+        client.update(4.0);
+        assert_eq!(client.state(), ClientState::ConnectTokenExpired);
     }
 
     #[test]

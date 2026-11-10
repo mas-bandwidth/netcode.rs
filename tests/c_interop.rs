@@ -82,6 +82,7 @@ fn spawn(env_var: &str, argument: String) -> ChildGuard {
 }
 
 #[test]
+#[ignore = "binds a real loopback socket; run with --ignored"]
 fn ephemeral_address_is_free_and_on_loopback() {
     let address = ephemeral_address();
     assert!(address.ip().is_loopback());

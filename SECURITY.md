@@ -42,6 +42,8 @@ affects every implementation of netcode rather than one. Report those the same w
 
 ## Known issue: connect token reuse across unfinished handshakes and multiple servers (fixed in 1.2.0)
 
+**Advisory: [GHSA-8mrq-q9c6-h23v](https://github.com/mas-bandwidth/netcode/security/advisories/GHSA-8mrq-q9c6-h23v)** (published 2026-11-19).
+
 **Affected: `netcode-official` 1.1.3 and earlier (`NETCODE 1.02`). Fixed in 1.2.0 (`NETCODE 1.03`).**
 
 In `NETCODE 1.02`, packets encrypted directly under the 32-byte `client_to_server_key` and
@@ -72,6 +74,8 @@ Fixed by upgrading the wire protocol to **`NETCODE 1.03`** in **`netcode-officia
   and `connection challenge` packets).
 - Pending connect token history entries also bind to `client_salt` and `timeout_seconds`,
   and half-open handshakes are consumed on `connection disconnect`.
+
+Thank you to [@magicaldave](https://github.com/magicaldave) ([DreamWeave-MP/dream-net](https://github.com/DreamWeave-MP/dream-net)) for discovering and privately reporting the unfinished-handshake connect-token reuse issue.
 
 Upgrade to `netcode-official` 1.2.0 or later. `NETCODE 1.03` intentionally rejects
 `NETCODE 1.02` tokens and packets, so backends, servers, and clients must upgrade together.

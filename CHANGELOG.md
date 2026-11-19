@@ -1,8 +1,21 @@
 # Changelog
 
-## Unreleased
+## v1.2.0
 
-Changes on main since v1.1.3.
+Upgrades the wire protocol to **`NETCODE 1.03`** (interoperable with C `netcode` v1.5.0),
+plus all changes since v1.1.3.
+
+### Protocol (`NETCODE 1.03`)
+
+- Connect token keys never encrypt packets directly. Per-connection 32-byte packet keys
+  are derived via `HChaCha20` over `client_salt[8] || server_nonce[8]`, eliminating AEAD
+  nonce reuse across retried/aborted handshakes and multi-server connect tokens.
+- `connection request` packets are now 1086 bytes (carrying an 8-byte random `client_salt`
+  rotated on every `Client::connect` call and every server failover).
+- `connection denied` and `connection challenge` packets carry an 8-byte cleartext
+  `server_nonce` header after the sequence number, authenticated in 30-byte AAD.
+- Pending connect token history entries bind to `(address, client_salt)` and
+  `timeout_seconds`, and half-open handshakes consume their entry on disconnect.
 
 ### Server
 
@@ -60,6 +73,8 @@ Changes on main since v1.1.3.
 - The README, crate example and examples drain `Server::next_event`, and issue connect
   tokens of at most the server's maximum lifetime after the server's start second.
 - The published crate no longer includes development files.
-- STANDARD.md is updated from the reference specification for netcode 1.4.10: a connect
-  token issued in the server's start second is refused, packet sequence 2^64-1 is
-  reserved, and the reference client's keep-alive client slot range is documented.
+- STANDARD.md is updated verbatim from the reference specification for netcode 1.5.0
+  (`NETCODE 1.03`): per-connection `HChaCha20` packet key derivation, 1086-byte connection
+  requests with `client_salt`, `server_nonce` headers and 30-byte AAD on connection denied
+  and challenge packets, start-second token floor, reserved packet sequence `2^64-1`, and
+  keep-alive slot bounds.

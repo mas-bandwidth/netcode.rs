@@ -11,8 +11,9 @@ use crate::packet::{AllowedPackets, Packet};
 use crate::replay::ReplayProtection;
 use crate::token::{CHALLENGE_TOKEN_BYTES, ConnectToken};
 use crate::{
-    CONNECT_TOKEN_BYTES, Error, KEY_BYTES, Key, MAX_CLIENTS, MAX_PACKET_BYTES, MAX_PAYLOAD_BYTES,
-    NUM_DISCONNECT_PACKETS, PACKET_QUEUE_SIZE, PACKET_SEND_RATE, socket,
+    CONNECT_SALT_BYTES, CONNECT_TOKEN_BYTES, Error, KEY_BYTES, Key, MAX_CLIENTS, MAX_PACKET_BYTES,
+    MAX_PAYLOAD_BYTES, NUM_DISCONNECT_PACKETS, PACKET_QUEUE_SIZE, PACKET_SEND_RATE,
+    SERVER_NONCE_BYTES, crypto, socket,
 };
 
 /// The state of a [`Client`].
@@ -115,6 +116,9 @@ pub struct Client {
     socket_ipv4: Option<socket::Transport>,
     socket_ipv6: Option<socket::Transport>,
     primary_is_ipv4: bool,
+    has_server_nonce: bool,
+    client_salt: [u8; CONNECT_SALT_BYTES],
+    server_nonce: [u8; SERVER_NONCE_BYTES],
     write_packet_key: Key,
     read_packet_key: Key,
     replay_protection: ReplayProtection,
@@ -230,6 +234,9 @@ impl Client {
             socket_ipv4,
             socket_ipv6,
             primary_is_ipv4,
+            has_server_nonce: false,
+            client_salt: [0; CONNECT_SALT_BYTES],
+            server_nonce: [0; SERVER_NONCE_BYTES],
             write_packet_key: [0; KEY_BYTES],
             read_packet_key: [0; KEY_BYTES],
             replay_protection: ReplayProtection::new(),
@@ -299,8 +306,6 @@ impl Client {
             );
         }
 
-        self.read_packet_key = connect_token.server_to_client_key;
-        self.write_packet_key = connect_token.client_to_server_key;
         self.connect_token = Some(connect_token);
 
         self.connect_start_time = self.time;
@@ -447,6 +452,11 @@ impl Client {
         self.server_address
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_server_nonce(&self) -> bool {
+        self.has_server_nonce
+    }
+
     // ----------------------------------------------------------------
 
     fn set_state(&mut self, state: ClientState) {
@@ -458,8 +468,13 @@ impl Client {
         self.last_packet_send_time = self.time - 1.0;
         self.last_packet_receive_time = self.time;
         self.should_disconnect = None;
+        self.has_server_nonce = false;
+        crypto::random_bytes(&mut self.client_salt);
+        self.server_nonce.zeroize();
+        self.write_packet_key.zeroize();
+        self.read_packet_key.zeroize();
         self.challenge_token_sequence = 0;
-        self.challenge_token_data = [0; CHALLENGE_TOKEN_BYTES];
+        self.challenge_token_data.zeroize();
         self.replay_protection.reset();
     }
 
@@ -471,10 +486,11 @@ impl Client {
         self.server_address_index = 0;
         self.server_address = None;
         self.connect_token = None;
-        self.write_packet_key = [0; KEY_BYTES];
-        self.read_packet_key = [0; KEY_BYTES];
+        self.write_packet_key.zeroize();
+        self.read_packet_key.zeroize();
         self.set_state(state);
         self.reset_before_next_connect();
+        self.client_salt.zeroize();
         self.packet_receive_queue.clear();
     }
 
@@ -491,7 +507,7 @@ impl Client {
 
         info!("client disconnected");
 
-        if send_disconnect_packets {
+        if send_disconnect_packets && self.has_server_nonce {
             debug!("client sent disconnect packets to server");
             for _ in 0..NUM_DISCONNECT_PACKETS {
                 self.send_packet_to_server(&Packet::Disconnect);
@@ -546,6 +562,7 @@ impl Client {
                     expire_timestamp: connect_token.expire_timestamp,
                     nonce: connect_token.nonce,
                     private_data: connect_token.private_data.clone(),
+                    client_salt: self.client_salt,
                 };
                 self.send_packet_to_server(&packet);
             }
@@ -640,29 +657,86 @@ impl Client {
             return;
         };
 
-        let Some((packet, sequence)) = crate::packet::read_packet(
-            packet_data,
-            Some(&self.read_packet_key),
-            connect_token.protocol_id,
-            0,
-            None,
-            AllowedPackets::CLIENT,
-            Some(&mut self.replay_protection),
-        ) else {
-            return;
+        let (packet, sequence) = match self.state {
+            ClientState::SendingConnectionRequest => {
+                debug_assert!(!self.has_server_nonce);
+                let Some(candidate_server_nonce) =
+                    crate::packet::peek_handshake_server_nonce(packet_data)
+                else {
+                    return;
+                };
+                let mut candidate_read_key = crypto::derive_packet_key(
+                    &connect_token.server_to_client_key,
+                    &self.client_salt,
+                    &candidate_server_nonce,
+                );
+                let parsed = crate::packet::read_packet(
+                    packet_data,
+                    Some(&candidate_read_key),
+                    connect_token.protocol_id,
+                    0,
+                    None,
+                    AllowedPackets::CLIENT_REQUESTING,
+                    Some(&mut self.replay_protection),
+                );
+                let Some((packet, sequence)) = parsed else {
+                    candidate_read_key.zeroize();
+                    return;
+                };
+                if matches!(packet, Packet::Challenge { .. }) {
+                    self.server_nonce = candidate_server_nonce;
+                    self.has_server_nonce = true;
+                    self.read_packet_key = candidate_read_key;
+                    self.write_packet_key = crypto::derive_packet_key(
+                        &connect_token.client_to_server_key,
+                        &self.client_salt,
+                        &candidate_server_nonce,
+                    );
+                }
+                candidate_read_key.zeroize();
+                (packet, sequence)
+            }
+            ClientState::SendingConnectionResponse | ClientState::Connected => {
+                if !self.has_server_nonce {
+                    return;
+                }
+                let allowed_packets = if self.state == ClientState::SendingConnectionResponse {
+                    AllowedPackets::CLIENT_RESPONDING
+                } else {
+                    AllowedPackets::CLIENT_CONNECTED
+                };
+                let Some((packet, sequence)) = crate::packet::read_packet(
+                    packet_data,
+                    Some(&self.read_packet_key),
+                    connect_token.protocol_id,
+                    0,
+                    None,
+                    allowed_packets,
+                    Some(&mut self.replay_protection),
+                ) else {
+                    return;
+                };
+                (packet, sequence)
+            }
+            _ => return,
         };
 
         match packet {
-            Packet::Denied => {
-                if self.state == ClientState::SendingConnectionRequest
-                    || self.state == ClientState::SendingConnectionResponse
+            Packet::Denied { server_nonce } => match self.state {
+                ClientState::SendingConnectionRequest => {
+                    self.should_disconnect = Some(ClientState::ConnectionDenied);
+                    self.last_packet_receive_time = self.time;
+                }
+                ClientState::SendingConnectionResponse
+                    if crypto::bytes_equal_8(&server_nonce, &self.server_nonce) =>
                 {
                     self.should_disconnect = Some(ClientState::ConnectionDenied);
                     self.last_packet_receive_time = self.time;
                 }
-            }
+                _ => {}
+            },
 
-            Packet::Challenge { challenge_token_sequence, challenge_token_data } => {
+            Packet::Challenge { challenge_token_sequence, challenge_token_data, .. } => {
                 if self.state == ClientState::SendingConnectionRequest {
                     debug!("client received connection challenge packet from server");
                     self.challenge_token_sequence = challenge_token_sequence;
@@ -736,6 +810,8 @@ fn reachable_server_index(
 impl Drop for Client {
     fn drop(&mut self) {
         self.disconnect();
+        self.client_salt.zeroize();
+        self.server_nonce.zeroize();
         self.write_packet_key.zeroize();
         self.read_packet_key.zeroize();
     }
@@ -1252,9 +1328,12 @@ mod tests {
 
         let mut client = Client::new_in_memory(&network, "127.0.0.1:0".parse().unwrap(), 0.0);
         client.connect(&connect_token).unwrap();
+        let key = ConnectToken::read(&connect_token).unwrap().server_to_client_key;
+        client.has_server_nonce = true;
+        client.read_packet_key = key;
+        client.write_packet_key = crypto::generate_key();
         client.state = ClientState::Connected;
 
-        let key = ConnectToken::read(&connect_token).unwrap().server_to_client_key;
         let mut packet_data = [0u8; MAX_PACKET_BYTES];
 
         let packet_bytes = crate::packet::write_packet(
@@ -1308,7 +1387,9 @@ mod tests {
         // a client with no sockets cannot connect, so set up the connection directly
         let mut client = Client::create(None, None, true, 1000.0).unwrap();
         let token = ConnectToken::read(&connect_token).unwrap();
+        client.has_server_nonce = true;
         client.read_packet_key = token.server_to_client_key;
+        client.write_packet_key = crypto::generate_key();
         client.server_address = Some(server_address);
         client.connect_token = Some(token);
         client.state = ClientState::SendingConnectionResponse;

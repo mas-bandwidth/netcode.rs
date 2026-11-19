@@ -8,7 +8,7 @@ If this library helps you, please support it: **[Become a supporter](https://www
 
 **netcode** is a secure client/server protocol for multiplayer games built on top of UDP.
 
-This is a Rust implementation of the [netcode 1.02 standard](https://github.com/mas-bandwidth/netcode/blob/main/STANDARD.md). It is a from-scratch port of the [reference C implementation](https://github.com/mas-bandwidth/netcode), written in idiomatic Rust, and interoperates on the wire with other conforming implementations.
+This is a Rust implementation of the [netcode 1.03 standard](https://github.com/mas-bandwidth/netcode/blob/main/STANDARD.md). It is a from-scratch port of the [reference C implementation](https://github.com/mas-bandwidth/netcode), written in idiomatic Rust, and interoperates on the wire with other conforming implementations.
 
 # Design
 
@@ -79,8 +79,9 @@ let mut server = netcode::Server::new_with_config(
 ```
 
 The server records each connect token it sees. Retransmitted requests remain
-pending only from their original address; a token is consumed when its client
-is installed and cannot be used again. While the server runs, entries remain
+pending only from their original address and client salt within the token
+timeout; a token is consumed when its client is installed or aborts the
+handshake and cannot be used again. While the server runs, entries remain
 until their tokens expire, so the finite history refuses new tokens rather than
 evicting unexpired entries.
 
@@ -154,7 +155,7 @@ Differences from the C implementation:
 * Server connect and disconnect callbacks are replaced by a polled event queue: `server.next_event()`.
 * The network simulator, loopback clients, dual-stack servers and packet tagging are not (yet) ported.
 
-If you'd like to create your own implementation of netcode, please read the [netcode 1.02 standard](https://github.com/mas-bandwidth/netcode/blob/main/STANDARD.md), and see [IMPLEMENTERS.md](https://github.com/mas-bandwidth/netcode/blob/main/IMPLEMENTERS.md) for findings other implementations should check themselves against. This implementation includes those fixes: the replay protection already-received test is written in the overflow-free subtraction form, and there is a regression test locking down the nonce construction.
+If you'd like to create your own implementation of netcode, please read the [netcode 1.03 standard](https://github.com/mas-bandwidth/netcode/blob/main/STANDARD.md), and see [IMPLEMENTERS.md](https://github.com/mas-bandwidth/netcode/blob/main/IMPLEMENTERS.md) for findings other implementations should check themselves against. This implementation includes those fixes: the replay protection already-received test is written in the overflow-free subtraction form, and there is a regression test locking down the nonce construction.
 
 # Development
 

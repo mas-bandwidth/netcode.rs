@@ -24,10 +24,10 @@
 
 //! **netcode** is a secure client/server protocol for multiplayer games built on top of UDP.
 //!
-//! This crate is a Rust implementation of the [netcode 1.02 standard]. It interoperates with
+//! This crate is a Rust implementation of the [netcode 1.03 standard]. It interoperates with
 //! the [reference C implementation] and other conforming implementations.
 //!
-//! [netcode 1.02 standard]: https://github.com/mas-bandwidth/netcode/blob/main/STANDARD.md
+//! [netcode 1.03 standard]: https://github.com/mas-bandwidth/netcode/blob/main/STANDARD.md
 //! [reference C implementation]: https://github.com/mas-bandwidth/netcode
 //!
 //! # Overview
@@ -144,7 +144,9 @@ pub type Key = [u8; KEY_BYTES];
 /// User data carried from the connect token to the server, opaque to netcode.
 pub type UserData = [u8; USER_DATA_BYTES];
 
-pub(crate) const VERSION_INFO: [u8; 13] = *b"NETCODE 1.02\0";
+pub(crate) const VERSION_INFO: [u8; 13] = *b"NETCODE 1.03\0";
+pub(crate) const CONNECT_SALT_BYTES: usize = 8;
+pub(crate) const SERVER_NONCE_BYTES: usize = 8;
 pub(crate) const MAX_PACKET_BYTES: usize = 1300;
 pub(crate) const PACKET_SEND_RATE: f64 = 10.0;
 pub(crate) const NUM_DISCONNECT_PACKETS: usize = 10;

@@ -19,8 +19,8 @@ use crate::token::{
     ConnectToken, PrivateConnectToken,
 };
 use crate::{
-    CONNECT_TOKEN_BYTES, KEY_BYTES, Key, MAC_BYTES, MAX_PACKET_BYTES, MAX_PAYLOAD_BYTES,
-    MAX_SERVERS_PER_CONNECT, USER_DATA_BYTES, VERSION_INFO,
+    CONNECT_SALT_BYTES, CONNECT_TOKEN_BYTES, KEY_BYTES, Key, MAC_BYTES, MAX_PACKET_BYTES,
+    MAX_PAYLOAD_BYTES, MAX_SERVERS_PER_CONNECT, SERVER_NONCE_BYTES, USER_DATA_BYTES, VERSION_INFO,
 };
 
 const FUZZ_PROTOCOL_ID: u64 = 0x1122334455667788;
@@ -79,14 +79,42 @@ fn seal_fuzz_packet(data: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     let prefix_byte = data[0];
+    let packet_type = prefix_byte & 0xF;
     let sequence = u64::from_le_bytes(data[1..9].try_into().unwrap());
-    let body_end = data.len().min(9 + MAX_PACKET_BYTES);
-    seal_prefixed_packet(prefix_byte, sequence, &data[9..body_end], &FUZZ_KEY, FUZZ_PROTOCOL_ID)
+    if packet_type == packet::CONNECTION_DENIED_PACKET
+        || packet_type == packet::CONNECTION_CHALLENGE_PACKET
+    {
+        if data.len() < 9 + SERVER_NONCE_BYTES {
+            return None;
+        }
+        let server_nonce: [u8; SERVER_NONCE_BYTES] =
+            data[9..9 + SERVER_NONCE_BYTES].try_into().unwrap();
+        let body_end = data.len().min(9 + SERVER_NONCE_BYTES + MAX_PACKET_BYTES);
+        seal_prefixed_packet(
+            prefix_byte,
+            sequence,
+            Some(&server_nonce),
+            &data[9 + SERVER_NONCE_BYTES..body_end],
+            &FUZZ_KEY,
+            FUZZ_PROTOCOL_ID,
+        )
+    } else {
+        let body_end = data.len().min(9 + MAX_PACKET_BYTES);
+        seal_prefixed_packet(
+            prefix_byte,
+            sequence,
+            None,
+            &data[9..body_end],
+            &FUZZ_KEY,
+            FUZZ_PROTOCOL_ID,
+        )
+    }
 }
 
 fn seal_prefixed_packet(
     prefix_byte: u8,
     sequence: u64,
+    server_nonce: Option<&[u8; SERVER_NONCE_BYTES]>,
     body: &[u8],
     key: &Key,
     protocol_id: u64,
@@ -101,25 +129,44 @@ fn seal_prefixed_packet(
     sequence_le[sequence_bytes..].fill(0);
     let sequence = u64::from_le_bytes(sequence_le);
 
-    let mut sealed = Vec::with_capacity(1 + sequence_bytes + body.len() + MAC_BYTES);
+    let header_nonce_bytes = if server_nonce.is_some() { SERVER_NONCE_BYTES } else { 0 };
+    let mut sealed =
+        Vec::with_capacity(1 + sequence_bytes + header_nonce_bytes + body.len() + MAC_BYTES);
     sealed.push(prefix_byte);
     sealed.extend_from_slice(&sequence_le[..sequence_bytes]);
+    if let Some(server_nonce) = server_nonce {
+        sealed.extend_from_slice(server_nonce);
+    }
     sealed.extend_from_slice(body);
     sealed.extend_from_slice(&[0u8; MAC_BYTES]);
 
-    let additional = fuzz_additional_data(protocol_id, prefix_byte);
+    let (additional, ad_len) = fuzz_additional_data(protocol_id, prefix_byte, server_nonce);
     let nonce = crypto::sequence_nonce(sequence);
-    crypto::encrypt_aead(&mut sealed[1 + sequence_bytes..], &additional, &nonce, key).ok()?;
+    crypto::encrypt_aead(
+        &mut sealed[1 + sequence_bytes + header_nonce_bytes..],
+        &additional[..ad_len],
+        &nonce,
+        key,
+    )
+    .ok()?;
     Some(sealed)
 }
 
-fn fuzz_additional_data(protocol_id: u64, prefix_byte: u8) -> [u8; 13 + 8 + 1] {
-    let mut additional_data = [0u8; 13 + 8 + 1];
+fn fuzz_additional_data(
+    protocol_id: u64,
+    prefix_byte: u8,
+    server_nonce: Option<&[u8; SERVER_NONCE_BYTES]>,
+) -> ([u8; 13 + 8 + 1 + SERVER_NONCE_BYTES], usize) {
+    let mut additional_data = [0u8; 13 + 8 + 1 + SERVER_NONCE_BYTES];
     let mut writer = Writer::new(&mut additional_data);
     writer.write_bytes(&VERSION_INFO);
     writer.write_u64(protocol_id);
     writer.write_u8(prefix_byte);
-    additional_data
+    if let Some(server_nonce) = server_nonce {
+        writer.write_bytes(server_nonce);
+    }
+    let len = writer.position();
+    (additional_data, len)
 }
 
 fn feed_sealed(sealed: &[u8], allowed: AllowedPackets, private_key: Option<&Key>) {
@@ -148,25 +195,38 @@ pub fn packet_write_read_round_trip(data: &[u8]) {
     let mut reader = Reader::new(rest);
 
     let (packet, allowed_packets) = match selector % 7 {
-        0 => (Packet::Denied, AllowedPackets::CLIENT),
-        1 | 2 => {
+        0 => {
+            let Some(server_nonce) = reader.read_bytes::<SERVER_NONCE_BYTES>() else {
+                return;
+            };
+            (Packet::Denied { server_nonce }, AllowedPackets::CLIENT)
+        }
+        1 => {
+            let Some(server_nonce) = reader.read_bytes::<SERVER_NONCE_BYTES>() else {
+                return;
+            };
             let Some(challenge_token_sequence) = reader.read_u64() else {
                 return;
             };
             let Some(challenge_token_data) = reader.read_bytes::<CHALLENGE_TOKEN_BYTES>() else {
                 return;
             };
-            if selector % 7 == 1 {
-                (
-                    Packet::Challenge { challenge_token_sequence, challenge_token_data },
-                    AllowedPackets::CLIENT,
-                )
-            } else {
-                (
-                    Packet::Response { challenge_token_sequence, challenge_token_data },
-                    AllowedPackets::SERVER,
-                )
-            }
+            (
+                Packet::Challenge { server_nonce, challenge_token_sequence, challenge_token_data },
+                AllowedPackets::CLIENT,
+            )
+        }
+        2 => {
+            let Some(challenge_token_sequence) = reader.read_u64() else {
+                return;
+            };
+            let Some(challenge_token_data) = reader.read_bytes::<CHALLENGE_TOKEN_BYTES>() else {
+                return;
+            };
+            (
+                Packet::Response { challenge_token_sequence, challenge_token_data },
+                AllowedPackets::SERVER,
+            )
         }
         3 => {
             let Some(client_index) = reader.read_u32() else {
@@ -255,6 +315,9 @@ fn connection_request_round_trip(reader: &mut Reader<'_>) {
     let Some(expire_raw) = reader.read_u64() else {
         return;
     };
+    let Some(client_salt) = reader.read_bytes::<CONNECT_SALT_BYTES>() else {
+        return;
+    };
     // the reader rejects tokens whose expire timestamp is <= the current timestamp,
     // which the harness fixes at zero
     let expire_timestamp = expire_raw.max(1);
@@ -279,8 +342,13 @@ fn connection_request_round_trip(reader: &mut Reader<'_>) {
     )
     .expect("encrypting the private connect token must succeed");
 
-    let request =
-        Packet::Request { protocol_id: FUZZ_PROTOCOL_ID, expire_timestamp, nonce, private_data };
+    let request = Packet::Request {
+        protocol_id: FUZZ_PROTOCOL_ID,
+        expire_timestamp,
+        nonce,
+        private_data,
+        client_salt,
+    };
 
     let mut buffer = [0u8; MAX_PACKET_BYTES];
     let written = packet::write_packet(&request, &mut buffer, 0, &FUZZ_KEY, FUZZ_PROTOCOL_ID)
@@ -297,9 +365,10 @@ fn connection_request_round_trip(reader: &mut Reader<'_>) {
     )
     .expect("a connection request produced by write_packet must read back");
 
-    let Packet::Request { private_data: decrypted, .. } = output else {
+    let Packet::Request { private_data: decrypted, client_salt: output_salt, .. } = output else {
         panic!("connection request packet read back as a different type");
     };
+    assert_eq!(output_salt, client_salt);
     let output_token = PrivateConnectToken::read(&decrypted[..])
         .expect("the decrypted private connect token must read back");
     assert_eq!(output_token, private_token);
@@ -344,9 +413,19 @@ mod tests {
     use super::*;
 
     fn fuzz_input(packet_type: u8, body: &[u8]) -> Vec<u8> {
-        let mut data = Vec::with_capacity(1 + 8 + body.len());
+        let header_nonce_bytes = if packet_type == packet::CONNECTION_DENIED_PACKET
+            || packet_type == packet::CONNECTION_CHALLENGE_PACKET
+        {
+            SERVER_NONCE_BYTES
+        } else {
+            0
+        };
+        let mut data = Vec::with_capacity(1 + 8 + header_nonce_bytes + body.len());
         data.push(packet_type | (1 << 4));
         data.extend_from_slice(&1u64.to_le_bytes());
+        if header_nonce_bytes > 0 {
+            data.extend_from_slice(&[0x77u8; SERVER_NONCE_BYTES]);
+        }
         data.extend_from_slice(body);
         data
     }

@@ -129,6 +129,24 @@ impl MemoryNetwork {
         inner.queues.entry(bound).or_default();
         MemorySocket { address: bound, network: Arc::clone(&self.inner) }
     }
+
+    pub(crate) fn filter_queue(
+        &self,
+        target: SocketAddr,
+        mut keep: impl FnMut(&[u8], SocketAddr) -> bool,
+    ) {
+        let target = normalize_address(target);
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(queue) = inner.queues.get_mut(&target) {
+            queue.retain(|(data, from)| keep(data, *from));
+        }
+    }
+
+    pub(crate) fn peek_queue(&self, target: SocketAddr) -> Vec<(Vec<u8>, SocketAddr)> {
+        let target = normalize_address(target);
+        let inner = self.inner.lock().unwrap();
+        inner.queues.get(&target).map(|q| q.iter().cloned().collect()).unwrap_or_default()
+    }
 }
 
 #[cfg(test)]

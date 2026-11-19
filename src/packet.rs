@@ -2,17 +2,20 @@
 //!
 //! The connection request packet travels in the clear (its private connect token data
 //! is already encrypted by the backend). Every other packet type is encrypted with
-//! ChaCha20-Poly1305, keyed per direction from the connect token, with the packet
-//! sequence number as the nonce and the version info, protocol id and prefix byte as
-//! associated data.
+//! ChaCha20-Poly1305, keyed per direction via HChaCha20 over `client_salt || server_nonce`,
+//! with the packet sequence number as the nonce and the version info, protocol id, prefix
+//! byte, and (on connection denied and challenge packets) `server_nonce` as associated data.
 
 use log::debug;
+use zeroize::Zeroize;
 
 use crate::bytes::{Reader, Writer};
 use crate::crypto;
 use crate::replay::ReplayProtection;
 use crate::token::{CHALLENGE_TOKEN_BYTES, CONNECT_TOKEN_NONCE_BYTES, CONNECT_TOKEN_PRIVATE_BYTES};
-use crate::{Error, Key, MAC_BYTES, MAX_PAYLOAD_BYTES, VERSION_INFO};
+use crate::{
+    CONNECT_SALT_BYTES, Error, Key, MAC_BYTES, MAX_PAYLOAD_BYTES, SERVER_NONCE_BYTES, VERSION_INFO,
+};
 
 pub(crate) const CONNECTION_REQUEST_PACKET: u8 = 0;
 pub(crate) const CONNECTION_DENIED_PACKET: u8 = 1;
@@ -23,8 +26,8 @@ pub(crate) const CONNECTION_PAYLOAD_PACKET: u8 = 5;
 pub(crate) const CONNECTION_DISCONNECT_PACKET: u8 = 6;
 const CONNECTION_NUM_PACKETS: u8 = 7;
 
-const CONNECTION_REQUEST_PACKET_BYTES: usize =
-    1 + 13 + 8 + 8 + CONNECT_TOKEN_NONCE_BYTES + CONNECT_TOKEN_PRIVATE_BYTES;
+pub(crate) const CONNECTION_REQUEST_PACKET_BYTES: usize =
+    1 + 13 + 8 + 8 + CONNECT_TOKEN_NONCE_BYTES + CONNECT_TOKEN_PRIVATE_BYTES + CONNECT_SALT_BYTES;
 
 #[cfg_attr(fuzzing, derive(Debug, PartialEq))]
 pub(crate) enum Packet {
@@ -36,9 +39,13 @@ pub(crate) enum Packet {
         /// left in the trailing 16 bytes for the server's used-token history),
         /// encrypted on write.
         private_data: Box<[u8; CONNECT_TOKEN_PRIVATE_BYTES]>,
+        client_salt: [u8; CONNECT_SALT_BYTES],
     },
-    Denied,
+    Denied {
+        server_nonce: [u8; SERVER_NONCE_BYTES],
+    },
     Challenge {
+        server_nonce: [u8; SERVER_NONCE_BYTES],
         challenge_token_sequence: u64,
         challenge_token_data: [u8; CHALLENGE_TOKEN_BYTES],
     },
@@ -58,7 +65,7 @@ impl Packet {
     pub fn packet_type(&self) -> u8 {
         match self {
             Packet::Request { .. } => CONNECTION_REQUEST_PACKET,
-            Packet::Denied => CONNECTION_DENIED_PACKET,
+            Packet::Denied { .. } => CONNECTION_DENIED_PACKET,
             Packet::Challenge { .. } => CONNECTION_CHALLENGE_PACKET,
             Packet::Response { .. } => CONNECTION_RESPONSE_PACKET,
             Packet::KeepAlive { .. } => CONNECTION_KEEP_ALIVE_PACKET,
@@ -69,15 +76,32 @@ impl Packet {
 }
 
 /// The set of packet types a receiver is willing to process. The server ignores
-/// challenge packets and the client ignores request and response packets.
+/// challenge packets and the client gates allowed packet types by connection state.
 #[derive(Clone, Copy)]
 pub(crate) struct AllowedPackets(u8);
 
 impl AllowedPackets {
+    #[cfg(any(test, fuzzing))]
     pub const CLIENT: Self = Self(
         1 << CONNECTION_DENIED_PACKET
             | 1 << CONNECTION_CHALLENGE_PACKET
             | 1 << CONNECTION_KEEP_ALIVE_PACKET
+            | 1 << CONNECTION_PAYLOAD_PACKET
+            | 1 << CONNECTION_DISCONNECT_PACKET,
+    );
+
+    pub const CLIENT_REQUESTING: Self =
+        Self(1 << CONNECTION_DENIED_PACKET | 1 << CONNECTION_CHALLENGE_PACKET);
+
+    pub const CLIENT_RESPONDING: Self = Self(
+        1 << CONNECTION_DENIED_PACKET
+            | 1 << CONNECTION_KEEP_ALIVE_PACKET
+            | 1 << CONNECTION_PAYLOAD_PACKET
+            | 1 << CONNECTION_DISCONNECT_PACKET,
+    );
+
+    pub const CLIENT_CONNECTED: Self = Self(
+        1 << CONNECTION_KEEP_ALIVE_PACKET
             | 1 << CONNECTION_PAYLOAD_PACKET
             | 1 << CONNECTION_DISCONNECT_PACKET,
     );
@@ -95,21 +119,50 @@ impl AllowedPackets {
     }
 }
 
+/// Peeks the 8-byte cleartext `server_nonce` header from a candidate `Denied` or
+/// `Challenge` packet while the client is in `SendingConnectionRequest`.
+pub(crate) fn peek_handshake_server_nonce(buffer: &[u8]) -> Option<[u8; SERVER_NONCE_BYTES]> {
+    if buffer.len() < 1 + 1 + SERVER_NONCE_BYTES + MAC_BYTES {
+        return None;
+    }
+    let prefix_byte = buffer[0];
+    let packet_type = prefix_byte & 0xF;
+    if packet_type != CONNECTION_DENIED_PACKET && packet_type != CONNECTION_CHALLENGE_PACKET {
+        return None;
+    }
+    let sequence_bytes = (prefix_byte >> 4) as usize;
+    if !(1..=8).contains(&sequence_bytes) {
+        return None;
+    }
+    if buffer.len() < 1 + sequence_bytes + SERVER_NONCE_BYTES + MAC_BYTES {
+        return None;
+    }
+    buffer[1 + sequence_bytes..1 + sequence_bytes + SERVER_NONCE_BYTES].try_into().ok()
+}
+
 /// The number of bytes required to send a sequence number, in `[1,8]`, found by
 /// omitting high zero bytes.
 fn sequence_number_bytes_required(sequence: u64) -> usize {
     (8 - sequence.leading_zeros() as usize / 8).max(1)
 }
 
-/// The associated data for packet encryption: version info, protocol id and the prefix
-/// byte, which stops an attacker from modifying the packet type.
-fn packet_additional_data(protocol_id: u64, prefix_byte: u8) -> [u8; 13 + 8 + 1] {
-    let mut additional_data = [0u8; 13 + 8 + 1];
+/// The associated data for packet encryption: version info, protocol id, prefix byte,
+/// and (for connection denied and challenge packets) the 8-byte `server_nonce`.
+fn packet_additional_data(
+    protocol_id: u64,
+    prefix_byte: u8,
+    server_nonce: Option<&[u8; SERVER_NONCE_BYTES]>,
+) -> ([u8; 13 + 8 + 1 + SERVER_NONCE_BYTES], usize) {
+    let mut additional_data = [0u8; 13 + 8 + 1 + SERVER_NONCE_BYTES];
     let mut writer = Writer::new(&mut additional_data);
     writer.write_bytes(&VERSION_INFO);
     writer.write_u64(protocol_id);
     writer.write_u8(prefix_byte);
-    additional_data
+    if let Some(server_nonce) = server_nonce {
+        writer.write_bytes(server_nonce);
+    }
+    let len = writer.position();
+    (additional_data, len)
 }
 
 /// Writes the packet to the buffer, encrypting it if it is not a connection request
@@ -121,7 +174,9 @@ pub(crate) fn write_packet(
     write_packet_key: &Key,
     protocol_id: u64,
 ) -> Result<usize, Error> {
-    if let Packet::Request { protocol_id, expire_timestamp, nonce, private_data } = packet {
+    if let Packet::Request { protocol_id, expire_timestamp, nonce, private_data, client_salt } =
+        packet
+    {
         // connection request packet: not encrypted, first byte is zero
         let mut writer = Writer::new(buffer);
         writer.write_u8(CONNECTION_REQUEST_PACKET);
@@ -130,6 +185,7 @@ pub(crate) fn write_packet(
         writer.write_u64(*expire_timestamp);
         writer.write_bytes(&nonce[..]);
         writer.write_bytes(&private_data[..]);
+        writer.write_bytes(&client_salt[..]);
         debug_assert_eq!(writer.position(), CONNECTION_REQUEST_PACKET_BYTES);
         return Ok(CONNECTION_REQUEST_PACKET_BYTES);
     }
@@ -155,12 +211,20 @@ pub(crate) fn write_packet(
     let sequence_le = sequence.to_le_bytes();
     writer.write_bytes(&sequence_le[..sequence_bytes]);
 
+    let header_server_nonce = match packet {
+        Packet::Denied { server_nonce } | Packet::Challenge { server_nonce, .. } => {
+            writer.write_bytes(server_nonce);
+            Some(server_nonce)
+        }
+        _ => None,
+    };
+
     let encrypted_start = writer.position();
 
     match packet {
         Packet::Request { .. } => unreachable!(),
-        Packet::Denied | Packet::Disconnect => {}
-        Packet::Challenge { challenge_token_sequence, challenge_token_data }
+        Packet::Denied { .. } | Packet::Disconnect => {}
+        Packet::Challenge { challenge_token_sequence, challenge_token_data, .. }
         | Packet::Response { challenge_token_sequence, challenge_token_data } => {
             writer.write_u64(*challenge_token_sequence);
             writer.write_bytes(&challenge_token_data[..]);
@@ -177,11 +241,12 @@ pub(crate) fn write_packet(
 
     let encrypted_finish = writer.position();
 
-    let additional_data = packet_additional_data(protocol_id, prefix_byte);
+    let (additional_data, ad_len) =
+        packet_additional_data(protocol_id, prefix_byte, header_server_nonce);
     let nonce = crypto::sequence_nonce(sequence);
     crypto::encrypt_aead(
         &mut buffer[encrypted_start..encrypted_finish + MAC_BYTES],
-        &additional_data,
+        &additional_data[..ad_len],
         &nonce,
         write_packet_key,
     )?;
@@ -283,7 +348,14 @@ pub(crate) fn read_packet_with_min_connect_token_expire_timestamp(
         return None;
     }
 
-    if buffer.len() < 1 + sequence_bytes + MAC_BYTES {
+    let header_nonce_bytes =
+        if packet_type == CONNECTION_DENIED_PACKET || packet_type == CONNECTION_CHALLENGE_PACKET {
+            SERVER_NONCE_BYTES
+        } else {
+            0
+        };
+
+    if buffer.len() < 1 + sequence_bytes + header_nonce_bytes + MAC_BYTES {
         debug!("ignored encrypted packet. buffer is too small for sequence bytes + encryption mac");
         return None;
     }
@@ -314,11 +386,21 @@ pub(crate) fn read_packet_with_min_connect_token_expire_timestamp(
 
     // decrypt the per-packet type data
 
-    let additional_data = packet_additional_data(protocol_id, prefix_byte);
-    let nonce = crypto::sequence_nonce(sequence);
-    let encrypted = &mut buffer[1 + sequence_bytes..];
+    let header_server_nonce: Option<[u8; SERVER_NONCE_BYTES]> = if header_nonce_bytes > 0 {
+        Some(
+            buffer[1 + sequence_bytes..1 + sequence_bytes + SERVER_NONCE_BYTES].try_into().unwrap(),
+        )
+    } else {
+        None
+    };
 
-    if crypto::decrypt_aead(encrypted, &additional_data, &nonce, read_packet_key).is_err() {
+    let (additional_data, ad_len) =
+        packet_additional_data(protocol_id, prefix_byte, header_server_nonce.as_ref());
+    let nonce = crypto::sequence_nonce(sequence);
+    let encrypted = &mut buffer[1 + sequence_bytes + header_nonce_bytes..];
+
+    if crypto::decrypt_aead(encrypted, &additional_data[..ad_len], &nonce, read_packet_key).is_err()
+    {
         debug!("ignored encrypted packet. failed to decrypt");
         return None;
     }
@@ -342,7 +424,7 @@ pub(crate) fn read_packet_with_min_connect_token_expire_timestamp(
                 debug!("ignored connection denied packet. decrypted packet data is wrong size");
                 return None;
             }
-            Packet::Denied
+            Packet::Denied { server_nonce: header_server_nonce.unwrap() }
         }
 
         CONNECTION_CHALLENGE_PACKET | CONNECTION_RESPONSE_PACKET => {
@@ -355,7 +437,11 @@ pub(crate) fn read_packet_with_min_connect_token_expire_timestamp(
             let challenge_token_sequence = reader.read_u64()?;
             let challenge_token_data = reader.read_bytes::<CHALLENGE_TOKEN_BYTES>()?;
             if packet_type == CONNECTION_CHALLENGE_PACKET {
-                Packet::Challenge { challenge_token_sequence, challenge_token_data }
+                Packet::Challenge {
+                    server_nonce: header_server_nonce.unwrap(),
+                    challenge_token_sequence,
+                    challenge_token_data,
+                }
             } else {
                 Packet::Response { challenge_token_sequence, challenge_token_data }
             }
@@ -451,10 +537,8 @@ fn read_connection_request_packet(
     }
 
     let nonce = reader.read_bytes::<CONNECT_TOKEN_NONCE_BYTES>()?;
-
-    let private_data_start = buffer.len() - CONNECT_TOKEN_PRIVATE_BYTES;
-    let mut private_data = Box::new([0u8; CONNECT_TOKEN_PRIVATE_BYTES]);
-    private_data.copy_from_slice(&buffer[private_data_start..]);
+    let mut private_data = Box::new(reader.read_bytes::<CONNECT_TOKEN_PRIVATE_BYTES>()?);
+    let client_salt = reader.read_bytes::<CONNECT_SALT_BYTES>()?;
 
     if crate::token::decrypt_connect_token_private(
         &mut private_data,
@@ -465,11 +549,18 @@ fn read_connection_request_packet(
     )
     .is_err()
     {
+        private_data.zeroize();
         debug!("ignored connection request packet. connect token failed to decrypt");
         return None;
     }
 
-    Some(Packet::Request { protocol_id: packet_protocol_id, expire_timestamp, nonce, private_data })
+    Some(Packet::Request {
+        protocol_id: packet_protocol_id,
+        expire_timestamp,
+        nonce,
+        private_data,
+        client_salt,
+    })
 }
 
 #[cfg(test)]
@@ -501,10 +592,18 @@ mod tests {
         // a sequence number of 1000 (0x3E8) takes two bytes, written low byte first
         let key = generate_key();
         let mut buffer = [0u8; MAX_PACKET_BYTES];
-        write_packet(&Packet::Denied, &mut buffer, 1000, &key, TEST_PROTOCOL_ID).unwrap();
+        write_packet(
+            &Packet::Denied { server_nonce: [0x11; SERVER_NONCE_BYTES] },
+            &mut buffer,
+            1000,
+            &key,
+            TEST_PROTOCOL_ID,
+        )
+        .unwrap();
         assert_eq!(buffer[0], CONNECTION_DENIED_PACKET | (2 << 4));
         assert_eq!(buffer[1], 0xE8);
         assert_eq!(buffer[2], 0x03);
+        assert_eq!(&buffer[3..3 + SERVER_NONCE_BYTES], &[0x11; SERVER_NONCE_BYTES]);
     }
 
     fn round_trip(packet: &Packet, allowed_packets: AllowedPackets) -> (Packet, u64) {
@@ -526,24 +625,82 @@ mod tests {
 
     #[test]
     fn denied_packet_round_trip() {
-        let (packet, sequence) = round_trip(&Packet::Denied, AllowedPackets::CLIENT);
-        assert!(matches!(packet, Packet::Denied));
+        let mut server_nonce = [0u8; SERVER_NONCE_BYTES];
+        crypto::random_bytes(&mut server_nonce);
+        let (packet, sequence) =
+            round_trip(&Packet::Denied { server_nonce }, AllowedPackets::CLIENT);
+        match packet {
+            Packet::Denied { server_nonce: out_nonce } => assert_eq!(out_nonce, server_nonce),
+            _ => panic!("wrong packet type"),
+        }
         assert_eq!(sequence, TEST_SEQUENCE);
+
+        // tampering with cleartext server_nonce is rejected by 30-byte AAD
+        let key = generate_key();
+        let mut buffer = [0u8; MAX_PACKET_BYTES];
+        let written = write_packet(
+            &Packet::Denied { server_nonce },
+            &mut buffer,
+            TEST_SEQUENCE,
+            &key,
+            TEST_PROTOCOL_ID,
+        )
+        .unwrap();
+        buffer[3] ^= 1;
+        assert!(
+            read_packet(
+                &mut buffer[..written],
+                Some(&key),
+                TEST_PROTOCOL_ID,
+                0,
+                None,
+                AllowedPackets::CLIENT,
+                None,
+            )
+            .is_none()
+        );
     }
 
     #[test]
     fn challenge_packet_round_trip() {
+        let mut server_nonce = [0u8; SERVER_NONCE_BYTES];
+        crypto::random_bytes(&mut server_nonce);
         let mut challenge_token_data = [0u8; CHALLENGE_TOKEN_BYTES];
         crypto::random_bytes(&mut challenge_token_data);
-        let input = Packet::Challenge { challenge_token_sequence: 7, challenge_token_data };
+        let input =
+            Packet::Challenge { server_nonce, challenge_token_sequence: 7, challenge_token_data };
         let (packet, _) = round_trip(&input, AllowedPackets::CLIENT);
         match packet {
-            Packet::Challenge { challenge_token_sequence, challenge_token_data: data } => {
+            Packet::Challenge {
+                server_nonce: out_nonce,
+                challenge_token_sequence,
+                challenge_token_data: data,
+            } => {
+                assert_eq!(out_nonce, server_nonce);
                 assert_eq!(challenge_token_sequence, 7);
                 assert_eq!(data, challenge_token_data);
             }
             _ => panic!("wrong packet type"),
         }
+
+        // tampering with cleartext server_nonce is rejected by 30-byte AAD
+        let key = generate_key();
+        let mut buffer = [0u8; MAX_PACKET_BYTES];
+        let written =
+            write_packet(&input, &mut buffer, TEST_SEQUENCE, &key, TEST_PROTOCOL_ID).unwrap();
+        buffer[3] ^= 1;
+        assert!(
+            read_packet(
+                &mut buffer[..written],
+                Some(&key),
+                TEST_PROTOCOL_ID,
+                0,
+                None,
+                AllowedPackets::CLIENT,
+                None,
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -615,20 +772,26 @@ mod tests {
         )
         .unwrap();
 
+        let mut client_salt = [0u8; CONNECT_SALT_BYTES];
+        crypto::random_bytes(&mut client_salt);
+
         let input = Packet::Request {
             protocol_id: TEST_PROTOCOL_ID,
             expire_timestamp,
             nonce,
             private_data,
+            client_salt,
         };
 
         let key = generate_key();
         let mut buffer = [0u8; MAX_PACKET_BYTES];
         let written = write_packet(&input, &mut buffer, 0, &key, TEST_PROTOCOL_ID).unwrap();
         assert_eq!(written, CONNECTION_REQUEST_PACKET_BYTES);
+        assert_eq!(written, 1086);
 
+        let mut read_buf = buffer;
         let (packet, _) = read_packet(
-            &mut buffer[..written],
+            &mut read_buf[..written],
             None,
             TEST_PROTOCOL_ID,
             crate::token::unix_timestamp(),
@@ -639,12 +802,43 @@ mod tests {
         .expect("connection request packet failed to read");
 
         match packet {
-            Packet::Request { private_data, .. } => {
+            Packet::Request { private_data, client_salt: out_salt, .. } => {
+                assert_eq!(out_salt, client_salt);
                 let output = crate::token::PrivateConnectToken::read(&private_data[..]).unwrap();
                 assert_eq!(output.client_id, 0x1234);
             }
             _ => panic!("wrong packet type"),
         }
+
+        // a 1078-byte NETCODE 1.02 request or wrong version byte must be rejected
+        let mut short_buf = buffer;
+        assert!(
+            read_packet(
+                &mut short_buf[..written - CONNECT_SALT_BYTES],
+                None,
+                TEST_PROTOCOL_ID,
+                crate::token::unix_timestamp(),
+                Some(&private_key),
+                AllowedPackets::SERVER,
+                None,
+            )
+            .is_none()
+        );
+
+        let mut wrong_ver = buffer;
+        wrong_ver[11] = b'2';
+        assert!(
+            read_packet(
+                &mut wrong_ver[..written],
+                None,
+                TEST_PROTOCOL_ID,
+                crate::token::unix_timestamp(),
+                Some(&private_key),
+                AllowedPackets::SERVER,
+                None,
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -677,6 +871,7 @@ mod tests {
             expire_timestamp,
             nonce,
             private_data,
+            client_salt: [0xAB; CONNECT_SALT_BYTES],
         };
         let key = generate_key();
         let mut buffer = [0u8; MAX_PACKET_BYTES];
@@ -728,6 +923,7 @@ mod tests {
             expire_timestamp,
             nonce,
             private_data,
+            client_salt: [0xCD; CONNECT_SALT_BYTES],
         };
         let key = generate_key();
         let mut buffer = [0u8; MAX_PACKET_BYTES];
@@ -783,9 +979,9 @@ mod tests {
         let mut buffer = [0u8; 1 + 1 + MAC_BYTES];
         buffer[0] = prefix_byte;
         buffer[1] = sequence as u8;
-        let additional_data = packet_additional_data(TEST_PROTOCOL_ID, prefix_byte);
+        let (additional_data, ad_len) = packet_additional_data(TEST_PROTOCOL_ID, prefix_byte, None);
         let nonce = crypto::sequence_nonce(sequence);
-        crypto::encrypt_aead(&mut buffer[2..], &additional_data, &nonce, &key).unwrap();
+        crypto::encrypt_aead(&mut buffer[2..], &additional_data[..ad_len], &nonce, &key).unwrap();
 
         assert!(
             read_packet(
@@ -877,9 +1073,9 @@ mod tests {
         crafted[1..1 + sequence_bytes].copy_from_slice(&sequence.to_le_bytes());
         let body_at = 1 + sequence_bytes;
         crafted[body_at..body_at + body.len()].copy_from_slice(&body);
-        let additional = packet_additional_data(TEST_PROTOCOL_ID, prefix);
+        let (additional, ad_len) = packet_additional_data(TEST_PROTOCOL_ID, prefix, None);
         let nonce = crypto::sequence_nonce(sequence);
-        crypto::encrypt_aead(&mut crafted[body_at..], &additional, &nonce, &key).unwrap();
+        crypto::encrypt_aead(&mut crafted[body_at..], &additional[..ad_len], &nonce, &key).unwrap();
 
         let mut replay_protection = ReplayProtection::new();
         assert!(
@@ -937,14 +1133,33 @@ mod tests {
         let sequence: u64 = 1;
         let sequence_bytes = 1usize;
         let prefix = packet_type | ((sequence_bytes as u8) << 4);
-        let mut buffer = Vec::with_capacity(1 + sequence_bytes + body.len() + MAC_BYTES);
+        let server_nonce = if packet_type == CONNECTION_DENIED_PACKET
+            || packet_type == CONNECTION_CHALLENGE_PACKET
+        {
+            Some([0x88u8; SERVER_NONCE_BYTES])
+        } else {
+            None
+        };
+        let header_nonce_bytes = if server_nonce.is_some() { SERVER_NONCE_BYTES } else { 0 };
+        let mut buffer =
+            Vec::with_capacity(1 + sequence_bytes + header_nonce_bytes + body.len() + MAC_BYTES);
         buffer.push(prefix);
         buffer.extend_from_slice(&sequence.to_le_bytes()[..sequence_bytes]);
+        if let Some(ref sn) = server_nonce {
+            buffer.extend_from_slice(sn);
+        }
         buffer.extend_from_slice(body);
         buffer.extend_from_slice(&[0u8; MAC_BYTES]);
-        let additional = packet_additional_data(TEST_PROTOCOL_ID, prefix);
+        let (additional, ad_len) =
+            packet_additional_data(TEST_PROTOCOL_ID, prefix, server_nonce.as_ref());
         let nonce = crypto::sequence_nonce(sequence);
-        crypto::encrypt_aead(&mut buffer[1 + sequence_bytes..], &additional, &nonce, &key).unwrap();
+        crypto::encrypt_aead(
+            &mut buffer[1 + sequence_bytes + header_nonce_bytes..],
+            &additional[..ad_len],
+            &nonce,
+            &key,
+        )
+        .unwrap();
         buffer
     }
 
@@ -960,13 +1175,13 @@ mod tests {
 
     fn assert_exact_body(packet_type: u8, packet: &Packet, body_len: usize) {
         match packet_type {
-            CONNECTION_DENIED_PACKET => assert!(matches!(packet, Packet::Denied)),
+            CONNECTION_DENIED_PACKET => assert!(matches!(packet, Packet::Denied { .. })),
             CONNECTION_DISCONNECT_PACKET => assert!(matches!(packet, Packet::Disconnect)),
             CONNECTION_KEEP_ALIVE_PACKET => {
                 assert!(matches!(packet, Packet::KeepAlive { client_index: 0, max_clients: 0 }));
             }
             CONNECTION_CHALLENGE_PACKET => match packet {
-                Packet::Challenge { challenge_token_sequence, challenge_token_data } => {
+                Packet::Challenge { challenge_token_sequence, challenge_token_data, .. } => {
                     assert_eq!(*challenge_token_sequence, 0);
                     assert!(challenge_token_data.iter().all(|byte| *byte == 0));
                     assert_eq!(8 + challenge_token_data.len(), body_len);
@@ -1085,6 +1300,7 @@ mod tests {
             expire_timestamp,
             nonce,
             private_data,
+            client_salt: [0x66u8; CONNECT_SALT_BYTES],
         };
         let mut buffer = vec![0u8; crate::MAX_PACKET_BYTES];
         let written =

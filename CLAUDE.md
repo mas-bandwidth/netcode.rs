@@ -1,5 +1,5 @@
 <!-- HOT:BEGIN -->
-WHAT: from-scratch Rust port of netcode 1.02, wire-compatible with the C reference.
+WHAT: from-scratch Rust port of netcode 1.03, wire-compatible with the C reference.
 NOT mas-bandwidth/netcode (that C reference), NOT netcode.go (the Go port).
 
 NAME TRAP: the crates.io package is `netcode-official`; `netcode` (vvanders) and

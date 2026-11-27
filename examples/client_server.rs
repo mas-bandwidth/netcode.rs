@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use netcode::{Client, ClientState, Server};
 
-const CONNECT_TOKEN_EXPIRY: i32 = 30;
+const CONNECT_TOKEN_EXPIRY: i32 = netcode::DEFAULT_MAX_CONNECT_TOKEN_LIFETIME;
 const CONNECT_TOKEN_TIMEOUT: i32 = 5;
 const PROTOCOL_ID: u64 = 0x1122334455667788;
 
@@ -31,6 +31,9 @@ fn main() {
         .expect("failed to create server");
 
     server.start(1).expect("failed to start server");
+
+    // the server refuses connect tokens issued in its start second
+    std::thread::sleep(Duration::from_secs(1));
 
     let client_id = u64::from_le_bytes(netcode::generate_key()[..8].try_into().unwrap());
     println!("client id is {client_id:016x}");

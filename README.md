@@ -8,7 +8,7 @@ If this library helps you, please support it: **[Become a supporter](https://www
 
 **netcode** is a secure client/server protocol for multiplayer games built on top of UDP.
 
-This is a Rust implementation of the [netcode 1.02 standard](https://github.com/mas-bandwidth/netcode/blob/main/STANDARD.md). It is a from-scratch port of the [reference C implementation](https://github.com/mas-bandwidth/netcode), written in idiomatic Rust, and interoperates on the wire with other conforming implementations.
+This is a Rust implementation of the [netcode 1.03 standard](https://github.com/mas-bandwidth/netcode/blob/main/STANDARD.md). It is a from-scratch port of the [reference C implementation](https://github.com/mas-bandwidth/netcode), written in idiomatic Rust, and interoperates on the wire with other conforming implementations.
 
 # Design
 
@@ -79,8 +79,9 @@ let mut server = netcode::Server::new_with_config(
 ```
 
 The server records each connect token it sees. Retransmitted requests remain
-pending only from their original address; a token is consumed when its client
-is installed and cannot be used again. While the server runs, entries remain
+pending only from their original address and client salt within the token
+timeout; a token is consumed when its client is installed or aborts the
+handshake and cannot be used again. While the server runs, entries remain
 until their tokens expire, so the finite history refuses new tokens rather than
 evicting unexpired entries.
 
@@ -89,6 +90,8 @@ Then start the server with the number of client slots you want:
 ```rust
 server.start(16).expect("failed to start server");
 ```
+
+A connect token issued in the same second the server started is refused, so a server accepts connections from the second after it starts.
 
 To connect a client, your client should hit a REST API to your backend that returns a _connect token_. Generate one with the same private key the server holds:
 
@@ -117,6 +120,10 @@ Drive the client and server from your game loop, passing in the current time in 
 ```rust
 client.update(time);
 server.update(time);
+
+while let Some(event) = server.next_event() {
+    // handle netcode::ServerEvent::ClientConnected and ClientDisconnected
+}
 ```
 
 Once the client connects it is assigned a client index and can exchange encrypted and signed packets with the server:
@@ -148,7 +155,7 @@ Differences from the C implementation:
 * Server connect and disconnect callbacks are replaced by a polled event queue: `server.next_event()`.
 * The network simulator, loopback clients, dual-stack servers and packet tagging are not (yet) ported.
 
-If you'd like to create your own implementation of netcode, please read the [netcode 1.02 standard](https://github.com/mas-bandwidth/netcode/blob/main/STANDARD.md), and see [IMPLEMENTERS.md](https://github.com/mas-bandwidth/netcode/blob/main/IMPLEMENTERS.md) for findings other implementations should check themselves against. This implementation includes those fixes: the replay protection already-received test is written in the overflow-free subtraction form, and there is a regression test locking down the nonce construction.
+If you'd like to create your own implementation of netcode, please read the [netcode 1.03 standard](https://github.com/mas-bandwidth/netcode/blob/main/STANDARD.md), and see [IMPLEMENTERS.md](https://github.com/mas-bandwidth/netcode/blob/main/IMPLEMENTERS.md) for findings other implementations should check themselves against. This implementation includes those fixes: the replay protection already-received test is written in the overflow-free subtraction form, and there is a regression test locking down the nonce construction.
 
 # Development
 
@@ -159,7 +166,7 @@ cargo clippy --all-targets -- -D warnings    # lints
 cargo +nightly fuzz run fuzz_read_packet     # coverage-guided fuzzing (cargo install cargo-fuzz)
 ```
 
-CI runs the test suite on Linux, macOS and Windows (stable and beta Rust), checks formatting, clippy, rustdoc, the minimum supported Rust version (1.85), dependency licenses and security advisories with cargo-deny, live interoperability against the reference C implementation, and smoke-fuzzes the untrusted input surface with the harnesses in `fuzz/`.
+CI runs the test suite on Linux, macOS and Windows (stable and beta Rust), checks formatting, clippy, rustdoc, the minimum supported Rust version (1.87), dependency licenses and security advisories with cargo-deny, live interoperability against the reference C implementation, and smoke-fuzzes the untrusted input surface with the harnesses in `fuzz/`.
 
 To run the interoperability tests locally, build the [reference C implementation](https://github.com/mas-bandwidth/netcode) and point the tests at its example binaries:
 

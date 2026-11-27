@@ -24,10 +24,10 @@
 
 //! **netcode** is a secure client/server protocol for multiplayer games built on top of UDP.
 //!
-//! This crate is a Rust implementation of the [netcode 1.02 standard]. It interoperates with
+//! This crate is a Rust implementation of the [netcode 1.03 standard]. It interoperates with
 //! the [reference C implementation] and other conforming implementations.
 //!
-//! [netcode 1.02 standard]: https://github.com/mas-bandwidth/netcode/blob/main/STANDARD.md
+//! [netcode 1.03 standard]: https://github.com/mas-bandwidth/netcode/blob/main/STANDARD.md
 //! [reference C implementation]: https://github.com/mas-bandwidth/netcode
 //!
 //! # Overview
@@ -50,6 +50,9 @@
 //! let mut server = netcode::Server::new(server_address, protocol_id, &private_key, 0.0).unwrap();
 //! server.start(16).unwrap();
 //!
+//! // the server refuses connect tokens issued in its start second
+//! std::thread::sleep(std::time::Duration::from_secs(1));
+//!
 //! let client_address: SocketAddr = "0.0.0.0:0".parse().unwrap();
 //! let mut client = netcode::Client::new(client_address, 0.0).unwrap();
 //!
@@ -58,7 +61,7 @@
 //! let connect_token = netcode::generate_connect_token(
 //!     &[server_address],
 //!     &[server_address],
-//!     30,
+//!     netcode::DEFAULT_MAX_CONNECT_TOKEN_LIFETIME,
 //!     5,
 //!     client_id,
 //!     protocol_id,
@@ -75,6 +78,9 @@
 //!     server.update(time);
 //!     if client.state() == netcode::ClientState::Connected {
 //!         client.send_packet(&[1, 2, 3, 4]).unwrap();
+//!     }
+//!     while let Some(event) = server.next_event() {
+//!         println!("server event {event:?}");
 //!     }
 //!     while let Some((payload, _sequence)) = server.receive_packet(0) {
 //!         println!("server received {} byte packet", payload.len());
@@ -138,7 +144,9 @@ pub type Key = [u8; KEY_BYTES];
 /// User data carried from the connect token to the server, opaque to netcode.
 pub type UserData = [u8; USER_DATA_BYTES];
 
-pub(crate) const VERSION_INFO: [u8; 13] = *b"NETCODE 1.02\0";
+pub(crate) const VERSION_INFO: [u8; 13] = *b"NETCODE 1.03\0";
+pub(crate) const CONNECT_SALT_BYTES: usize = 8;
+pub(crate) const SERVER_NONCE_BYTES: usize = 8;
 pub(crate) const MAX_PACKET_BYTES: usize = 1300;
 pub(crate) const PACKET_SEND_RATE: f64 = 10.0;
 pub(crate) const NUM_DISCONNECT_PACKETS: usize = 10;

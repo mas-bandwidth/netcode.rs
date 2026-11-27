@@ -40,7 +40,47 @@ The protocol itself is specified in `STANDARD.md`. **A flaw in the *specificatio
 opposed to this implementation of it — is in scope and is more valuable to us**, because it
 affects every implementation of netcode rather than one. Report those the same way.
 
-## netcode.rs is NOT affected by the AEAD nonce reuse issue
+## Known issue: connect token reuse across unfinished handshakes and multiple servers (fixed in 1.2.0)
+
+**Advisory: [GHSA-8mrq-q9c6-h23v](https://github.com/mas-bandwidth/netcode/security/advisories/GHSA-8mrq-q9c6-h23v)** (published 2026-11-19).
+
+**Affected: `netcode-official` 1.1.3 and earlier (`NETCODE 1.02`). Fixed in 1.2.0 (`NETCODE 1.03`).**
+
+In `NETCODE 1.02`, packets encrypted directly under the 32-byte `client_to_server_key` and
+`server_to_client_key` carried inside a connect token, using a per-session sequence counter
+starting at `0` (per-client) or `2^63` (server global) as the 96-bit ChaCha20-Poly1305 AEAD
+nonce:
+
+1. **Retried or aborted handshakes with the same connect token.** If a client sent one or
+   more `connection response` packets (starting at sequence `0`), never completed the
+   handshake, and called `connect` again with the same unexpired connect token, the new
+   attempt reset its packet sequence to `0` and encrypted a fresh `connection response`
+   under the same `client_to_server_key` at nonce `0` (and replayed `connection challenge`
+   packets from an earlier attempt could trigger the same reset even if the server refused
+   the retry).
+2. **Multi-server connect tokens.** Two independent dedicated servers listed in the same
+   connect token each started their `global_sequence` at `2^63` and encrypted global
+   `connection denied` / `connection challenge` packets directly under the shared
+   `server_to_client_key`, colliding at nonce `2^63` on failover.
+
+Fixed by upgrading the wire protocol to **`NETCODE 1.03`** in **`netcode-official` 1.2.0**
+(matching C `netcode` 1.5.0):
+
+- Connect token keys never encrypt packets directly. Each connection attempt derives
+  distinct 32-byte `client_to_server` and `server_to_client` packet keys via `HChaCha20`
+  over an 8-byte random `client_salt` (appended to `connection request` packets and
+  rotated on every `connect` call and server failover) concatenated with an 8-byte random
+  `server_nonce` (carried in the cleartext header and 30-byte AAD of `connection denied`
+  and `connection challenge` packets).
+- Pending connect token history entries also bind to `client_salt` and `timeout_seconds`,
+  and half-open handshakes are consumed on `connection disconnect`.
+
+Thank you to [@magicaldave](https://github.com/magicaldave) ([DreamWeave-MP/dream-net](https://github.com/DreamWeave-MP/dream-net)) for discovering and privately reporting the unfinished-handshake connect-token reuse issue.
+
+Upgrade to `netcode-official` 1.2.0 or later. `NETCODE 1.03` intentionally rejects
+`NETCODE 1.02` tokens and packets, so backends, servers, and clients must upgrade together.
+
+## Historical note: netcode.rs was NOT affected by the C 1.3.5 server-restart nonce reuse issue
 
 Stated explicitly, because the rest of the netcode family *is* and silence would invite the
 wrong inference.

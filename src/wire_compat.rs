@@ -23,7 +23,10 @@ use crate::token::{
     self, CHALLENGE_TOKEN_BYTES, CONNECT_TOKEN_NONCE_BYTES, CONNECT_TOKEN_PRIVATE_BYTES,
     ChallengeToken, ConnectToken, PrivateConnectToken,
 };
-use crate::{CONNECT_TOKEN_BYTES, KEY_BYTES, Key, MAX_PACKET_BYTES, USER_DATA_BYTES, UserData};
+use crate::{
+    CONNECT_SALT_BYTES, CONNECT_TOKEN_BYTES, KEY_BYTES, Key, MAX_PACKET_BYTES, SERVER_NONCE_BYTES,
+    USER_DATA_BYTES, UserData,
+};
 
 const VECTOR_PROTOCOL_ID: u64 = 0x1122334455667788;
 const VECTOR_CLIENT_ID: u64 = 0x0102030405060708;
@@ -76,6 +79,14 @@ fn user_data() -> UserData {
 
 fn connect_token_nonce() -> [u8; CONNECT_TOKEN_NONCE_BYTES] {
     std::array::from_fn(|i| (100 + i) as u8)
+}
+
+fn client_salt() -> [u8; CONNECT_SALT_BYTES] {
+    std::array::from_fn(|i| (50 + i) as u8)
+}
+
+fn server_nonce() -> [u8; SERVER_NONCE_BYTES] {
+    std::array::from_fn(|i| (80 + i) as u8)
 }
 
 fn server_addresses() -> Vec<SocketAddr> {
@@ -230,13 +241,21 @@ fn connection_request_packet_matches_c() {
         expire_timestamp: VECTOR_EXPIRE_TIMESTAMP,
         nonce: connect_token_nonce(),
         private_data: Box::new(*PRIVATE_TOKEN_ENCRYPTED),
+        client_salt: client_salt(),
     };
     let output = packet_round_trip_c(&packet, PACKET_REQUEST, AllowedPackets::SERVER);
     match output {
-        Packet::Request { protocol_id, expire_timestamp, nonce, private_data } => {
+        Packet::Request {
+            protocol_id,
+            expire_timestamp,
+            nonce,
+            private_data,
+            client_salt: salt,
+        } => {
             assert_eq!(protocol_id, VECTOR_PROTOCOL_ID);
             assert_eq!(expire_timestamp, VECTOR_EXPIRE_TIMESTAMP);
             assert_eq!(nonce, connect_token_nonce());
+            assert_eq!(salt, client_salt());
             // the private data comes back decrypted, with the original HMAC in the
             // trailing 16 bytes
             assert_eq!(private_data[..1008], PRIVATE_TOKEN_PLAINTEXT[..1008]);
@@ -248,19 +267,29 @@ fn connection_request_packet_matches_c() {
 
 #[test]
 fn connection_denied_packet_matches_c() {
-    let output = packet_round_trip_c(&Packet::Denied, PACKET_DENIED, AllowedPackets::CLIENT);
-    assert!(matches!(output, Packet::Denied));
+    let packet = Packet::Denied { server_nonce: server_nonce() };
+    let output = packet_round_trip_c(&packet, PACKET_DENIED, AllowedPackets::CLIENT);
+    match output {
+        Packet::Denied { server_nonce: nonce } => assert_eq!(nonce, server_nonce()),
+        _ => panic!("wrong packet type"),
+    }
 }
 
 #[test]
 fn connection_challenge_packet_matches_c() {
     let packet = Packet::Challenge {
+        server_nonce: server_nonce(),
         challenge_token_sequence: VECTOR_CHALLENGE_SEQUENCE,
         challenge_token_data: *CHALLENGE_TOKEN_ENCRYPTED,
     };
     let output = packet_round_trip_c(&packet, PACKET_CHALLENGE, AllowedPackets::CLIENT);
     match output {
-        Packet::Challenge { challenge_token_sequence, challenge_token_data } => {
+        Packet::Challenge {
+            server_nonce: nonce,
+            challenge_token_sequence,
+            challenge_token_data,
+        } => {
+            assert_eq!(nonce, server_nonce());
             assert_eq!(challenge_token_sequence, VECTOR_CHALLENGE_SEQUENCE);
             assert_eq!(&challenge_token_data, CHALLENGE_TOKEN_ENCRYPTED);
         }
@@ -317,11 +346,13 @@ fn connection_disconnect_packet_matches_c() {
 
 #[test]
 fn version_info_matches_c() {
-    assert_eq!(&crate::VERSION_INFO, b"NETCODE 1.02\0");
+    assert_eq!(&crate::VERSION_INFO, b"NETCODE 1.03\0");
     assert_eq!(KEY_BYTES, 32);
     assert_eq!(USER_DATA_BYTES, 256);
     assert_eq!(CONNECT_TOKEN_BYTES, 2048);
     assert_eq!(CONNECT_TOKEN_PRIVATE_BYTES, 1024);
     assert_eq!(CHALLENGE_TOKEN_BYTES, 300);
     assert_eq!(CONNECT_TOKEN_NONCE_BYTES, 24);
+    assert_eq!(CONNECT_SALT_BYTES, 8);
+    assert_eq!(SERVER_NONCE_BYTES, 8);
 }

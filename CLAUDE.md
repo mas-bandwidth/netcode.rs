@@ -1,5 +1,5 @@
 <!-- HOT:BEGIN -->
-WHAT: from-scratch Rust port of netcode 1.02, wire-compatible with the C reference.
+WHAT: from-scratch Rust port of netcode 1.03, wire-compatible with the C reference.
 NOT mas-bandwidth/netcode (that C reference), NOT netcode.go (the Go port).
 
 NAME TRAP: the crates.io package is `netcode-official`; `netcode` (vvanders) and
@@ -32,15 +32,6 @@ NEVER regenerate tests/vectors/*.bin to make a test pass: a golden failure means
 change breaks every other netcode implementation. Only a standard change justifies new
 vectors.
 
-PUBLISHING (crates.io) — the token is NOT on this bench
-The crates.io token lives at /Users/glenn/.cargo/credentials.toml on GLENN'S personal
-macOS account: mode 0600, owned by glenn, unreadable from the mas account. `cargo publish`
-here fails with "no token found". That is NOT a missing credential and NOT a reason to
-mint a new one — it is the wrong machine account. Either Glenn publishes from his own
-account, or he moves the token into the mas keychain with the prompting form
-(`security add-generic-password -U -a rowan -s crates-io-token -w`, no value after -w).
-Verified 2026-07-26: crates.io has netcode-official 1.0.0 while this repo is at 1.1.0.
-
 CARGO.LOCK IS GITIGNORED HERE ON PURPOSE
 `.gitignore` lists `Cargo.lock` and `fuzz/Cargo.lock` deliberately, hand-written beside
 the fuzz artifacts. This is a library crate: dependents do not use its lock, and this is
@@ -63,8 +54,10 @@ cargo clippy --all-targets -- -D warnings
 cargo doc --no-deps                          # CI builds docs with -D warnings
 ```
 
-MSRV is 1.85 (`rust-version` in Cargo.toml); CI checks it with `cargo check` on that
-toolchain.
+MSRV is 1.87 (`rust-version` in Cargo.toml); CI checks it with `cargo check` on that
+toolchain. 1.87 is the lowest version on which the dependency tree resolves without the
+open advisory RUSTSEC-2026-0385: the resolver honours `rust-version`, and every fixed
+`ctutils` (>= 0.4.4, via chacha20poly1305 -> poly1305 -> universal-hash) needs 1.87.
 
 Interop tests, against the C reference built from mas-bandwidth/netcode with CMake:
 

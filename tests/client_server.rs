@@ -1,13 +1,24 @@
 //! Integration tests: a real client and server exchanging packets over localhost UDP.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use netcode::{Client, ClientState, DisconnectReason, Key, Server, ServerEvent};
 
 const PROTOCOL_ID: u64 = 0x1122334455667788;
-const CONNECT_TOKEN_EXPIRY: i32 = 30;
+const CONNECT_TOKEN_EXPIRY: i32 = netcode::DEFAULT_MAX_CONNECT_TOKEN_LIFETIME;
 const CONNECT_TOKEN_TIMEOUT: i32 = 5;
 const DELTA_TIME: f64 = 1.0 / 100.0;
+
+/// Waits until the wall clock second has advanced past the one this is called in. A
+/// server refuses connect tokens issued in its start second, so tests call this after
+/// starting a server and before issuing tokens for it.
+fn wait_for_next_second() {
+    let unix_seconds = || SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let second = unix_seconds();
+    while unix_seconds() <= second {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
 
 struct Harness {
     private_key: Key,
@@ -23,6 +34,7 @@ impl Harness {
         let mut server =
             Server::new("127.0.0.1:0".parse().unwrap(), PROTOCOL_ID, &private_key, 0.0).unwrap();
         server.start(max_clients).unwrap();
+        wait_for_next_second();
         Self { private_key, server, clients: Vec::new(), time: 0.0 }
     }
 
@@ -77,6 +89,7 @@ impl Harness {
 }
 
 #[test]
+#[ignore = "functional: binds a real UDP socket; run with --ignored"]
 fn client_connects_to_server() {
     let mut harness = Harness::new(1);
     harness.connect_client(0x1234);
@@ -96,6 +109,50 @@ fn client_connects_to_server() {
 }
 
 #[test]
+#[ignore = "functional: binds a real UDP socket; run with --ignored"]
+fn server_skips_empty_datagrams_before_connection_request() {
+    // Zero-length datagrams are valid UDP, so a burst of them can arrive ahead of a
+    // connection request. Each trial uses a fresh server whose receive queue holds
+    // EMPTY_DATAGRAMS empty datagrams and then one connection request, and gives the
+    // server exactly ONE update before checking whether the client was answered. A
+    // server that stops reading at an empty datagram, or reads only part of the queue
+    // per update, never answers within its single update. UDP may drop any packet, so
+    // the test requires one answered trial, not every trial.
+    const EMPTY_DATAGRAMS: usize = 64;
+    const TRIALS: usize = 10;
+
+    let mut answered_trials = 0;
+    for _ in 0..TRIALS {
+        let mut harness = Harness::new(1);
+        harness.connect_client(0x1234);
+
+        let noise = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        for _ in 0..EMPTY_DATAGRAMS {
+            noise.send_to(&[], harness.server.address()).unwrap();
+        }
+
+        // the client sends its connection request on its first update
+        harness.clients[0].update(harness.time);
+        assert_eq!(harness.clients[0].state(), ClientState::SendingConnectionRequest);
+
+        harness.server.update(harness.time);
+
+        // the challenge, if the server sent one, is read on the client's next update
+        std::thread::sleep(Duration::from_millis(1));
+        harness.clients[0].update(harness.time);
+        if harness.clients[0].state() == ClientState::SendingConnectionResponse {
+            answered_trials += 1;
+        }
+    }
+
+    assert!(
+        answered_trials > 0,
+        "no connection request was answered in one server update in any of {TRIALS} trials"
+    );
+}
+
+#[test]
+#[ignore = "functional: binds a real UDP socket; run with --ignored"]
 fn client_and_server_exchange_payload_packets() {
     let mut harness = Harness::new(1);
     harness.connect_client(0x1234);
@@ -123,6 +180,7 @@ fn client_and_server_exchange_payload_packets() {
 }
 
 #[test]
+#[ignore = "functional: binds a real UDP socket; run with --ignored"]
 fn client_side_disconnect() {
     let mut harness = Harness::new(1);
     harness.connect_client(0x1234);
@@ -143,6 +201,7 @@ fn client_side_disconnect() {
 }
 
 #[test]
+#[ignore = "functional: binds a real UDP socket; run with --ignored"]
 fn server_side_disconnect() {
     let mut harness = Harness::new(1);
     harness.connect_client(0x1234);
@@ -155,6 +214,62 @@ fn server_side_disconnect() {
 }
 
 #[test]
+#[ignore = "functional: binds a real UDP socket; run with --ignored"]
+fn server_disconnect_does_not_advance_to_next_server() {
+    let mut harness = Harness::new(1);
+    let private_key = harness.private_key;
+
+    let mut next_server =
+        Server::new("127.0.0.1:0".parse().unwrap(), PROTOCOL_ID, &private_key, 0.0).unwrap();
+    next_server.start(1).unwrap();
+    wait_for_next_second();
+
+    let connect_token = netcode::generate_connect_token(
+        &[harness.server.address(), next_server.address()],
+        &[harness.server.address(), next_server.address()],
+        CONNECT_TOKEN_EXPIRY,
+        CONNECT_TOKEN_TIMEOUT,
+        0x1234,
+        PROTOCOL_ID,
+        &private_key,
+        &[0u8; netcode::USER_DATA_BYTES],
+    )
+    .unwrap();
+
+    let mut client = Client::new("127.0.0.1:0".parse().unwrap(), harness.time).unwrap();
+    client.connect(&connect_token).unwrap();
+    harness.clients.push(client);
+
+    harness.run_until(1000, |h| h.clients[0].state() == ClientState::Connected);
+    assert_eq!(harness.clients[0].server_address(), Some(harness.server.address()));
+
+    harness.server.disconnect_client(0);
+
+    // a connected client that receives a server disconnect must stop, not move on
+    // to the next server address in the connect token.
+    let mut reached_disconnected = false;
+    for _ in 0..1000 {
+        harness.update();
+        next_server.update(harness.time);
+        let state = harness.clients[0].state();
+        if state == ClientState::Disconnected {
+            reached_disconnected = true;
+            break;
+        }
+        assert_eq!(
+            state,
+            ClientState::Connected,
+            "connected client advanced to another server after a server disconnect"
+        );
+    }
+
+    assert!(reached_disconnected, "client did not transition to disconnected");
+    assert_eq!(harness.clients[0].server_address(), None);
+    assert_eq!(next_server.num_connected_clients(), 0);
+}
+
+#[test]
+#[ignore = "functional: binds a real UDP socket; run with --ignored"]
 fn server_full_denies_next_client() {
     let mut harness = Harness::new(1);
     harness.connect_client(1);
@@ -167,6 +282,7 @@ fn server_full_denies_next_client() {
 }
 
 #[test]
+#[ignore = "functional: binds a real UDP socket; run with --ignored"]
 fn connect_token_cannot_be_reused_from_another_address() {
     let mut harness = Harness::new(2);
     let connect_token = harness.generate_connect_token(1);
@@ -176,6 +292,14 @@ fn connect_token_cannot_be_reused_from_another_address() {
     harness.clients.push(client1);
     harness.run_until(1000, |h| h.clients[0].state() == ClientState::Connected);
 
+    // End the first session before the second client presents the same token
+    // from a different address. With no client connected, neither the address
+    // nor the client id is in use, so the request is decided by the connect
+    // token history alone.
+    harness.clients[0].disconnect();
+    harness.run_until(1000, |h| h.server.num_connected_clients() == 0);
+    assert!(!harness.server.client_connected(0));
+
     // the same token sent from a different address must not connect
     let mut client2 = Client::new("127.0.0.1:0".parse().unwrap(), harness.time).unwrap();
     client2.connect(&connect_token).unwrap();
@@ -184,10 +308,11 @@ fn connect_token_cannot_be_reused_from_another_address() {
         harness.update();
         assert_ne!(harness.clients[1].state(), ClientState::Connected);
     }
-    assert_eq!(harness.server.num_connected_clients(), 1);
+    assert_eq!(harness.server.num_connected_clients(), 0);
 }
 
 #[test]
+#[ignore = "functional: binds a real UDP socket; run with --ignored"]
 fn connect_token_cannot_be_reused_after_disconnect() {
     let mut harness = Harness::new(1);
     let connect_token = harness.generate_connect_token(1);
@@ -211,6 +336,7 @@ fn connect_token_cannot_be_reused_after_disconnect() {
 }
 
 #[test]
+#[ignore = "functional: binds a real UDP socket; run with --ignored"]
 fn wrong_protocol_id_cannot_connect() {
     let mut harness = Harness::new(1);
 
@@ -238,6 +364,7 @@ fn wrong_protocol_id_cannot_connect() {
 }
 
 #[test]
+#[ignore = "functional: binds a real UDP socket; run with --ignored"]
 fn wrong_private_key_cannot_connect() {
     let mut harness = Harness::new(1);
 
@@ -266,6 +393,7 @@ fn wrong_private_key_cannot_connect() {
 }
 
 #[test]
+#[ignore = "functional: binds a real UDP socket; run with --ignored"]
 fn multiple_clients_connect_and_exchange_packets() {
     const NUM_CLIENTS: usize = 4;
 
@@ -293,4 +421,22 @@ fn multiple_clients_connect_and_exchange_packets() {
         }
         received.iter().all(|&count| count >= 5)
     });
+}
+
+#[test]
+#[ignore = "functional: binds a real UDP socket; run with --ignored"]
+fn restarted_server_accepts_new_client_over_udp() {
+    let mut harness = Harness::new(1);
+    harness.connect_client(0x1111);
+    harness.run_until(1000, |h| h.clients[0].state() == ClientState::Connected);
+
+    harness.server.stop();
+    harness.server.start(1).unwrap();
+    wait_for_next_second();
+    harness.clients.clear();
+
+    harness.connect_client(0x2222);
+    harness.run_until(1000, |h| h.clients[0].state() == ClientState::Connected);
+    assert_eq!(harness.server.num_connected_clients(), 1);
+    assert_eq!(harness.server.client_id(0), 0x2222);
 }

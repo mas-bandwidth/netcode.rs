@@ -1,8 +1,8 @@
 [package]
 name = "netcode-official"
-version = "1.1.2"
+version = "1.2.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.87"
 authors = ["Más Bandwidth LLC"]
 description = "The official Rust implementation of the netcode network protocol"
 license = "LicenseRef-MBSL"
@@ -11,7 +11,7 @@ documentation = "https://docs.rs/netcode-official"
 readme = "README.md"
 keywords = ["gamedev", "networking", "udp", "protocol", "netcode"]
 categories = ["game-development", "network-programming"]
-exclude = [".github/", "fuzz/"]
+exclude = [".github/", "fuzz/", "CLAUDE.md", ".mailmap", "deny.toml"]
 
 [lib]
 # the library target keeps the name `netcode` (code says `use netcode::...`), so if
@@ -24,6 +24,7 @@ chacha20poly1305 = "0.11"
 getrandom = "0.4"
 log = "0.4"
 socket2 = "0.6"
+zeroize = "1.8"
 
 [dev-dependencies]
 env_logger = "0.11"

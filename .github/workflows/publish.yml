@@ -1,11 +1,21 @@
-# Publishes the crate to crates.io when a release tag is pushed. The release itself (tag and
-# GitHub release) is made by hand as before; this workflow only uploads the package. Without the
-# CRATES_IO_TOKEN secret it skips the upload and succeeds.
+# Publishes the crate to crates.io when a GitHub release is published. The release itself (tag and
+# GitHub release) is made by hand as before; this workflow only uploads the package.
+#
+# Authentication is crates.io Trusted Publishing: the job's GitHub OIDC token is exchanged for a
+# 30-minute crates.io token by rust-lang/crates-io-auth-action. No secret is stored. A crate owner
+# must first add this repository and the workflow file "publish.yml" (no environment) under the
+# crate's Settings -> Trusted Publishing on crates.io; until then the auth step fails.
 name: publish
 
 on:
-  push:
-    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+  release:
+    types: [published]
+  # By hand, to publish an existing release tag.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: release tag to publish (vX.Y.Z)
+        required: true
 
 permissions:
   contents: read
@@ -18,9 +28,15 @@ jobs:
     name: publish to crates.io
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write   # for the crates.io Trusted Publishing OIDC exchange
+    env:
+      TAG: ${{ inputs.tag || github.event.release.tag_name }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7
         with:
+          ref: refs/tags/${{ env.TAG }}
           persist-credentials: false
 
       - run: rustup toolchain install stable --profile minimal && rustup default stable
@@ -29,20 +45,18 @@ jobs:
         run: |
           set -eu
           version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
-          tag_version="${GITHUB_REF_NAME#v}"
+          tag_version="${TAG#v}"
           if [ "$tag_version" != "$version" ]; then
-            echo "::error::tag $GITHUB_REF_NAME does not match version $version in Cargo.toml"
+            echo "::error::tag $TAG does not match version $version in Cargo.toml"
             exit 1
           fi
-          echo "tag $GITHUB_REF_NAME matches Cargo.toml version $version"
+          echo "tag $TAG matches Cargo.toml version $version"
+
+      - name: Authenticate with crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9   # v1.0.6
 
       - name: Publish
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
-        run: |
-          set -eu
-          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
-            echo "CRATES_IO_TOKEN not set; skipping crates.io publish"
-            exit 0
-          fi
-          cargo publish --locked
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish --locked
